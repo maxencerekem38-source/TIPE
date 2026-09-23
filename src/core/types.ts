@@ -542,6 +542,8 @@ export interface OffBallWeights {
   hysteresis: number; // gain minimal pour changer de cible
   runBandWidth: number; // m, largeur des bandes (un seul coureur par bande)
   reexamineEvery: number; // s, ré-examen forcé de la cible
+  /** (décision hors-ballon) Bonus gaussien d'un candidat de soutien situé à `tactic.supportDistance` du ballon, défaut 0,1. */
+  wSupport?: number;
 }
 
 /** Coûts de l'affectation défensive. */

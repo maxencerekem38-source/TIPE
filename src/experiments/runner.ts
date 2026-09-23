@@ -354,7 +354,14 @@ export function resolveTaskPolicies(task: MatchTask): Record<TeamId, PolicySet> 
   if (!task.policies && !Object.keys(overrides).length) return undefined;
   const out = {} as Record<TeamId, PolicySet>;
   for (const team of TEAMS) {
-    let p = resolvePolicy(names[team]);
+    let p: PolicySet;
+    try {
+      p = resolvePolicy(names[team]);
+    } catch (err) {
+      // Fonction de décision injectée (tests) : les politiques nommées sont facultatives.
+      if (task.options?.decide && isNotImplemented(err)) return undefined;
+      throw err;
+    }
     const ov = overrides[team];
     if (ov && Object.keys(ov).length) p = withParams(p, applyFlatParams(task.config.params, ov), `${names[team]}+ϑ`);
     out[team] = p;

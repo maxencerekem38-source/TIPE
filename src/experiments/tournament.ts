@@ -189,6 +189,7 @@ export interface TournamentOptions {
   batch?: BatchOptions;
   paramsOf?: (seed: number) => MatchConfig['params'];
   policy?: string;
+  matchOptions?: Omit<RunMatchOptions, 'onDecisions'>;
 }
 
 /** Tournoi toutes rondes : chaque paire de profils joue chaque graine dans les deux sens. */
@@ -201,9 +202,9 @@ export async function runTournament(profiles: readonly TacticConfig[], seeds: re
       for (const seed of seeds) {
         const params = options.paramsOf?.(seed);
         const policy = options.policy ?? FULL_POLICY_NAME;
-        tasks.push({ config: defaultMakeConfig({ seed, minutes, tacticA: profiles[i], tacticB: profiles[j], params }), policies: { A: policy, B: policy } });
+        tasks.push({ config: defaultMakeConfig({ seed, minutes, tacticA: profiles[i], tacticB: profiles[j], params }), policies: { A: policy, B: policy }, options: options.matchOptions });
         meta.push({ i, j, seed });
-        tasks.push({ config: defaultMakeConfig({ seed, minutes, tacticA: profiles[j], tacticB: profiles[i], params }), policies: { A: policy, B: policy } });
+        tasks.push({ config: defaultMakeConfig({ seed, minutes, tacticA: profiles[j], tacticB: profiles[i], params }), policies: { A: policy, B: policy }, options: options.matchOptions });
         meta.push({ i: j, j: i, seed });
       }
   const t0 = performance.now();

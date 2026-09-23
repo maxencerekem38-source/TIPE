@@ -71,7 +71,7 @@ export function comparisonsSummaryMarkdown(cs: readonly PairedComparison[], pHol
 
 export function tournamentMarkdown(t: TournamentResult): string {
   const lines: string[] = [];
-  lines.push(`${t.profiles.length} profils, ${t.seeds.length} graines, matchs de ${t.minutes} min, ${t.matches} matchs joués.`, '');
+  lines.push(`${t.profiles.length} profils, ${t.seeds.length} graines, matchs de ${Number.isInteger(t.minutes) ? t.minutes : fmt(t.minutes, 1)} min, ${t.matches} matchs joués.`, '');
   const order = t.profiles.map((_, i) => i).sort((a, b) => t.elo[t.profiles[b]] - t.elo[t.profiles[a]]);
   lines.push('#### Classement', '');
   lines.push(mdTable(

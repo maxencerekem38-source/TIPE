@@ -9,7 +9,7 @@ import { DEFAULT_PARAMS, applyFlatParams, flattenParams } from '../core/params';
 import { Rng } from '../core/rng';
 import { confidenceInterval, mean, std } from '../core/stats';
 import { runBatch, type BatchOptions } from './worker-pool';
-import { runMatchTask, type MatchTask } from './runner';
+import { runMatchTask, type MatchTask, type RunMatchOptions } from './runner';
 import { turnoverDanger } from './metrics';
 import { NATURAL_FORMATION, naturalProfiles } from './tournament';
 import { FULL_POLICY_NAME, makeConfig } from './cli';
@@ -264,6 +264,8 @@ export interface MatchFitnessOptions {
   degeneratePenalty?: number;
   /** Seuils de dégénérescence : tirs/match, longueur moyenne de passe (m), part de possession. */
   guards?: { minShots: number; maxPassLength: number; minPossession: number };
+  /** Options de match supplémentaires (tests : fonction de décision injectée). */
+  matchOptions?: Omit<RunMatchOptions, 'onDecisions' | 'collectEvents'>;
 }
 
 export interface FitnessBreakdown {
@@ -310,7 +312,7 @@ export function makeMatchFitness(options: MatchFitnessOptions = {}): MatchFitnes
         config,
         policies: { A: FULL_POLICY_NAME, B: FULL_POLICY_NAME },
         paramOverrides: { [candidateSide]: candidate, [oppSide]: pool.pick(i) } as MatchTask['paramOverrides'],
-        options: { collectEvents: true },
+        options: { ...(options.matchOptions ?? {}), collectEvents: true },
       });
     }
     return out;
@@ -359,6 +361,8 @@ export interface OptimizeParamsOptions {
   base?: SimParams;
   batch?: BatchOptions;
   onGeneration?: (record: GenerationRecord) => void;
+  matchOptions?: MatchFitnessOptions['matchOptions'];
+  minSigma?: number;
 }
 
 export interface OptimizeParamsResult {
@@ -373,7 +377,7 @@ export interface OptimizeParamsResult {
 export async function optimizeParams(options: OptimizeParamsOptions = {}): Promise<OptimizeParamsResult> {
   const paths = [...(options.paths ?? DEFAULT_OPTIM_PATHS)];
   const base = options.base ?? DEFAULT_PARAMS;
-  const fit = makeMatchFitness({ paths, matches: options.matches, minutes: options.minutes, base, batch: options.batch });
+  const fit = makeMatchFitness({ paths, matches: options.matches, minutes: options.minutes, base, batch: options.batch, matchOptions: options.matchOptions });
   const optimizer = OPTIMIZERS[options.optimizer ?? 'cem'];
   const result = await optimizer({
     dims: paths.length,
@@ -383,7 +387,7 @@ export async function optimizeParams(options: OptimizeParamsOptions = {}): Promi
     population: options.population ?? 32,
     elites: options.elites ?? 8,
     generations: options.generations ?? 25,
-    minSigma: 0.02,
+    minSigma: options.minSigma ?? 0.02,
     fitness: fit.fitness,
     rng: new Rng(options.seed ?? 2024),
     seedsPerGeneration: Math.min(8, options.matches ?? 8),

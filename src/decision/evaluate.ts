@@ -337,9 +337,9 @@ function positivePhrase(c: ScoreComponent, cand: Candidate): string | null {
   const a = cand.action;
   switch (c.key) {
     case 'threat':
-      return a.type === 'shoot' ? `chance de but (xG ${fmtPct(cand.probability)})` : `zone d’arrivée dangereuse (xT ${fmtFr(c.value, 2)})`;
+      return a.type === 'shoot' ? `chance de but (xG ${fmtPct(cand.probability)})` : `zone dangereuse (xT ${fmtFr(c.value, 2)})`;
     case 'control':
-      return `espace disponible important (contrôle ${fmtPct(c.value + 0.5)})`;
+      return `espace disponible important (${fmtPct(c.value + 0.5)})`;
     case 'progression':
       return `forte progression vers le but (+${fmtFr(c.value, 0)} m)`;
     case 'support':
@@ -364,10 +364,10 @@ function negativePhrase(c: ScoreComponent, cand: Candidate, state: MatchState): 
       if ((a.type === 'pass' || a.type === 'clear') && cand.threats && cand.threats.length > 0) {
         return `risque d’interception élevé (${playerNumber(state, cand.threats[0])})`;
       }
-      return `perte dangereuse en cas d’échec (${fmtPct(1 - cand.probability)})`;
+      return `risque de perte (${fmtPct(1 - cand.probability)})`;
     }
     case 'control':
-      return `zone d’arrivée contestée (contrôle ${fmtPct(c.value + 0.5)})`;
+      return `zone contestée (${fmtPct(c.value + 0.5)})`;
     case 'progression':
       return `recul de ${fmtFr(-c.value, 0)} m`;
     case 'support':
@@ -392,6 +392,7 @@ function probabilityPhrase(cand: Candidate, pressureBall: number): string | null
   if (a.type === 'pass') return `ligne de passe dégagée (${fmtPct(cand.probability)})`;
   if (a.type === 'dribble') return `dribble sûr (${fmtPct(cand.probability)})`;
   if (a.type === 'hold') return pressureBall < 0.5 ? 'faible pression défensive' : `conservation probable (${fmtPct(cand.probability)})`;
+  if (a.type === 'clear') return 'dégagement sûr';
   return null;
 }
 

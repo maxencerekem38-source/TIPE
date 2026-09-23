@@ -115,6 +115,7 @@ export const DEFAULT_PARAMS: SimParams = {
     hysteresis: 0.15,
     runBandWidth: 15,
     reexamineEvery: 2,
+    wSupport: 0.1,
   },
   defence: {
     muPriority: 6,

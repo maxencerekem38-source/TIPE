@@ -114,7 +114,9 @@ export function shortLabel(candidate: Candidate, state: MatchState, playerId?: n
   const a = candidate.action;
   switch (a.type) {
     case 'pass':
-      return `${a.kind === 'through' ? 'Profondeur' : a.kind === 'lob' ? 'Lob' : 'Passe'} → ${playerNumber(state, a.targetId)}`;
+      return a.kind === 'through'
+        ? `Profondeur → ${playerNumber(state, a.targetId)} vers ${fmtPoint(a.targetPoint)}`
+        : `${a.kind === 'lob' ? 'Lob' : 'Passe'} → ${playerNumber(state, a.targetId)}`;
     case 'dribble':
       return `Dribble ${directionArrow(a.direction, teamOf(state, playerId))} ${fmtFr(a.distance, 0)} m`;
     case 'shoot':
@@ -179,20 +181,30 @@ const contributionOf = (c: Candidate, key: string): number => {
   return s;
 };
 
-/** Composante de plus grand écart (chosen − alt) entre deux candidats ; null si aucune. */
+/** Clés « secondaires » : ne servent de « pourquoi pas » qu'à défaut d'un écart sur un terme physique. */
+const SECONDARY_KEYS = new Set(['tactic', 'hysteresis']);
+
+/**
+ * Composante de plus grand écart (chosen − alt) entre deux candidats ; les termes physiques priment sur les bonus
+ * tactiques et l'hystérésis (utilisés seulement si aucun terme physique n'est en faveur de l'action choisie).
+ * null si aucune composante.
+ */
 export function largestGap(chosen: Candidate, alt: Candidate): { key: string; label: string; gap: number } | null {
   const keys = new Set<string>();
   for (const k of chosen.components) keys.add(k.key);
   for (const k of alt.components) keys.add(k.key);
   let best: { key: string; label: string; gap: number } | null = null;
+  let bestSecondary: { key: string; label: string; gap: number } | null = null;
   for (const key of keys) {
     const gap = contributionOf(chosen, key) - contributionOf(alt, key);
-    if (!best || gap > best.gap) {
-      const comp: ScoreComponent | undefined = chosen.components.find((k) => k.key === key) ?? alt.components.find((k) => k.key === key);
-      best = { key, label: comp?.label ?? key, gap };
-    }
+    const comp: ScoreComponent | undefined = chosen.components.find((k) => k.key === key) ?? alt.components.find((k) => k.key === key);
+    const entry = { key, label: comp?.label ?? key, gap };
+    if (SECONDARY_KEYS.has(key)) { if (!bestSecondary || gap > bestSecondary.gap) bestSecondary = entry; }
+    else if (!best || gap > best.gap) best = entry;
   }
-  return best;
+  if (best && best.gap > 1e-9) return best;
+  if (bestSecondary && bestSecondary.gap > 1e-9) return bestSecondary;
+  return best ?? bestSecondary;
 }
 
 /**
