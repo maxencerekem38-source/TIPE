@@ -43,6 +43,10 @@ export interface Simulation {
   advance(seconds: number, options?: StepOptions): void;
   /** Dernières décisions par joueur. */
   decisions: Map<number, Decision>;
+}
+
+/** Simulation du moteur : `Simulation` enrichie des aides de pilotage (remise à zéro, tactiques, fin de match). */
+export interface EngineSimulation extends Simulation {
   /** Instant du prochain cycle de décision (s). */
   nextDecisionTime: number;
   /** Le match a atteint `config.durationSec`. */
@@ -66,10 +70,10 @@ function defaultPolicies(): Record<TeamId, PolicySet> {
   return { A: full, B: full };
 }
 
-export function createSimulation(config: MatchConfig, options: SimulationOptions = {}): Simulation {
+export function createSimulation(config: MatchConfig, options: SimulationOptions = {}): EngineSimulation {
   const cfg: MatchConfig = { ...config, tactics: { A: config.tactics.A, B: config.tactics.B } };
   const initialRng = new Rng(cfg.seed);
-  const sim: Simulation = {
+  const sim: EngineSimulation = {
     state: createMatch(cfg, initialRng),
     config: cfg,
     rng: initialRng,
@@ -101,7 +105,7 @@ export function createSimulation(config: MatchConfig, options: SimulationOptions
 }
 
 /** Un pas de simulation (§13.2). */
-function stepOnce(sim: Simulation, options: StepOptions): void {
+function stepOnce(sim: EngineSimulation, options: StepOptions): void {
   const state = sim.state;
   const cfg = sim.config;
   const params = cfg.params;

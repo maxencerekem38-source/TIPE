@@ -337,7 +337,7 @@ export const stars = (p: number): string => (p < 0.001 ? '***' : p < 0.01 ? '**'
 export function mdTable(headers: string[], rows: (string | number)[][], align?: string[]): string {
   const al = headers.map((_, i) => align?.[i] ?? (i === 0 ? 'l' : 'r'));
   const sep = al.map((a) => (a === 'l' ? ':---' : a === 'c' ? ':---:' : '---:'));
-  const cell = (c: string | number): string => (typeof c === 'number' ? fmt(c) : c);
+  const cell = (c: string | number): string => (typeof c === 'number' ? (Number.isInteger(c) ? String(c) : fmt(c)) : c);
   return [`| ${headers.join(' | ')} |`, `| ${sep.join(' | ')} |`, ...rows.map((r) => `| ${r.map(cell).join(' | ')} |`)].join('\n');
 }
 

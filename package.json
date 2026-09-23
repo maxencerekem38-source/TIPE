@@ -16,7 +16,8 @@
     "scenarios": "tsx scripts/scenarios.ts",
     "optimize": "tsx scripts/optimize.ts",
     "bench": "tsx scripts/bench.ts",
-    "screenshot": "tsx scripts/screenshot.ts"
+    "screenshot": "tsx scripts/screenshot.ts",
+    "calibrate": "tsx scripts/calibrate.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

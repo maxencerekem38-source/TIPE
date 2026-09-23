@@ -106,10 +106,11 @@ export const isNotImplemented = (err: unknown): boolean =>
   err instanceof Error ? err.message.includes(NOT_IMPLEMENTED) : String(err).includes(NOT_IMPLEMENTED);
 
 let engineCache: { ok: boolean; reason: string } | null = null;
+let simulationCache: { ok: boolean; reason: string } | null = null;
 
 /**
- * Le moteur est-il utilisable ? On tente de créer une simulation par défaut et d'avancer d'un pas.
- * Le résultat est mis en cache (le moteur ne change pas en cours d'exécution).
+ * Le moteur complet (simulation + couche décision) est-il utilisable ? On tente de créer une simulation
+ * par défaut et d'avancer d'un pas avec l'algorithme complet. Résultat mis en cache.
  */
 export function engineStatus(): { ok: boolean; reason: string } {
   if (engineCache) return engineCache;
@@ -124,10 +125,28 @@ export function engineStatus(): { ok: boolean; reason: string } {
   return engineCache;
 }
 
-export const engineAvailable = (): boolean => engineStatus().ok;
+/**
+ * La simulation seule (physique, règles, création de match) est-elle utilisable ? On avance d'un pas
+ * avec une fonction de décision factice (aucune décision), indépendamment de la couche décision.
+ */
+export function simulationStatus(): { ok: boolean; reason: string } {
+  if (simulationCache) return simulationCache;
+  try {
+    const sim = loopModule.createSimulation(makeConfig({ seed: 1, minutes: 1 }));
+    sim.step({ decide: () => new Map() });
+    sim.advance(0.5, { decide: () => new Map() });
+    simulationCache = { ok: true, reason: '' };
+  } catch (err) {
+    simulationCache = { ok: false, reason: err instanceof Error ? err.message : String(err) };
+  }
+  return simulationCache;
+}
 
-/** Réinitialise le cache (tests). */
-export const resetEngineStatus = (): void => { engineCache = null; };
+export const engineAvailable = (): boolean => engineStatus().ok;
+export const simulationAvailable = (): boolean => simulationStatus().ok;
+
+/** Réinitialise les caches (tests). */
+export const resetEngineStatus = (): void => { engineCache = null; simulationCache = null; };
 
 export const ENGINE_UNAVAILABLE_MESSAGE = 'moteur non disponible';
 

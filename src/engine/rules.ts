@@ -91,7 +91,11 @@ export function changePossession(state: MatchState, team: TeamId, turnover: bool
   state.possessionSince = state.time;
   const p = pos ? { x: pos.x, y: pos.y } : { x: state.ball.pos.x, y: state.ball.pos.y };
   pushEvent(state, { time: state.time, kind: 'possession_change', team, pos: p });
-  if (turnover && loser) pushEvent(state, { time: state.time, kind: 'turnover', team: loser, playerId: loserId, pos: { ...p } });
+  if (turnover && loser) {
+    // Le joueur fautif n'est attribué que s'il appartient bien à l'équipe qui perd le ballon
+    const culprit = loserId !== undefined ? playerById(state, loserId) : undefined;
+    pushEvent(state, { time: state.time, kind: 'turnover', team: loser, playerId: culprit && culprit.team === loser ? culprit.id : undefined, pos: { ...p } });
+  }
 }
 
 // ---------------------------------------------------------------------------

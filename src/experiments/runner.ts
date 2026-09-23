@@ -15,7 +15,7 @@ import type { Vec2 } from '../core/vec2';
 import { emptyStats } from '../core/state-builder';
 import { applyFlatParams } from '../core/params';
 import type { PolicySet } from '../decision/policy';
-import type { Simulation, StepOptions } from '../engine/loop';
+import type { DecideFn, Simulation, StepOptions } from '../engine/loop';
 import { createSimulation } from '../engine/loop';
 import * as structureModule from '../models/structure';
 import { latencyPercentiles, teamKpis, type TeamKpi } from './metrics';
@@ -88,6 +88,8 @@ export interface RunMatchOptions {
   onDecisions?: StepOptions['onDecisions'];
   /** Étiquettes des politiques (pour le résultat). */
   policyNames?: Record<TeamId, string>;
+  /** Fonction de décision injectée (tests, baselines factices) — remplace `decideAll`. */
+  decide?: DecideFn;
 }
 
 // ---------------------------------------------------------------------------
@@ -316,7 +318,7 @@ export function runMatch(config: MatchConfig, policies?: Record<TeamId, PolicySe
     ...options,
     policyNames: options.policyNames ?? (policies ? { A: policies.A.name, B: policies.B.name } : undefined),
   });
-  const stepOptions: StepOptions = { policies, onDecisions: collector.onDecisions };
+  const stepOptions: StepOptions = { policies, onDecisions: collector.onDecisions, ...(options.decide ? { decide: options.decide } : {}) };
   const t0 = performance.now();
   sim.advance(config.durationSec, stepOptions);
   const wallMs = performance.now() - t0;
@@ -441,6 +443,8 @@ export interface RunScenarioOptions {
   params?: SimParams;
   /** Politique de l'équipe adverse (défaut : algorithme complet, sinon la même politique). */
   opponentPolicy?: PolicySet;
+  /** Fonction de décision injectée (tests) — remplace `decideAll`. */
+  decide?: DecideFn;
 }
 
 /**
@@ -459,21 +463,21 @@ export function runScenario(scenario: Scenario, policy: PolicySet | undefined, s
     if (!other) { try { other = resolvePolicy(FULL_POLICY_NAME); } catch { other = policy; } }
     policies = { [team]: policy, [opp]: other } as Record<TeamId, PolicySet>;
   }
-  let captured: Decision | null = null;
+  const capture: { decision: Decision | null } = { decision: null };
   let possessionTicks = 0, totalTicks = 0;
   const onDecisions = (decisions: Map<number, Decision>, s: MatchState): void => {
     totalTicks++;
     if (s.possession === team) possessionTicks++;
-    if (captured) return;
+    if (capture.decision) return;
     const d = decisions.get(scenario.protagonistId);
-    if (d && d.chosen.action.type !== 'move' && s.ball.ownerId === scenario.protagonistId) captured = d;
+    if (d && d.chosen.action.type !== 'move' && s.ball.ownerId === scenario.protagonistId) capture.decision = d;
   };
   const t0 = performance.now();
-  sim.advance(horizonSec, { policies, onDecisions });
+  sim.advance(horizonSec, { policies, onDecisions, ...(options.decide ? { decide: options.decide } : {}) });
   const wall = performance.now() - t0;
   const live = sim.state;
   const protagonist = live.players.find((p) => p.id === scenario.protagonistId)!;
-  const decision: Decision | null = captured;
+  const decision: Decision | null = capture.decision;
   const action = decision ? decision.chosen.action : null;
   const cls = action ? actionClassOf(action) : null;
   const acceptable = action ? isAcceptable(scenario.acceptable, action, { pos: state.players.find((p) => p.id === scenario.protagonistId)!.pos, team: protagonist.team }) : false;
