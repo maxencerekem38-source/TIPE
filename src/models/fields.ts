@@ -21,6 +21,8 @@ const DEFAULT_PRESSURE_CLOSING = 0.5;
 const DEFAULT_THREAT_KEEPER_COVERAGE = 0.57;
 /** Au-delà de 4 r_p, exp(−r²/2r_p²) < 4·10⁻⁴ : contribution négligée (accélère le calcul de la pression). */
 const PRESSURE_CUTOFF_RADII = 4;
+/** Poids du softmin ignorés au-delà de e^{−12} (accélère le contrôle, erreur relative < 10⁻⁴). */
+const EXP_CUTOFF = 12;
 const BOX_X = PITCH.halfLength - PITCH.penaltyAreaLength; // 36 m
 const BOX_Y = PITCH.penaltyAreaHalfWidth; // 20,16 m
 
@@ -210,8 +212,8 @@ export function computeFields(state: MatchState, params: SimParams): FieldSet {
   // Le gardien ne participe au contrôle que dans sa propre surface (§4.2) : minT ne compte que les
   // joueurs éligibles, argminPlayer compte tout le monde (espace disponible, §4.5).
   const arrivalTime: ScalarField[] = new Array(P);
-  const minAll = new Float32Array(n).fill(Infinity);
-  const minT = new Float32Array(n).fill(Infinity);
+  const minAll = new Float64Array(n).fill(Infinity);
+  const minT = new Float64Array(n).fill(Infinity);
   const boxSide = new Int8Array(P);
   const tau = m.reactionTime;
   for (let k = 0; k < P; k++) {
@@ -245,27 +247,29 @@ export function computeFields(state: MatchState, params: SimParams): FieldSet {
   }
 
   // --- 2. Contrôle : softmin centré sur le min (stable pour β → 0) ---
-  const sumA = new Float32Array(n);
-  const sumAll = new Float32Array(n);
+  // Les poids e^{−(T−T_min)/β} < e^{−12} sont ignorés (erreur relative < 22·e^{−12} ≈ 10⁻⁴).
+  const sumA = new Float64Array(n);
+  const sumB = new Float64Array(n);
   const invBeta = 1 / Math.max(1e-6, m.controlBeta);
   for (let k = 0; k < P; k++) {
     const data = arrivalTime[k].data;
     const side = boxSide[k];
-    const isA = players[k].team === 'A';
+    const acc = players[k].team === 'A' ? sumA : sumB;
     for (let j = 0; j < rows; j++) {
-      const y = ys[j];
-      if (side !== 0 && Math.abs(y) > BOX_Y) continue;
+      if (side !== 0 && Math.abs(ys[j]) > BOX_Y) continue;
       let idx = j * cols;
       for (let i = 0; i < cols; i++, idx++) {
         if (side !== 0 && side * xs[i] < BOX_X) continue;
-        const w = Math.exp(-(data[idx] - minT[idx]) * invBeta);
-        sumAll[idx] += w;
-        if (isA) sumA[idx] += w;
+        const z = (data[idx] - minT[idx]) * invBeta;
+        if (z < EXP_CUTOFF) acc[idx] += Math.exp(-z);
       }
     }
   }
   const ctl = controlA.data;
-  for (let idx = 0; idx < n; idx++) ctl[idx] = sumAll[idx] > 0 ? sumA[idx] / sumAll[idx] : 0.5;
+  for (let idx = 0; idx < n; idx++) {
+    const tot = sumA[idx] + sumB[idx];
+    ctl[idx] = tot > 0 ? sumA[idx] / tot : 0.5;
+  }
 
   // --- 3. Pression (§4.4) : par joueur, sur la fenêtre de cellules à moins de 4 r_p ---
   const invTwoR2 = 1 / (2 * m.pressureRadius * m.pressureRadius);
