@@ -1,0 +1,8 @@
+node_modules/
+dist/
+results/*.json
+results/*.csv
+!results/.gitkeep
+.DS_Store
+*.log
+.vite/

@@ -1,0 +1,27 @@
+{
+  "name": "tipe-football-decision",
+  "version": "1.0.0",
+  "description": "Système de décision et simulation tactique de football — TIPE MPI",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "sim": "tsx scripts/sim.ts",
+    "experiments": "tsx scripts/experiments.ts",
+    "scenarios": "tsx scripts/scenarios.ts",
+    "optimize": "tsx scripts/optimize.ts",
+    "bench": "tsx scripts/bench.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vite": "^6.0.0",
+    "vitest": "^2.1.0"
+  }
+}
