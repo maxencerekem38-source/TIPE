@@ -6,3 +6,6 @@ results/*.csv
 .DS_Store
 *.log
 .vite/
+results/analysis/
+results/screenshots/*.png
+!results/screenshots/.gitkeep
