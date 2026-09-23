@@ -115,25 +115,24 @@ export function isOffsidePosition(state: MatchState, q: Vec2, attackingTeam: Tea
 
 /**
  * Aire de la cellule de Voronoï (euclidienne) du joueur (m²), bornée au terrain — « espace propre ».
- * Approximation par échantillonnage : centres de cellules de `cellSize` m, chaque cellule pondérée par
- * son aire réellement incluse dans le terrain (la somme sur les 22 joueurs vaut exactement L·W).
- * `radius` (optionnel) restreint le comptage aux cellules à moins de `radius` m du joueur (espace §4.5).
+ * Approximation par échantillonnage : le terrain est découpé en cellules uniformes de taille ≈ `cellSize`
+ * (n_x = ⌈L/cellSize⌉ colonnes de largeur L/n_x, idem en y) ; une cellule est attribuée au joueur le plus
+ * proche de son centre (égalité : plus petit identifiant), de sorte que la somme sur tous les joueurs vaut
+ * exactement L·W. `radius` (optionnel) restreint le comptage aux cellules à moins de `radius` m du joueur (§4.5).
  */
 export function voronoiArea(state: MatchState, playerId: number, cellSize = 2, radius?: number): number {
   const players = state.players;
   const me = players.find((p) => p.id === playerId);
   if (!me) return 0;
-  const nx = Math.ceil(PITCH.length / cellSize), ny = Math.ceil(PITCH.width / cellSize);
+  const nx = Math.max(1, Math.ceil(PITCH.length / cellSize)), ny = Math.max(1, Math.ceil(PITCH.width / cellSize));
+  const wx = PITCH.length / nx, wy = PITCH.width / ny;
+  const cellArea = wx * wy;
   const r2 = radius !== undefined ? radius * radius : Infinity;
-  let area = 0;
+  let count = 0;
   for (let j = 0; j < ny; j++) {
-    const y0 = -PITCH.halfWidth + j * cellSize;
-    const h = Math.min(cellSize, PITCH.halfWidth - y0);
-    const y = y0 + h / 2;
+    const y = -PITCH.halfWidth + (j + 0.5) * wy;
     for (let i = 0; i < nx; i++) {
-      const x0 = -PITCH.halfLength + i * cellSize;
-      const w = Math.min(cellSize, PITCH.halfLength - x0);
-      const x = x0 + w / 2;
+      const x = -PITCH.halfLength + (i + 0.5) * wx;
       const mdx = x - me.pos.x, mdy = y - me.pos.y;
       const myD2 = mdx * mdx + mdy * mdy;
       if (myD2 >= r2) continue;
@@ -142,12 +141,13 @@ export function voronoiArea(state: MatchState, playerId: number, cellSize = 2, r
         const p = players[k];
         if (p.id === playerId) continue;
         const dx = x - p.pos.x, dy = y - p.pos.y;
-        if (dx * dx + dy * dy < myD2) { nearest = false; break; }
+        const d2 = dx * dx + dy * dy;
+        if (d2 < myD2 || (d2 === myD2 && p.id < playerId)) { nearest = false; break; }
       }
-      if (nearest) area += w * h;
+      if (nearest) count++;
     }
   }
-  return area;
+  return count * cellArea;
 }
 
 /** Supériorité globale (§4.7) : Σ_{q ∈ tiers offensif} PC_att(q) Δ² (m²), lue sur le champ de contrôle. */
