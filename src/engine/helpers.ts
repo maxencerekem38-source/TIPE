@@ -37,6 +37,27 @@ export const ballStopDistance = (initialSpeed: number, physics: PhysicsParams): 
   physics.ballFriction <= 1e-9 ? Infinity : (initialSpeed * initialSpeed) / (2 * physics.ballFriction);
 
 // ---------------------------------------------------------------------------
+// Ballon aérien (lob, dégagement) : tir balistique à 45° partagé avec le modèle de décision
+// ---------------------------------------------------------------------------
+/** Gravité (m/s²). */
+export const GRAVITY = 9.81;
+
+/**
+ * Cinématique d'un ballon aérien couvrant `distance` : tir à 45° (v₀ = √(g d), bornée à passSpeedMax),
+ * composante horizontale hs = v₀/√2, durée T = d/hs, vitesse verticale vz = g·T/2 (portée exactement d).
+ * Identique au `flightModel('lob')` de src/models/interception.ts : la décision et le moteur prévoient la même durée.
+ * Apogée g·T²/8 = d/4 (7,5 m pour 30 m). Au-delà de passSpeedMax²/g (≈ 64 m) l'arc se redresse (vz > hs).
+ */
+export function lobKinematics(distance: number, physics: PhysicsParams): { hs: number; T: number; vz: number; initialSpeed: number } {
+  const d = Math.max(0.1, distance);
+  const s0 = Math.min(physics.passSpeedMax, Math.sqrt(GRAVITY * d));
+  const hs = s0 / Math.SQRT2;
+  const T = d / hs;
+  const vz = (GRAVITY * T) / 2;
+  return { hs, T, vz, initialSpeed: Math.hypot(hs, vz) };
+}
+
+// ---------------------------------------------------------------------------
 // Pont optionnel vers src/models
 // ---------------------------------------------------------------------------
 const NOT_IMPLEMENTED = /non implémenté/;
@@ -141,6 +162,22 @@ export function nearestPlayer(state: MatchState, q: Vec2, team?: TeamId, exclude
     if (d < bestD) { bestD = d; best = p; }
   }
   return best;
+}
+
+/**
+ * Joueur de champ de `team` le plus proche de q (le gardien seulement s'il n'y a personne d'autre) :
+ * remetteur d'une touche, d'un corner ou d'un coup franc — le gardien n'est jamais téléporté loin de son but.
+ */
+export function nearestOutfield(state: MatchState, q: Vec2, team?: TeamId, excludeId?: number): Player | undefined {
+  let best: Player | undefined;
+  let bestD = Infinity;
+  for (const p of state.players) {
+    if (team !== undefined && p.team !== team) continue;
+    if (p.id === excludeId || p.role === 'GK') continue;
+    const d = dist2(p.pos, q);
+    if (d < bestD) { bestD = d; best = p; }
+  }
+  return best ?? nearestPlayer(state, q, team, excludeId);
 }
 
 /** Adversaire de `team` le plus proche de q. */

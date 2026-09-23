@@ -17,15 +17,19 @@ import { makeTactic } from '@/tactics/styles';
 import type { DecisionInput } from '@/decision/policy';
 import { decideOnBall, evaluateCandidates, selectCandidate, sameAction } from '@/decision/onball';
 import { modulatedWeights } from '@/decision/evaluate';
-import { actionLabel, explainDecision, whyNot, directionLabel } from '@/decision/explain';
+import { proposeThroughBalls } from '@/decision/candidates';
+import { actionLabel, explainDecision, whyNot, directionLabel, shortLabel } from '@/decision/explain';
 
 const P: SimParams = DEFAULT_PARAMS;
 const v = (x: number, y: number): Vec2 => ({ x, y });
 const mirror = (p: Vec2): Vec2 => ({ x: -p.x, y: -p.y });
 
-/** Paramètres déterministes (argmax pur). */
+/** Paramètres déterministes (argmax pur, départage ε par P puis T). */
 const P0: SimParams = cloneParams(P);
 P0.decision.softmaxTemperature = 0;
+/** Déterministes ET sans fenêtre ε (argmax strict) : isole l'hystérésis du départage. */
+const P0e: SimParams = cloneParams(P0);
+P0e.decision.epsilonTie = 0;
 
 /** État « équipe A attaque vers +x » : le porteur est le joueur `ownerId` (rôle MF sauf mention). */
 function simple(players: PlayerSpec[], ownerId = 0, style: StyleId = 'balanced'): MatchState {
@@ -143,8 +147,10 @@ describe('propriétés de classement (§6.2)', () => {
     expect(po.probability).toBeGreaterThan(0.75);
     expect(pb.probability).toBeLessThan(po.probability - 0.2);
     expect(pb.score).toBeLessThan(po.score);
-    // Recul dans le classement : le rang de la passe ne s'améliore pas et sa décomposition porte le risque d'interception.
-    expect(cb.indexOf(pb)).toBeGreaterThanOrEqual(co.indexOf(po));
+    // Recul dans le classement (hors passes en profondeur, dont les cibles « espace » dépendent de la géométrie) :
+    // le rang de la passe ne s'améliore pas et sa décomposition porte le risque d'interception.
+    const rank = (list: Candidate[], c: Candidate): number => list.filter((k) => !isPass(k, 'through')).indexOf(c);
+    expect(rank(cb, pb)).toBeGreaterThanOrEqual(rank(co, po));
     const risk = (c: Candidate): number => c.components.find((k) => k.key === 'risk')!.contribution;
     expect(risk(pb)).toBeLessThan(risk(po));
     expect(pb.threats).toContain(2);
@@ -152,10 +158,10 @@ describe('propriétés de classement (§6.2)', () => {
     expect(pb.reason).toMatch(/interception/);
   });
 
-  it('tir ouvert depuis le point de penalty (gardien hors de position) : le tir est choisi', () => {
+  it('tir ouvert à 8 m (gardien hors de position, dribble fermé par deux défenseurs) : le tir est choisi', () => {
     const state = simple([
-      { team: 'A', pos: v(41.5, 0) }, { team: 'A', pos: v(30, 10) },
-      { team: 'B', pos: v(50, 18), role: 'GK' }, { team: 'B', pos: v(44, 2.6) }, { team: 'B', pos: v(44, -2.6) }, { team: 'B', pos: v(38, 6) },
+      { team: 'A', pos: v(44.5, 0) }, { team: 'A', pos: v(30, 10) },
+      { team: 'B', pos: v(50, 18), role: 'GK' }, { team: 'B', pos: v(46.5, 2.5) }, { team: 'B', pos: v(46.5, -2.5) }, { team: 'B', pos: v(42.5, 0.5), vel: v(6, 0) },
     ]);
     const d = decideOnBall(mkInput(state), 0, null);
     expect(d.chosen.action.type).toBe('shoot');
@@ -164,7 +170,32 @@ describe('propriétés de classement (§6.2)', () => {
     expect(shot.probability).toBeGreaterThan(0.2);
     if (shot.action.type === 'shoot') expect(shot.action.xg).toBeCloseTo(shot.probability, 9);
     expect(d.candidates.filter((c) => c.action.type === 'shoot')).toHaveLength(1); // trois visées, la meilleure retenue
-    expect(d.explanation.split('\n')[0]).toBe('ACTION OPTIMALE : TIRER');
+    expect(d.explanation.split('\n')[0]).toBe('ACTION CHOISIE : TIRER');
+    // Coût d'opportunité du tir : composante « possession » = −(1 − xG)·w·Θ(b), absente si w = 0.
+    const poss = shot.components.find((k) => k.key === 'possession')!;
+    expect(poss).toBeDefined();
+    expect(poss.contribution).toBeLessThan(0);
+    expect(poss.contribution).toBeCloseTo(-(1 - shot.probability) * (P.decision.wShotPossession ?? 1) * poss.value, 9);
+    const noCost = cloneParams(P0);
+    noCost.decision.wShotPossession = 0;
+    const d0 = decideOnBall(mkInput(state, 1, noCost), 0, null);
+    expect(d0.candidates.find((c) => c.action.type === 'shoot')!.components.some((k) => k.key === 'possession')).toBe(false);
+  });
+
+  it('tir lointain désespéré (33 m, xG < xG_min) : le tir n’est pas un candidat, sinon il battrait toute passe', () => {
+    const state = simple([
+      { team: 'A', pos: v(19.5, 0) }, { team: 'A', pos: v(25, 10) }, { team: 'A', pos: v(15, -12) },
+      { team: 'B', pos: v(52, 0), role: 'GK' }, { team: 'B', pos: v(30, 4) }, { team: 'B', pos: v(30, -6) }, { team: 'B', pos: v(38, 10) }, { team: 'B', pos: v(40, -12) },
+    ]);
+    const d = decideOnBall(mkInput(state), 0, null);
+    expect(d.candidates.some((c) => c.action.type === 'shoot')).toBe(false);
+    // Sans plancher, le tir existe mais avec un xG faible.
+    const free = cloneParams(P0);
+    free.decision.shotMinXg = 0;
+    const shot = decideOnBall(mkInput(state, 1, free), 0, null).candidates.find((c) => c.action.type === 'shoot')!;
+    expect(shot).toBeDefined();
+    expect(shot.probability).toBeLessThan(0.04);
+    expect(shot.action.type).toBe('shoot');
   });
 
   it('impasse : défenseurs côté but des coéquipiers, pas de tir possible ⇒ conservation ou dribble, jamais une passe', () => {
@@ -190,17 +221,21 @@ describe('hystérésis, déterminisme, réponse quantale (§6.5)', () => {
   ]);
 
   it('l’intention précédente est conservée quand le challenger reste dans la marge h, pas au-delà', () => {
-    const d1 = decideOnBall(mkInput(symmetric()), 0, null);
+    // Argmax strict (ε = 0) pour isoler l'hystérésis du départage à ε près.
+    const d1 = decideOnBall(mkInput(symmetric(), 1, P0e), 0, null);
     expect(d1.chosen.action.type).toBe('pass');
     const chosenTarget = d1.chosen.action.type === 'pass' ? d1.chosen.action.targetId : -1;
     const other = chosenTarget === 1 ? 2 : 1;
-    // Le challenger devient légèrement meilleur (0,4 m plus avancé) : sans mémoire il gagne…
+    // Le challenger devient légèrement meilleur (0,3 m plus avancé) : sans mémoire il gagne…
     const s2 = symmetric();
-    s2.players[other].pos.x += 0.4;
-    const dNone = decideOnBall(mkInput(s2), 0, null);
+    s2.players[other].pos.x += 0.3;
+    const dNone = decideOnBall(mkInput(s2, 1, P0e), 0, null);
     expect(dNone.chosen.action.type === 'pass' && dNone.chosen.action.targetId).toBe(other);
-    // … mais avec l'intention précédente l'action est conservée (écart < h = 0,02).
-    const dPrev = decideOnBall(mkInput(s2), 0, d1);
+    const gap = dNone.candidates[0].score - dNone.candidates.find((c) => sameAction(c.action, d1.chosen.action))!.score;
+    expect(gap).toBeGreaterThan(0);
+    expect(gap).toBeLessThan(P.decision.hysteresis);
+    // … mais avec l'intention précédente l'action est conservée (écart < h).
+    const dPrev = decideOnBall(mkInput(s2, 1, P0e), 0, d1);
     expect(sameAction(dPrev.chosen.action, d1.chosen.action)).toBe(true);
     expect(dPrev.keptByHysteresis).toBe(true);
     expect(dPrev.chosen.components.find((k) => k.key === 'hysteresis')!.contribution).toBeCloseTo(P.decision.hysteresis, 9);
@@ -211,9 +246,46 @@ describe('hystérésis, déterminisme, réponse quantale (§6.5)', () => {
       { team: 'B', pos: v(52, 0), role: 'GK' }, { team: 'B', pos: v(30, 12) }, { team: 'B', pos: v(30, -12) }, { team: 'B', pos: v(-6, 0) },
       { team: 'B', pos: v(q.x * 0.6, q.y * 0.6) },
     ]);
-    const dFar = decideOnBall(mkInput(s3), 0, d1);
+    const dFar = decideOnBall(mkInput(s3, 1, P0e), 0, d1);
     expect(dFar.keptByHysteresis).toBeFalsy();
     expect(sameAction(dFar.chosen.action, d1.chosen.action)).toBe(false);
+  });
+
+  it('calibration de h (§6.5) : h est de l’ordre du 30ᵉ percentile des écarts Q(a₁) − Q(a₂) bruts (rapporté)', () => {
+    const gaps: number[] = [];
+    const carriers = [1, 4, 6, 8, 9, 10];
+    const balls = [v(-30, -10), v(-15, 5), v(0, 0), v(10, -15), v(20, 8), v(32, 0), v(40, -12)];
+    for (const owner of carriers) {
+      for (const ballPos of balls) {
+        const state = buildFullState({ ownerId: owner, ballPos });
+        const d = decideOnBall(mkInput(state, 1, P0), owner, null);
+        if (d.candidates.length > 1) gaps.push(d.candidates[0].score - d.candidates[1].score);
+      }
+    }
+    gaps.sort((a, b) => a - b);
+    const q = (p: number): number => gaps[Math.min(gaps.length - 1, Math.floor(p * gaps.length))];
+    // eslint-disable-next-line no-console
+    console.log(`écarts Q1−Q2 (${gaps.length} décisions) : p10 ${q(0.1).toFixed(4)} p30 ${q(0.3).toFixed(4)} p50 ${q(0.5).toFixed(4)} — h = ${P.decision.hysteresis}`);
+    expect(gaps.length).toBeGreaterThan(30);
+    expect(P.decision.hysteresis).toBeGreaterThanOrEqual(q(0.1));
+    expect(P.decision.hysteresis).toBeLessThanOrEqual(q(0.6));
+  });
+
+  it('départage à ε près (§6.5) : à température nulle, parmi les candidats à ε du meilleur, le plus probable puis le plus rapide', () => {
+    const fake = (score: number, probability: number, duration: number): Candidate => ({ action: { type: 'hold' }, score, probability, duration, valueIfSuccess: 0, valueIfFailure: 0, components: [], reason: '' });
+    const list = [fake(0.100, 0.5, 1), fake(0.099, 0.9, 1), fake(0.0985, 0.9, 0.5), fake(0.090, 1.0, 0.1)];
+    expect(selectCandidate(list, 0.005, 0, new Rng(1))).toBe(list[2]);
+    expect(selectCandidate(list, 0, 0, new Rng(1))).toBe(list[0]);
+    // Deux passes symétriques (même score à ε près) : la décision réelle choisit celle de plus grande probabilité.
+    const state = symmetric();
+    state.players[2].pos.x += 0.3; // légèrement plus avancée : score un peu plus haut, P un peu plus faible
+    const d = decideOnBall(mkInput(state, 1, P0), 0, null);
+    const best = d.candidates[0].score;
+    const window = d.candidates.filter((c) => c.score >= best - P.decision.epsilonTie);
+    expect(window.length).toBeGreaterThan(1); // les deux options symétriques sont à ε l'une de l'autre
+    expect(window).toContain(d.chosen);
+    for (const c of window) expect(d.chosen.probability).toBeGreaterThanOrEqual(c.probability - 1e-12);
+    if (d.chosen !== d.candidates[0]) expect(d.explanation).toMatch(/départage quantal/);
   });
 
   it('déterminisme : même graine ⇒ même décision, mêmes scores', () => {
@@ -270,7 +342,7 @@ describe('modulation tactique (§13.3)', () => {
   it('dilemme construit : la possession choisit la passe sûre, la contre-attaque la passe en profondeur', () => {
     const mk = (style: StyleId): MatchState => simple([
       { team: 'A', pos: v(-10, 0) }, { team: 'A', pos: v(-9, 9) }, { team: 'A', pos: v(10, 0), vel: v(6, 0) },
-      { team: 'B', pos: v(-6.5, 2) }, { team: 'B', pos: v(11, 9) }, { team: 'B', pos: v(11, -9) }, { team: 'B', pos: v(52, 0), role: 'GK' }, { team: 'B', pos: v(-25, -20) },
+      { team: 'B', pos: v(-6.5, 2) }, { team: 'B', pos: v(12, 10) }, { team: 'B', pos: v(12, -10) }, { team: 'B', pos: v(52, 0), role: 'GK' }, { team: 'B', pos: v(-25, -20) },
     ], 0, style);
     const dp = decideOnBall(mkInput(mk('possession')), 0, null);
     const dc = decideOnBall(mkInput(mk('counter')), 0, null);
@@ -299,10 +371,23 @@ describe('profondeur 2, contexte, symétrie, performance', () => {
     expect(expanded.length).toBeLessThanOrEqual(P.decision.topK);
     for (const c of expanded) {
       expect(c.response?.kind).toBe('press');
-      expect(c.response!.delta).toBeGreaterThanOrEqual(-1e-9); // presser ne peut qu'abaisser le contrôle
+      expect(c.response!.delta).toBeGreaterThanOrEqual(0); // presser ne peut qu'abaisser le contrôle
       const la = c.components.find((k) => k.key === 'lookahead')!;
       expect(Math.abs(la.contribution - c.probability * P.decision.gamma * la.value)).toBeLessThan(1e-9);
+      // §6.3 : gain incrémental G ≥ 0 (la conservation garantit qu'une suite ne dégrade pas la valeur déjà comptée en q⁺).
+      expect(la.value).toBeGreaterThanOrEqual(0);
+      expect(la.contribution).toBeGreaterThanOrEqual(0);
+      // Réponse adverse chargée dans le score : composante « response » = −P·δ, égale à la dégradation affichée.
+      const rp = c.components.find((k) => k.key === 'response');
+      if (c.response!.delta > 1e-4) {
+        expect(rp).toBeDefined();
+        expect(rp!.contribution).toBeCloseTo(-c.probability * c.response!.delta, 9);
+      }
+      expect(Math.abs(sumContrib(c) - c.score)).toBeLessThan(1e-9);
     }
+    // Un candidat non développé (Q = EV₁) ne peut pas dépasser un candidat développé par simple omission : pour chaque
+    // candidat développé, sa valeur Q ≥ son EV₁ (avant réponse : lookahead ≥ 0 et réponse ≤ 0 s'annulent au pire).
+    expect(d.chosen.components.some((k) => k.key === 'lookahead') || d.candidates.indexOf(d.chosen) < P.decision.topK).toBe(true);
     // Sans lookahead (γ = 0 ou K = 0) : aucune composante lookahead.
     const noLA = cloneParams(P);
     noLA.decision.topK = 0;
@@ -325,6 +410,13 @@ describe('profondeur 2, contexte, symétrie, performance', () => {
     expect(d.time).toBe(state.time);
     expect(d.computeMs).toBeGreaterThan(0);
     expect(d.committedUntil === undefined || d.committedUntil >= state.time).toBe(true);
+    // Engagement (§6.5) : seuls dribble et conservation portent committedUntil (durée de l'action) ; une passe est immédiate.
+    if (d.chosen.action.type === 'dribble' || d.chosen.action.type === 'hold') expect(d.committedUntil).toBeCloseTo(state.time + d.chosen.duration!, 9);
+    else expect(d.committedUntil).toBeUndefined();
+    const passState = simple([{ team: 'A', pos: v(0, 0) }, { team: 'A', pos: v(14, 0) }, ...B_LINE]);
+    const dp = decideOnBall(mkInput(passState), 0, null);
+    expect(dp.chosen.action.type).toBe('pass');
+    expect(dp.committedUntil).toBeUndefined();
   });
 
   it('symétrie miroir : l’état (x, y) ↦ (−x, −y) avec équipes échangées donne les mêmes candidats (cibles miroir, scores égaux)', () => {
@@ -367,6 +459,83 @@ describe('profondeur 2, contexte, symétrie, performance', () => {
 });
 
 // ---------------------------------------------------------------------------
+describe('régressions de l’évaluation (revue) : hors-jeu, longueur de passe, profondeur, menaces', () => {
+  it('risque de hors-jeu : jamais pour un receveur derrière le ballon (le porteur est la ligne), signalé devant le ballon près des défenseurs', () => {
+    const mk = (ry: number, rx: number): MatchState => simple([
+      { team: 'A', pos: v(32, 0) }, { team: 'A', pos: v(rx, ry) },
+      { team: 'B', pos: v(52, 0), role: 'GK' }, { team: 'B', pos: v(24, 8) }, { team: 'B', pos: v(24, -8) },
+    ]);
+    const behind = evaluateCandidates(mkInput(mk(10, 31.5)), 0).find((c) => isPass(c, 'ground', 1))!;
+    expect(behind).toBeDefined();
+    expect(behind.components.some((k) => k.key === 'offside')).toBe(false);
+    const ahead = evaluateCandidates(mkInput(mk(10, 32.4)), 0).find((c) => isPass(c, 'ground', 1))!;
+    expect(ahead).toBeDefined();
+    expect(ahead.components.find((k) => k.key === 'offside')!.contribution).toBeCloseTo(-P.decision.wOffside, 9);
+    // Receveur loin derrière la ligne des défenseurs : aucun risque.
+    const safe = simple([{ team: 'A', pos: v(0, 0) }, { team: 'A', pos: v(12, 6) }, ...B_LINE]);
+    expect(evaluateCandidates(mkInput(safe), 0).find((c) => isPass(c, 'ground', 1))!.components.some((k) => k.key === 'offside')).toBe(false);
+  });
+
+  it('longueur de passe (style) : la possession pénalise une passe longue bien plus que la contre-attaque', () => {
+    const mk = (style: StyleId): MatchState => simple([
+      { team: 'A', pos: v(-20, 0) }, { team: 'A', pos: v(-12, 6) }, { team: 'A', pos: v(10, 8) },
+      { team: 'B', pos: v(52, 0), role: 'GK' }, { team: 'B', pos: v(30, 12) }, { team: 'B', pos: v(30, -12) }, { team: 'B', pos: v(-30, -20) },
+    ], 0, style);
+    const long = (d: Decision): Candidate => d.candidates.find((c) => isPass(c, 'ground', 2))!;
+    const short = (d: Decision): Candidate => d.candidates.find((c) => isPass(c, 'ground', 1))!;
+    const dp = decideOnBall(mkInput(mk('possession')), 0, null), dc = decideOnBall(mkInput(mk('counter')), 0, null);
+    const lenP = long(dp).components.find((k) => k.key === 'length')!;
+    expect(lenP).toBeDefined();
+    expect(lenP.contribution).toBeLessThan(0);
+    const lenC = long(dc).components.find((k) => k.key === 'length');
+    expect(-(lenC?.contribution ?? 0)).toBeLessThan(-lenP.contribution / 3);
+    // La passe courte (10 m < distance de soutien) ne porte pas de pénalité de longueur.
+    expect(short(dp).components.some((k) => k.key === 'length')).toBe(false);
+    // Écart long − court plus favorable au long en contre-attaque qu'en possession.
+    expect(long(dc).score - short(dc).score).toBeGreaterThan(long(dp).score - short(dp).score);
+    // Formule des poids : w_len = wLength·(1 − directness), longueur libre = supportDistance.
+    const t = makeTactic('4-3-3', 'possession').params;
+    const w = modulatedWeights(P, t, 'attack');
+    expect(w.wLength).toBeCloseTo((P.decision.wLength ?? 0.1) * (1 - t.directness), 12);
+    expect(w.lengthFree).toBe(t.supportDistance);
+  });
+
+  it('passes en profondeur : un receveur qui recule n’engendre pas de cibles confondues à ses pieds ; cibles « espace » devant le ballon', () => {
+    const state = simple([{ team: 'A', pos: v(0, 0) }, { team: 'A', pos: v(15, 5), vel: v(-4, 0) }, ...B_LINE]);
+    const input = mkInput(state);
+    const props = proposeThroughBalls(state, state.players[0], P0, input.fields);
+    const keys = new Set(props.map((p) => `${p.receiverId}:${p.successPoint.x.toFixed(2)},${p.successPoint.y.toFixed(2)}`));
+    expect(keys.size).toBe(props.length); // aucune cible dupliquée
+    for (const p of props) {
+      expect(p.successPoint.x).toBeGreaterThan(0); // devant le ballon
+      if (p.receiverId === 1 && Math.abs(p.successPoint.y - 5) < 1e-9) expect(p.successPoint.x).toBeGreaterThan(15); // λ·û devant le receveur
+    }
+    expect(props.length).toBeGreaterThan(P0.decision.throughDistances.length); // cibles « espace » ajoutées
+  });
+
+  it('menaces : l’adversaire du point faible (W = max φ) est nommé en premier, même s’il n’est pas le premier de la liste', () => {
+    const state = simple([
+      { team: 'A', pos: v(0, 0) }, { team: 'A', pos: v(20, 0) },
+      ...B_LINE, { team: 'B', pos: v(8, 3.5) }, { team: 'B', pos: v(15, 0.6) },
+    ]);
+    const pass = evaluateCandidates(mkInput(state), 0).find((c) => isPass(c, 'ground', 1))!;
+    expect(pass).toBeDefined();
+    expect(pass.threats).toContain(6);
+    expect(pass.weakOpponentId).toBe(6);
+    expect(pass.threats![0]).toBe(pass.weakOpponentId);
+    if (/interception/.test(pass.reason)) expect(pass.reason).toContain(`n°${state.players[6].number}`);
+  });
+
+  it('teamOf : un porteur inconnu de l’état ne provoque pas de récursion infinie dans les libellés', () => {
+    const state = simple([{ team: 'A', pos: v(0, 0) }, { team: 'A', pos: v(10, 0) }, ...B_LINE]);
+    state.ball.ownerId = 99;
+    const cand: Candidate = { action: { type: 'dribble', direction: v(1, 0), distance: 4 }, score: 0, probability: 0.5, valueIfSuccess: 0, valueIfFailure: 0, components: [], reason: '' };
+    expect(actionLabel(cand, state)).toBe('DRIBBLER (vers l’avant)');
+    expect(shortLabel(cand, state)).toMatch(/^Dribble → 4 m$/);
+  });
+});
+
+// ---------------------------------------------------------------------------
 describe('explications (§6.6)', () => {
   it('actionLabel : libellés français des actions', () => {
     const state = simple([{ team: 'A', pos: v(0, 0), number: 8 }, { team: 'A', pos: v(10, 0), number: 7 }, { team: 'A', pos: v(20, 0), number: 9 }, ...B_LINE]);
@@ -394,7 +563,7 @@ describe('explications (§6.6)', () => {
     const d = decideOnBall(mkInput(state, 1, P), 0, null);
     const lines = d.explanation.split('\n');
     expect(lines.length).toBeLessThanOrEqual(12);
-    expect(lines[0]).toMatch(/^ACTION OPTIMALE : /);
+    expect(lines[0]).toMatch(/^ACTION CHOISIE : /);
     expect(lines[1]).toMatch(/^CIBLE : /);
     expect(lines[2]).toMatch(/^SCORE : −?\d+,\d{2} — PROBABILITÉ : \d+ %$/);
     expect(lines[3]).toMatch(/^RAISON : .+/);
@@ -427,7 +596,7 @@ describe('explications (§6.6)', () => {
     };
     const text = explainDecision(d, state);
     const lines = text.split('\n');
-    expect(lines[0]).toBe('ACTION OPTIMALE : SE DÉPLACER (appel en profondeur)');
+    expect(lines[0]).toBe('ACTION CHOISIE : SE DÉPLACER (appel en profondeur)');
     expect(lines[1]).toMatch(/^CIBLE : \(4,0 ; −8,0\) — appel en profondeur$/);
     expect(lines[2]).toBe('SCORE : 0,12 — PROBABILITÉ : 60 %');
     expect(lines[3]).toMatch(/hystérésis/);

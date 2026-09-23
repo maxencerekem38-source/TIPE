@@ -3,15 +3,15 @@
  * prises de balle et duels (§3.3). Pas de règles ici (voir rules.ts) : les issues physiques qui doivent être
  * journalisées (prise de balle, tacle, duel gagné) sont déposées dans une file par état, lue par applyRules.
  */
-import type { BallFlight, MatchState, Player, SimParams, Ball } from '../core/types';
+import type { BallFlight, MatchState, Player, SimParams, Ball, TeamId } from '../core/types';
+import type { Vec2 } from '../core/vec2';
 import { attackDir } from '../core/types';
 import type { Rng } from '../core/rng';
 import { PITCH, isInsidePitch } from '../core/pitch';
 import { clamp, sigmoid } from '../core/vec2';
-import { isFrozen, playerById, pressureAt } from './helpers';
+import { GRAVITY, isFrozen, playerById, pressureAt } from './helpers';
 
-/** Gravité (m/s²). */
-export const GRAVITY = 9.81;
+export { GRAVITY };
 /** Les joueurs peuvent déborder du terrain de 2 m (touches, corners). */
 const PLAYER_PITCH_MARGIN = 2;
 /** Un joueur à moins de 0,3 m de sa cible est considéré arrivé (vitesse désirée nulle). */
@@ -172,17 +172,41 @@ function carryBall(ball: Ball, owner: Player): void {
   ball.vz = 0;
 }
 
-/** Ballon libre : roulement avec décélération μ (§3.2) ou vol balistique avec rebond. */
+/**
+ * Ballon libre : roulement avec décélération μ (§3.2) ou vol balistique avec rebond.
+ * Premier contact au sol d'un lob / dégagement : la pelouse absorbe l'impact — vitesse horizontale bornée à
+ * `lobLandingSpeed`, restitution verticale `lobBounce` — pour que le ballon soit contrôlable au point visé ;
+ * les rebonds suivants (et ceux des tirs) gardent la règle générale (ballBounce, 80 % de vitesse horizontale).
+ */
 function moveFreeBall(ball: Ball, ph: SimParams['physics'], dt: number): void {
   if (ball.z > 0 || ball.vz !== 0) {
+    const zPrev = ball.z, vzPrev = ball.vz;
     ball.pos.x += ball.vel.x * dt;
     ball.pos.y += ball.vel.y * dt;
     ball.z += ball.vz * dt;
     ball.vz -= GRAVITY * dt;
     if (ball.z <= 0) {
+      // Contact au sol interpolé dans le pas (fraction f du pas avant le contact, z linéaire dans le pas) ; la vitesse
+      // d'impact est celle de la trajectoire continue au contact (pas la vitesse de fin de pas, qui ferait rebondir
+      // indéfiniment un ballon dont l'impact avoisine BOUNCE_MIN_VZ).
+      const f = zPrev > 0 && vzPrev < 0 ? clamp(zPrev / (zPrev - ball.z), 0, 1) : 1;
+      const impact = Math.max(0, -(vzPrev - GRAVITY * f * dt));
       ball.z = 0;
-      if (-ball.vz > BOUNCE_MIN_VZ) {
-        ball.vz = -ball.vz * ph.ballBounce;
+      const fl = ball.flight;
+      const landing = fl !== null && !fl.landed && (fl.kind === 'lob' || fl.kind === 'clearance');
+      if (landing) {
+        // Atterrissage au point de la trajectoire continue, puis le reste du pas est parcouru à la vitesse amortie.
+        fl.landed = true;
+        const rest = (1 - f) * dt;
+        ball.pos.x -= ball.vel.x * rest;
+        ball.pos.y -= ball.vel.y * rest;
+        const sp = Math.hypot(ball.vel.x, ball.vel.y);
+        if (sp > ph.lobLandingSpeed) { const k = ph.lobLandingSpeed / sp; ball.vel.x *= k; ball.vel.y *= k; }
+        ball.pos.x += ball.vel.x * rest;
+        ball.pos.y += ball.vel.y * rest;
+        ball.vz = impact > BOUNCE_MIN_VZ ? impact * ph.lobBounce : 0;
+      } else if (impact > BOUNCE_MIN_VZ) {
+        ball.vz = impact * ph.ballBounce;
         ball.vel.x *= BOUNCE_HORIZONTAL;
         ball.vel.y *= BOUNCE_HORIZONTAL;
       } else {
@@ -210,6 +234,9 @@ function moveFreeBall(ball: Ball, ph: SimParams['physics'], dt: number): void {
  * Prise de balle (§3.3) : tout joueur à moins de r_ctl (+ bonus si ballon lent) d'un ballon bas, avec une vitesse
  * relative < 12 m/s, qui n'est ni « passé » ni le frappeur dans le délai d'immunité. Plusieurs candidats des deux
  * équipes le même tick ⇒ tirage pondéré (mouvement vers le ballon, attribut, distance).
+ * La vitesse relative ignore la composante de la vitesse du joueur dirigée vers le ballon : un receveur qui court
+ * au-devant d'une passe l'amortit (le ballon seul compte), alors qu'un ballon qui le croise ou le dépasse est jugé
+ * sur la vitesse relative complète (les tirs à 25 m/s restent incontrôlables).
  */
 function ballControl(state: MatchState, params: SimParams, rng: Rng): void {
   const ph = params.physics;
@@ -228,8 +255,15 @@ function ballControl(state: MatchState, params: SimParams, rng: Rng): void {
     if (time - p.lastKickTime < ph.kickerImmunity) continue;
     if (fl && fl.kickerId === p.id && time - fl.startTime < ph.kickerImmunity) continue;
     const dx = ball.pos.x - p.pos.x, dy = ball.pos.y - p.pos.y;
-    if (dx * dx + dy * dy > r2) continue;
-    const rvx = ball.vel.x - p.vel.x, rvy = ball.vel.y - p.vel.y;
+    const d2 = dx * dx + dy * dy;
+    if (d2 > r2) continue;
+    // Vitesse du joueur privée de sa composante vers le ballon (un joueur qui va au ballon l'absorbe)
+    let pvx = p.vel.x, pvy = p.vel.y;
+    if (d2 > 1e-9) {
+      const toward = (pvx * dx + pvy * dy) / d2;
+      if (toward > 0) { pvx -= toward * dx; pvy -= toward * dy; }
+    }
+    const rvx = ball.vel.x - pvx, rvy = ball.vel.y - pvy;
     if (rvx * rvx + rvy * rvy >= maxRel2) continue;
     if (!single) single = p;
     else { if (!candidates) candidates = [single]; candidates.push(p); }
@@ -276,31 +310,49 @@ function ballControl(state: MatchState, params: SimParams, rng: Rng): void {
   ball.z = 0;
   ball.vz = 0;
   ball.flight = null;
+  taker.lastControlTime = time;
   emit(state, { kind: 'control', playerId: taker.id, flight: previousFlight, contested, lastTouchId });
 }
 
 /**
- * Duels (§3.3) : un adversaire entrant dans r_tackle du porteur déclenche un duel (au plus un par `duelCooldown`
- * pour ce défenseur) : P_win^def = σ(base + goalSide·[côté but] + pressure·Π(b) + skill·(defending − dribbling)),
- * borné. Victoire ⇒ ballon au tacleur (tackleKeepProb) ou libre à 1,5 m vers lui ; défaite ⇒ défenseur « passé ».
+ * Duels (§3.3) : un adversaire qui **attaque** le porteur — à moins de r_tackle et se rapprochant de lui à plus de
+ * `duelClosingSpeed` (le porteur qui fonce sur lui compte aussi : prise à défaut), ou resté à son contact (dans
+ * r_tackle) plus de `duelContactTime` s — déclenche un duel, au plus un par `duelCooldown` pour ce défenseur **et**
+ * pour ce porteur, jamais dans les `duelCarrierGrace` s qui suivent une prise de balle. Un défenseur qui contient à
+ * distance ou marche à côté du porteur ne déclenche rien ; un face-à-face prolongé ne peut pas durer indéfiniment.
+ * P_win^def = σ(base + goalSide·[côté but] + pressure·Π₋(b) + skill·(defending − dribbling)), borné, où Π₋ est la
+ * pression des autres adversaires (le tacleur lui-même n'est pas compté deux fois).
+ * Victoire ⇒ ballon au tacleur (tackleKeepProb) ou libre à 1,5 m vers lui ; défaite ⇒ défenseur « passé ».
  */
 function resolveDuels(state: MatchState, params: SimParams, rng: Rng): void {
   const ph = params.physics;
   const ball = state.ball;
   const owner = playerById(state, ball.ownerId!);
   if (!owner) return;
-  const r2 = params.defence.tackleRadius * params.defence.tackleRadius;
   const time = state.time;
+  const carrierReady = !(owner.lastDuelTime !== undefined && time - owner.lastDuelTime < ph.duelCooldown)
+    && !(owner.lastControlTime !== undefined && time - owner.lastControlTime < ph.duelCarrierGrace);
+  const r2 = params.defence.tackleRadius * params.defence.tackleRadius;
   const dir = attackDir(owner.team);
   for (const d of state.players) {
     if (d.team === owner.team) continue;
+    const dx = d.pos.x - owner.pos.x, dy = d.pos.y - owner.pos.y;
+    const d2 = dx * dx + dy * dy;
+    // Suivi du contact (entrée / sortie de r_tackle), tenu à jour même pendant les délais d'attente
+    if (d2 > r2) { d.duelContactSince = undefined; continue; }
+    if (d.duelContactSince === undefined) d.duelContactSince = time;
+    if (!carrierReady) continue;
     if (d.beatenUntil !== undefined && time < d.beatenUntil) continue;
     if (d.lastDuelTime !== undefined && time - d.lastDuelTime < ph.duelCooldown) continue;
-    const dx = d.pos.x - owner.pos.x, dy = d.pos.y - owner.pos.y;
-    if (dx * dx + dy * dy > r2) continue;
+    // Vitesse de rapprochement (m/s) : projection de la vitesse relative sur l'axe porteur → défenseur
+    const n = Math.sqrt(d2) || 1;
+    const closing = -((d.vel.x - owner.vel.x) * dx + (d.vel.y - owner.vel.y) * dy) / n;
+    if (closing < ph.duelClosingSpeed && time - d.duelContactSince < ph.duelContactTime) continue;
     d.lastDuelTime = time;
+    d.duelContactSince = time;
+    owner.lastDuelTime = time;
     const goalSide = dx * dir > 0 ? 1 : 0;
-    const pressure = pressureAt(state, ball.pos, owner.team, params);
+    const pressure = pressureExcluding(state, ball.pos, owner.team, params, d);
     const z = ph.duelBase + ph.duelGoalSide * goalSide + ph.duelPressure * pressure + ph.duelSkill * (d.attrs.defending - owner.attrs.dribbling);
     const p = clamp(sigmoid(z), ph.duelMinProb, ph.duelMaxProb);
     if (rng.bernoulli(p)) {
@@ -314,7 +366,6 @@ function resolveDuels(state: MatchState, params: SimParams, rng: Rng): void {
         ball.vel.y = d.vel.y;
         ball.flight = null;
       } else {
-        const n = Math.hypot(dx, dy) || 1;
         const ux = dx / n, uy = dy / n;
         ball.ownerId = null;
         ball.lastTouchId = d.id;
@@ -336,4 +387,10 @@ function resolveDuels(state: MatchState, params: SimParams, rng: Rng): void {
     }
     return; // un seul duel par tick
   }
+}
+
+/** Pression Π(q) subie par `team` en excluant un adversaire donné (le tacleur, déjà représenté par le terme de base). */
+function pressureExcluding(state: MatchState, q: Vec2, team: TeamId, params: SimParams, excluded: Player): number {
+  const players = state.players.filter((p) => p !== excluded);
+  return pressureAt({ ...state, players }, q, team, params);
 }

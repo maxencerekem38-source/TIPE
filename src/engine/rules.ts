@@ -12,7 +12,7 @@ import { clamp, dist, distToSegment } from '../core/vec2';
 import type { Rng } from '../core/rng';
 import { giveBall, kickoffPositions, setupKickoff } from './match';
 import { takePhysicsEvents, type PhysicsEvent } from './physics';
-import { isFrozen, keeperOf, nearestPlayer, playerById, playerLabel, teamLabel } from './helpers';
+import { isFrozen, keeperOf, nearestOpponent, nearestOutfield, nearestPlayer, playerById, playerLabel, teamLabel } from './helpers';
 
 /** Taille maximale du journal d'événements. */
 export const MAX_EVENTS = 200;
@@ -50,6 +50,8 @@ function describeEvent(state: MatchState, e: MatchEvent): string {
     case 'dribble': return `Dribble de ${who}`;
     case 'dribble_failed': return `Dribble raté de ${who}`;
     case 'tackle': return `Tacle de ${who} sur ${to}`;
+    case 'block': return `Tir de ${to} contré par ${who}`;
+    case 'clearance': return `Dégagement de ${who}`;
     case 'turnover': return `Perte de balle de l'${teamLabel(e.team)}${e.playerId !== undefined ? ` (${who})` : ''}`;
     case 'out': return `Sortie de balle (dernier toucheur ${who})`;
     case 'restart': return `Reprise pour l'${teamLabel(e.team)}${e.playerId !== undefined ? ` par ${who}` : ''}`;
@@ -76,6 +78,8 @@ export function pushEvent(state: MatchState, event: MatchEvent): void {
     case 'tackle': s.tackles++; break;
     case 'turnover': s.turnovers++; break;
     case 'dribble': s.dribbles++; break;
+    case 'block': s.blocks = (s.blocks ?? 0) + 1; break;
+    case 'clearance': s.clearances = (s.clearances ?? 0) + 1; break;
     default: break;
   }
 }
@@ -144,9 +148,18 @@ function handlePhysicsEvent(state: MatchState, ev: PhysicsEvent, params: SimPara
       if (!ev.loose) changePossession(state, tackler.team, true, victim.pos, victim.id);
       break;
     }
-    case 'duel_won':
-      // Le défenseur est « passé » (immobilisé par la physique) ; rien à comptabiliser ici.
+    case 'duel_won': {
+      // Défenseur « passé » : le dribble (prise à défaut) est gagné — comptabilisé ici, jamais au chronomètre
+      const carrier = playerById(state, ev.carrierId);
+      if (!carrier) return;
+      if (carrier.lastDribbleStart === undefined) {
+        // Duel gagné en conservation : il vaut une prise à défaut tentée et réussie
+        pushEvent(state, { time: state.time, kind: 'dribble', team: carrier.team, playerId: carrier.id, pos: { x: carrier.pos.x, y: carrier.pos.y }, value: ev.probability });
+      }
+      carrier.lastDribbleStart = undefined;
+      state.stats[carrier.team].dribblesWon++;
       break;
+    }
     default:
       break;
   }
@@ -180,7 +193,9 @@ function onControl(state: MatchState, ev: Extract<PhysicsEvent, { kind: 'control
       });
     }
   }
-  changePossession(state, team, true, taker.pos, ev.lastTouchId ?? undefined);
+  // Ballon libéré par un tacle ou un contre : le fautif est la victime (kickerId), pas le tacleur (dernier toucheur)
+  const loserId = fl && fl.kind === 'loose' ? fl.kickerId : ev.lastTouchId ?? undefined;
+  changePossession(state, team, true, taker.pos, loserId);
 }
 
 /** Hors-jeu sifflé à la réception : coup franc indirect pour l'adversaire au point de la faute. */
@@ -189,7 +204,7 @@ function whistleOffside(state: MatchState, receiver: Player, params: SimParams):
   pushEvent(state, { time: state.time, kind: 'offside', team: receiver.team, playerId: receiver.id, pos });
   const opp = otherTeam(receiver.team);
   changePossession(state, opp, true, pos, receiver.id);
-  const taker = nearestPlayer(state, pos, opp) ?? nearestPlayer(state, pos, undefined, receiver.id);
+  const taker = nearestOutfield(state, pos, opp) ?? nearestOutfield(state, pos, undefined, receiver.id);
   restartWith(state, { kind: 'free_kick', team: opp, pos, resumeAt: 0 }, taker, params.physics.restartFreeze);
 }
 
@@ -215,6 +230,7 @@ function restartWith(state: MatchState, restart: Restart, taker: Player | undefi
     ball.flight = null;
   }
   state.restart = { ...restart, pos, resumeAt: state.time + freeze };
+  state.lastRestart = { ...state.restart, pos: { ...pos }, playerId: taker?.id };
   pushEvent(state, { time: state.time, kind: 'restart', team: restart.team, playerId: taker?.id, pos: { ...pos }, label: restartLabel(state.restart, taker) });
 }
 
@@ -245,8 +261,9 @@ function resolveShot(state: MatchState, params: SimParams, rng: Rng): void {
   const elapsed = state.time - fl.startTime;
   const total = dist(fl.origin, fl.targetPoint) / Math.max(1, fl.initialSpeed);
 
-  // Contre (rare) : défenseur de champ à moins de blockRadius du trajet parcouru ce tick, en début de vol
-  if (elapsed <= ph.blockWindow * total && ball.z < BLOCK_MAX_HEIGHT) {
+  // Contre : défenseur de champ à moins de blockRadius du trajet parcouru ce tick, en début de vol — uniquement si
+  // l'issue tirée n'est pas un but (les contreurs sont déjà dans le xG : ne pas les pénaliser deux fois)
+  if (fl.outcome !== 'goal' && elapsed <= ph.blockWindow * total && ball.z < BLOCK_MAX_HEIGHT) {
     const prev: Vec2 = { x: ball.pos.x - ball.vel.x * ph.dt, y: ball.pos.y - ball.vel.y * ph.dt };
     for (const d of state.players) {
       if (d.team !== defending || d.role === 'GK') continue;
@@ -280,7 +297,7 @@ function resolveShot(state: MatchState, params: SimParams, rng: Rng): void {
   }
 }
 
-/** Tir contré : le ballon devient libre, l'issue tirée est annulée (le tir n'est plus cadré). */
+/** Tir contré : le ballon devient libre (fautif = tireur), l'issue tirée est annulée (le tir n'est plus cadré). */
 function blockShot(state: MatchState, blocker: Player, fl: BallFlight, attacking: TeamId, rng: Rng): void {
   const ball = state.ball;
   const sp = Math.hypot(ball.vel.x, ball.vel.y) || 1;
@@ -291,14 +308,14 @@ function blockShot(state: MatchState, blocker: Player, fl: BallFlight, attacking
   ball.vz = 0;
   ball.lastTouchId = blocker.id;
   ball.flight = {
-    kind: 'loose', kickerId: blocker.id, targetId: null, targetPoint: { ...ball.pos }, origin: { ...ball.pos },
+    kind: 'loose', kickerId: fl.kickerId, targetId: null, targetPoint: { ...ball.pos }, origin: { ...ball.pos },
     startTime: state.time, initialSpeed: Math.hypot(ball.vel.x, ball.vel.y),
   };
   if (fl.outcome !== 'miss') state.stats[attacking].shotsOnTarget = Math.max(0, state.stats[attacking].shotsOnTarget - 1);
   fl.outcome = 'miss';
   fl.onTarget = false;
   pushEvent(state, {
-    time: state.time, kind: 'tackle', team: blocker.team, playerId: blocker.id, targetId: fl.kickerId,
+    time: state.time, kind: 'block', team: blocker.team, playerId: blocker.id, targetId: fl.kickerId,
     pos: { x: ball.pos.x, y: ball.pos.y }, label: `Tir de ${playerLabel(state, fl.kickerId)} contré par ${blocker.name}`,
   });
 }
@@ -335,7 +352,7 @@ function checkBallOut(state: MatchState, params: SimParams, rng: Rng): void {
       restartWith(state, { kind: 'goal_kick', team: defending, pos: spot, resumeAt: 0 }, taker, params.physics.restartFreeze);
     } else {
       const spot: Vec2 = { x: side * H, y: (b.y >= 0 ? 1 : -1) * W };
-      const taker = nearestPlayer(state, spot, attacking) ?? nearestPlayer(state, spot);
+      const taker = nearestOutfield(state, spot, attacking) ?? nearestOutfield(state, spot);
       changePossession(state, attacking, false, spot);
       restartWith(state, { kind: 'corner', team: attacking, pos: spot, resumeAt: 0 }, taker, params.physics.restartFreeze);
     }
@@ -347,7 +364,7 @@ function checkBallOut(state: MatchState, params: SimParams, rng: Rng): void {
     const team = otherTeam(lastTeam);
     const spot: Vec2 = { x: clamp(b.x, -H + 1, H - 1), y: (b.y > 0 ? 1 : -1) * W };
     endFlightOut(state, lastTouch);
-    const taker = nearestPlayer(state, spot, team) ?? nearestPlayer(state, spot);
+    const taker = nearestOutfield(state, spot, team) ?? nearestOutfield(state, spot);
     changePossession(state, team, false, spot);
     restartWith(state, { kind: 'throw_in', team, pos: spot, resumeAt: 0 }, taker, params.physics.restartFreeze);
   }
@@ -387,6 +404,7 @@ function scoreGoal(state: MatchState, team: TeamId, params: SimParams): void {
     p.beatenUntil = undefined;
     p.lastDribbleStart = undefined;
     p.lastDuelTime = undefined;
+    p.duelContactSince = undefined;
   }
   ball.pos = { x: 0, y: 0 };
   ball.vel = { x: 0, y: 0 };
@@ -401,6 +419,7 @@ function scoreGoal(state: MatchState, team: TeamId, params: SimParams): void {
   state.phaseSince[conceding] = state.time;
   state.phaseSince[team] = state.time;
   state.restart = { kind: 'kickoff', team: conceding, pos: { x: 0, y: 0 }, resumeAt: state.time + params.physics.goalFreeze, resetOnResume: true };
+  state.lastRestart = { ...state.restart, pos: { x: 0, y: 0 } };
   state.lastKickoff = conceding;
   pushEvent(state, { time: state.time, kind: 'restart', team: conceding, pos: { x: 0, y: 0 }, label: `Coup d’envoi pour l'${teamLabel(conceding)}` });
 }
@@ -425,15 +444,19 @@ function failDribble(state: MatchState, p: Player): void {
   pushEvent(state, { time: state.time, kind: 'dribble_failed', team: p.team, playerId: p.id, pos: { x: p.pos.x, y: p.pos.y } });
 }
 
-/** Dribble réussi si le dribbleur possède encore le ballon `dribbleWonDelay` s après le départ. */
+/**
+ * Suivi des prises à défaut en cours : gagnée par un duel remporté (handlePhysicsEvent), perdue par un tacle ou une
+ * sortie (failDribble) ; après une passe / un tir, ou après `dribbleWonDelay` s une fois le porteur dégagé (plus
+ * d'adversaire à moins de `takeOnRadius`), elle expire sans issue.
+ */
 function updateDribbles(state: MatchState, ph: SimParams['physics']): void {
   const ball = state.ball;
   for (const p of state.players) {
     if (p.lastDribbleStart === undefined) continue;
     if (ball.ownerId === p.id) {
       if (state.time - p.lastDribbleStart >= ph.dribbleWonDelay) {
-        state.stats[p.team].dribblesWon++;
-        p.lastDribbleStart = undefined;
+        const opp = nearestOpponent(state, p.pos, p.team);
+        if (!opp || dist(opp.pos, p.pos) > ph.takeOnRadius) p.lastDribbleStart = undefined;
       }
     } else if (p.lastKickTime >= p.lastDribbleStart) {
       p.lastDribbleStart = undefined; // passe ou tir : le dribble n'est ni gagné ni perdu

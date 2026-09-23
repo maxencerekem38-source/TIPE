@@ -85,6 +85,8 @@ Roulement : $\dot v_b = -\mu_b\, \hat v_b$, arrêt quand $\|v_b\| < 0{,}1$ m/s. 
 $$s_0 = \min\!\Big(s_0^{max},\ \sqrt{2\mu_b d + s_{arr}^2}\Big),\qquad T_b(d) = \frac{s_0 - \sqrt{s_0^2 - 2\mu_b d}}{\mu_b},\qquad s_0^{max} = 25\ \text{m/s}.$$
 Exemple : $d = 20$ m, $s_{arr} = 6$ ⇒ $s_0 = 9{,}8$ m/s, $T_b = 2{,}5$ s. Bruit d'exécution tiré au RNG : direction $\mathcal N(0, (3° + 2°\,\Pi(b))^2)$, vitesse $\mathcal N(0, (5\%)^2)$.
 
+**Ballon aérien** (lob, dégagement) : tir balistique à 45°, $v_0 = \min(s_0^{max}, \sqrt{g d})$, vitesse horizontale $h_s = v_0/\sqrt 2$ constante, durée $T = d/h_s$, $v_z = gT/2$, apogée $gT^2/8 = d/4$. Une seule fonction (`lobFlight`, `src/models/motion.ts`) sert au moteur et à la décision, de sorte que les temps balle des interceptions et la durée d'action sont ceux du ballon réellement simulé.
+
 **Tir** : vitesse $s_{shot} = 25$ m/s vers un point de visée $y_{aim} \in \{-2{,}9 ; 0 ; 2{,}9\}$, bruit direction $\mathcal N(0, (4° + 3°\,\Pi(b))^2)$, $T_{flight} = d_G / s_{shot}$ (pas de décélération sur la durée d'un tir).
 
 **Dribble** : le ballon est maintenu à $p_h + 0{,}6\,\hat v_h$ ; **conservation** : ballon maintenu à $p_h + 0{,}5\, \hat u_{dos}$ où $\hat u_{dos}$ est la direction opposée à l'adversaire le plus proche.
@@ -95,7 +97,7 @@ Principe : **la physique tranche, les probabilités ne servent qu'à décider** 
 
 - **Prise de balle** : tout joueur à moins de $r_{ctl}$ du ballon avec $\|v_b - v_i\| < 12$ m/s prend le contrôle ; si plusieurs, le premier arrivé (le tick où la condition est vraie) ; en cas d'égalité au même tick, tirage avec $P = \sigma(1{,}5\,[\text{en mouvement vers le ballon}])$.
 - **Interception de passe** : les défenseurs affectés à une tâche `intercept` (§8) courent vers le point de poursuite ; s'ils entrent dans $r_{ctl}$ avant le receveur, ils prennent la balle. Aucun tirage.
-- **Duel** (dribble ou conservation) : lorsqu'un défenseur entre dans $r_{tackle}$ du porteur, un duel est résolu au plus une fois par 0,5 s : $P_{win}^{def} = \sigma(-0{,}3 + 1{,}0\,[\text{défenseur de face}] + 0{,}6\,\Pi(b))$ ; en cas de victoire du défenseur le ballon lui est attribué, sinon le défenseur est « passé » (pénalité de $0{,}5$ s d'immobilité).
+- **Duel** (dribble ou conservation) : un défenseur dans $r_{tackle}$ du porteur engage un duel s'il **l'attaque** — vitesse de rapprochement $> 0{,}8$ m/s (le porteur qui fonce sur lui compte aussi : prise à défaut) ou contact continu $> 0{,}8$ s — au plus une fois par $1{,}5$ s pour ce défenseur *et* pour ce porteur, jamais dans les $0{,}4$ s suivant une prise de balle (un défenseur qui contient à distance ne déclenche rien) : $P_{win}^{def} = \mathrm{clip}\big(\sigma(-1{,}1 + 1{,}0\,[\text{défenseur de face}] + 0{,}6\,\Pi_{-}(b) + 1{,}2\,(\text{defending} - \text{dribbling})),\ 0{,}15,\ 0{,}6\big)$, où $\Pi_{-}$ est la pression des *autres* adversaires (le tacleur n'est pas compté deux fois) ; en cas de victoire du défenseur le ballon lui est attribué (p = 0,5) ou devient libre à 1,5 m, sinon le défenseur est « passé » (pénalité de $1$ s d'immobilité) et la prise à défaut est comptée réussie. Paramètres `physics.duel*`, `beatenFreeze`, `tackleKeepProb` (src/core/params.ts).
 - **Tir** : le gardien se déplace selon sa politique (§8.6) ; l'issue est tirée avec la probabilité $xG$ (§5.4) au moment de la frappe ; l'animation est rendue cohérente en visant le point de visée le plus éloigné du gardien en cas de but et un point dans son rayon d'action en cas d'arrêt.
 
 ### 3.4 Sorties, buts, remises en jeu (règles simplifiées)
@@ -104,7 +106,7 @@ Principe : **la physique tranche, les probabilités ne servent qu'à décider** 
 |---|---|---|
 | But | $|x_b| > 52{,}5$ et $|y_b| < 3{,}66$ | Engagement au centre par l'équipe encaissante, gel $t_{restart} = 2$ s |
 | Sortie de but / corner | $|x_b| > 52{,}5$, $|y_b| \ge 3{,}66$ | Dernier toucheur attaquant ⇒ six mètres (GK, ballon en $(\pm 47, \pm 9)$) ; défenseur ⇒ corner (ballon au coin, un attaquant) |
-| Touche | $|y_b| > 34$ | Ballon rendu au joueur le plus proche de l'équipe n'ayant pas touché en dernier, au point de sortie |
+| Touche | $|y_b| > 34$ | Ballon rendu au joueur de champ le plus proche de l'équipe n'ayant pas touché en dernier, au point de sortie (le gardien ne remet jamais une touche ni un corner) |
 | Hors-jeu | Au lancement d'une passe, receveur avec $x_r > \max(x_b, x^{(2)}_{def})$ et $x_r > 0$, puis réception | Coup franc indirect : ballon au défenseur le plus proche du point du hors-jeu |
 
 À chaque remise : gel de $t_{restart} = 1$ s (2 s pour un but), adversaires repoussés à $\ge 3$ m, puis la remise est une décision de passe ordinaire du remetteur (candidats restreints aux passes).
@@ -151,6 +153,7 @@ $\text{space}_i = \#\{q \in \Gamma : \|q - p_i\| < R_s,\ \arg\min_j T_j(q) = i\}
 Pour une trajectoire $b \to q$ à vitesse initiale $s_0$, on échantillonne $M = 12$ points $q_m$ aux temps balle $T_b(q_m)$. Pour chaque défenseur $j$ : $\Phi_{j,m} = \operatorname{logit}^{-1}\!\big((T_b(q_m) - T_j(q_m))/\sigma_T\big)$ avec $\operatorname{logit}^{-1}(z) = 1/(1+e^{-\pi z/\sqrt 3})$.
 
 - **Probabilité d'interception (produit)** : $P_{int} = 1 - \prod_{m}\prod_{j}(1 - \eta\, \Phi_{j,m})$, $\eta = 0{,}35$. Hypothèse assumée : chances séquentielles indépendantes ; $\eta$ est **calibré par Monte-Carlo** sur la physique réelle (§11.6), et cette calibration est rapportée.
+- **Ballon aérien** : un échantillon n'est interceptable que si la hauteur $z(f) = 4\,\text{apex}\,f(1-f)$ est inférieure à la hauteur de contrôle du moteur (1,6 m) ; l'atterrissage ($f = 1$) est une chance supplémentaire de disputer le ballon retombé, d'efficacité $\eta_{land} = 0{,}6$ et avec une fenêtre $t_{land} = 0{,}3$ s ($\Phi_{land} = \operatorname{logit}^{-1}((T + t_{land} - T_j)/\sigma_T)$). Pour une trajectoire déjà en cours, les temps balle sont mesurés depuis l'instant courant ($T_b(q_m) - t_{écoulé}$) et les points dépassés ne sont plus interceptables.
 - **Point faible de la ligne** : $W = \max_{j,m} \Phi_{j,m}$, avec le défenseur et le point qui le réalisent. Propriété : $P_{int}^{(\eta = 1)} \ge W$ (borne inférieure documentée). $W$ est la **feature d'explication** (« l'adversaire 7 arrive 0,3 s avant le ballon au point 6 ») et la quantité d'élagage.
 - **Marge angulaire** $\beta_{lane} = \min_j \angle\big(q - b,\ p_j - b\big)$ sur les défenseurs avec $\|p_j - b\| < \|q - b\|$ (degrés).
 - **Élagage géométrique** : distance perpendiculaire minimale d'un défenseur au segment $[b, q]$ ; un candidat avec distance $< 1$ m et $W > 0{,}8$ n'est pas évalué.
@@ -179,11 +182,12 @@ Ancrages : 15 m libre ≈ 0,82 ; 35 m sous pression ($\Pi = 1$) ≈ 0,45.
 ### 5.2 Passe en profondeur (vers un point $q$, receveur $k = \arg\min_{i \in att} T_i(q)$)
 
 $$P_{through} = (1 - P_{int}(b \to q))\cdot \operatorname{logit}^{-1}\!\Big(\frac{\min_{j \in def} T_j(q) - T_k(q)}{\sigma_T}\Big)\cdot \sigma\big(1{,}8 - 0{,}03\, d - 0{,}8\,\Pi(b)\big)\cdot \mathbb 1[\text{onside}(k)],$$
-$s_{arr} = 9$ m/s (ballon à prendre en course). Hors-jeu évalué au lancement : $x_k \le \max(x_b, x^{(2)}_{def})$ ou $x_k \le 0$.
+$s_{arr} = 9$ m/s (ballon à prendre en course). Hors-jeu évalué au lancement : $x_k \le \max(x_b, x^{(2)}_{def})$ ou $x_k \le 0$ (sans défenseur, la ligne est la ligne de but adverse). Facteur supplémentaire « receveur au rendez-vous » : $\operatorname{logit}^{-1}\big((T_b(q) + \delta_{reach} - T_k(q))/\sigma_T\big)$, $\delta_{reach} = 0{,}6$ s — un ballon lancé pour arriver à 9 m/s poursuit sa course au-delà de $q$ et un receveur trop en retard le manque, même sans défenseur.
 
 ### 5.3 Dribble ($b \to q$, $d \le 8$ m)
 
-$$P_{drib} = \sigma\Big(1{,}5 - 1{,}2\,\bar\Pi_{path} - 0{,}15\, d + 0{,}8\big(PC_{att}(q) - 0{,}5\big) + 1{,}0\tanh\big(\min_{j} T_j(q) - d/v_{drib}\big)\Big),\quad \bar\Pi_{path} = \tfrac1M\sum_m \Pi(q_m).$$
+$$P_{drib} = \sigma\Big(1{,}5 - 1{,}2\,\bar\Pi_{path} - 0{,}15\, d + 0{,}8\big(PC_{att}(q) - 0{,}5\big) + 1{,}0\tanh\big(\min_{j} T_j(q) - T_{drib}(q)\big)\Big),\quad \bar\Pi_{path} = \tfrac1M\sum_m \Pi(q_m),$$
+où $T_{drib}(q)$ est le temps de conduite du ballon avec la même cinématique que les adversaires (accélération bornée depuis la vitesse courante projetée, plafond $v_{drib}$, sans temps de réaction : `dribbleTime`). L'ancienne forme $d/v_{drib}$ accordait au porteur un départ lancé instantané (0,67 s pour 4 m contre 1,27 s depuis l'arrêt), soit +0,6 s de marge systématique en faveur du dribble.
 Ancrages : 4 m libre ≈ 0,89 ; 4 m contesté ($\bar\Pi = 1$, $PC = 0{,}5$, course perdue de 0,5 s) ≈ 0,32.
 
 ### 5.4 Tir ($xG$ avec gardien)

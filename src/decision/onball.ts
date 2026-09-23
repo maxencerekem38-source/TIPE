@@ -2,14 +2,22 @@
  * Décision du porteur de balle (docs/CONCEPTION.md §6) : génération des candidats (passes, passes en
  * profondeur, dribbles, tir, conservation, dégagement), évaluation par espérance de valeur avec risque
  * (evaluate.ts), anticipation à deux coups (expectimax profondeur 2 sur les K meilleurs candidats avec une
- * réponse adverse pessimiste), hystérésis, sélection par réponse quantale (softmax) et explication.
+ * réponse adverse pessimiste), hystérésis, sélection (argmax, départage ε, réponse quantale) et explication.
  *
- * Score final d'un candidat développé (§6.3, forme mélangée) :
- *   Q(a) = P_a · [(1 − γ) V⁺(a) + γ · max_{a'} EV₁(a' | s⁺_a)] − (1 − P_a) · λ · L(q_a⁻) − C(a)
- *        = EV₁(a) + P_a · γ · (max EV₁' − V⁺(a))                    (composante « lookahead »)
- * où s⁺_a est l'état anticipé après succès : joueurs avancés de T_a, ballon au point d'arrivée, receveur porteur,
+ * Score final d'un candidat développé (§6.3) :
+ *   Q(a) = P_a · [V⁺(a) − δ_a + γ · G(a)] − (1 − P_a) · λ · L(q_a⁻) − C(a)
+ *        = EV₁(a) − P_a · δ_a + P_a · γ · G(a)          (composantes « response » et « lookahead »)
+ *   δ_a  = Θ(q⁺) − Θ_press(q⁺) ≥ 0 : dégradation de la menace par la réponse adverse « press » ;
+ *   G(a) = max(0, max_{a'} EV₁(a' | s⁺_a) − Θ_press(q⁺)) : gain incrémental de la meilleure suite, au-delà de la
+ *          menace déjà comptée en q⁺ (la conservation garantit G ≳ 0 : aucun double comptage, et un candidat non
+ *          développé — Q = EV₁ ≤ Q développé — ne peut pas dépasser un candidat développé par simple omission).
+ *          Une suite « tir » est comparée aussi au tir immédiat, sinon « dribbler puis tirer » serait crédité de tout xG'.
+ * s⁺_a est l'état anticipé après succès : joueurs avancés de T_a, ballon au point d'arrivée, receveur porteur,
  * et les deux adversaires les plus proches du receveur courant vers lui (modèle de mouvement §4.1 : réaction puis
  * accélération bornée) — réponse « press », pessimiste et bornée physiquement.
+ *
+ * Engagement (§6.5) : un dribble ou une conservation choisis portent `committedUntil` (durée de l'action) ; le
+ * moteur (loop.ts) ne re-décide pas un dribble engagé tant que le porteur garde le ballon et n'a pas atteint sa cible.
  *
  * Aucune allocation profonde : l'état anticipé est une copie superficielle des joueurs (positions dupliquées).
  */
@@ -17,7 +25,7 @@ import type { Vec2 } from '../core/vec2';
 import type { Action, Candidate, Decision, DecisionContext, MatchState, Player, SimParams } from '../core/types';
 import type { DecisionInput } from './policy';
 import { proposeClear, proposeDribbles, proposeHold, proposeLob, proposePass, proposeShot, proposeThroughBalls, type Proposal } from './candidates';
-import { buildReason, createEvalContext, evaluateProposal, modulatedWeights, shallowPlayers, LOB_MIN_DISTANCE, type EvalContext, type Evaluation, type OnBallWeights } from './evaluate';
+import { buildReason, createEvalContext, evaluateProposal, modulatedWeights, shallowPlayers, LANE_BLOCK_PHI, LOB_MIN_DISTANCE, type EvalContext, type Evaluation, type OnBallWeights } from './evaluate';
 import { explainDecision } from './explain';
 import { localSuperiority } from '../models/structure';
 import { pitchControlAt, pressureAt, threatAt } from '../models/fields';
@@ -69,8 +77,8 @@ export function evaluateCandidates(input: DecisionInput, playerId: number, optio
   const me = playerById(state, playerId);
   if (!me) return [];
   const weights = options.weights ?? modulatedWeights(params, input.tactic.params, state.phase[me.team]);
-  const ctx = createEvalContext(state, fields, params, weights, me, options.detailed ?? false);
   const reduced = options.reduced ?? false;
+  const ctx = createEvalContext(state, fields, params, weights, me, options.detailed ?? false, !reduced);
   const out: Candidate[] = [];
 
   // --- Passes au pied (une par coéquipier) ---
@@ -84,7 +92,7 @@ export function evaluateCandidates(input: DecisionInput, playerId: number, optio
     let best: Evaluation = first;
     if (first.blocked) {
       if (first.distance > LOB_MIN_DISTANCE) {
-        const lob = evaluateProposal(ctx, proposeLob(proposalOf(first, speeds[0])));
+        const lob = evaluateProposal(ctx, proposeLob(proposalOf(first, speeds[0]), first.logit));
         if (lob && lob.candidate.score > best.candidate.score) best = lob;
       }
     } else {
@@ -97,11 +105,12 @@ export function evaluateCandidates(input: DecisionInput, playerId: number, optio
   }
 
   if (!reduced) {
-    // --- Passes en profondeur : élagage W > 0,8 puis les 8 meilleures ---
+    // --- Passes en profondeur (§6.1) : cibles receveur + cellules de danger, élagage W > 0,8, les 8 meilleures par EV₁ ---
+    // (déviation documentée : la spécification garde les 8 plus petits W ; EV₁ intègre déjà (1 − P_int) et la valeur.)
     const through: Candidate[] = [];
-    for (const prop of proposeThroughBalls(state, me, params)) {
+    for (const prop of proposeThroughBalls(state, me, params, fields)) {
       const e = evaluateProposal(ctx, prop);
-      if (!e || e.candidate.probability <= 0) continue;
+      if (!e || e.candidate.probability <= 0 || e.weakPhi > LANE_BLOCK_PHI) continue;
       through.push(e.candidate);
     }
     through.sort(compareCandidates);
@@ -115,9 +124,9 @@ export function evaluateCandidates(input: DecisionInput, playerId: number, optio
     if (e) out.push(e.candidate);
   }
 
-  // --- Tir, conservation, dégagement ---
+  // --- Tir (plancher xG_min : un tir désespéré n'est pas une option), conservation, dégagement ---
   const shot = proposeShot(state, me, params);
-  if (shot) { const e = evaluateProposal(ctx, shot); if (e) out.push(e.candidate); }
+  if (shot) { const e = evaluateProposal(ctx, shot); if (e && e.candidate.probability >= weights.shotMinXg) out.push(e.candidate); }
   const hold = evaluateProposal(ctx, proposeHold(state, me));
   if (hold) out.push(hold.candidate);
   if (!reduced) {
@@ -162,9 +171,9 @@ function nextOwnerId(c: Candidate, playerId: number): number | null {
 /**
  * Construit l'état anticipé s⁺ après le succès du candidat : joueurs avancés de T_a, receveur au point d'arrivée
  * (porteur du ballon), et les PRESS_DEFENDERS adversaires les plus proches courant vers lui (réponse « press »).
- * Retourne aussi la dégradation de menace Θ(q⁺) − Θ_press(q⁺) due à la réponse.
+ * Retourne aussi la menace sous press Θ_press(q⁺) et la dégradation δ = Θ(q⁺) − Θ_press(q⁺) due à la réponse.
  */
-export function predictSuccessState(state: MatchState, c: Candidate, playerId: number, ownerId: number, params: SimParams): { next: MatchState; delta: number } {
+export function predictSuccessState(state: MatchState, c: Candidate, playerId: number, ownerId: number, params: SimParams): { next: MatchState; delta: number; thetaPress: number } {
   const T = c.duration ?? 0;
   const q = c.successPoint!;
   const players = shallowPlayers(state.players);
@@ -205,27 +214,39 @@ export function predictSuccessState(state: MatchState, c: Candidate, playerId: n
     d.vel.x = ux * speed; d.vel.y = uy * speed;
   }
   const after = xT * pitchControlAt(next, q, team, params);
-  return { next, delta: before - after };
+  return { next, delta: before - after, thetaPress: after };
 }
 
 /**
- * Développe un candidat en profondeur 2 : meilleure suite du nouveau porteur sur s⁺ (jeu réduit, 6 échantillons),
- * puis mélange Q = EV₁ + P·γ·(max EV₁' − V⁺). Ajoute la composante « lookahead » et la réponse adverse.
+ * Développe un candidat en profondeur 2 (§6.3) :
+ *  1. réponse pessimiste « press » : le premier terme devient Θ_press(q⁺) = Θ(q⁺) − δ, chargé avec le poids P
+ *     (composante « response », affichée telle quelle par l'explication) ;
+ *  2. meilleure suite du nouveau porteur sur s⁺ (jeu réduit, 6 échantillons) et gain incrémental
+ *     G = max(0, max EV₁' − Θ_press(q⁺)) (une suite « tir » est aussi comparée au tir immédiat `shotNowEV`) ;
+ *     Q = EV₁ − P·δ + P·γ·G, V⁺ ← V⁺ − δ + γ·G.
  */
-function expandLookahead(input: DecisionInput, c: Candidate, playerId: number, reducedParams: SimParams, weights: OnBallWeights): void {
+function expandLookahead(input: DecisionInput, c: Candidate, playerId: number, reducedParams: SimParams, weights: OnBallWeights, shotNowEV: number): void {
   const ownerId = nextOwnerId(c, playerId);
   if (ownerId === null || !c.successPoint) return;
   const gamma = weights.gamma;
   if (gamma <= 0) return;
-  const { next, delta } = predictSuccessState(input.state, c, playerId, ownerId, input.params);
+  const { next, delta, thetaPress } = predictSuccessState(input.state, c, playerId, ownerId, input.params);
+  const pressed = Math.max(0, delta);
+  if (pressed > EPS) {
+    c.components.push({ key: 'response', label: 'Réponse adverse (press du receveur)', value: -pressed, unit: 'but', weight: c.probability, contribution: -c.probability * pressed });
+    c.score -= c.probability * pressed;
+    c.valueIfSuccess -= pressed;
+  }
+  c.response = { kind: 'press', delta: pressed };
   const continuation = evaluateCandidates({ ...input, state: next, params: reducedParams }, ownerId, { reduced: true, weights });
-  const maxEV = continuation.length > 0 ? continuation[0].score : 0;
-  const gain = maxEV - c.valueIfSuccess;
+  const best = continuation.length > 0 ? continuation[0] : null;
+  const maxEV = best ? best.score : 0;
+  const baseline = best && best.action.type === 'shoot' ? Math.max(thetaPress, shotNowEV) : thetaPress;
+  const gain = Math.max(0, maxEV - baseline);
   const contribution = c.probability * gamma * gain;
   c.components.push({ key: 'lookahead', label: 'Meilleure suite (profondeur 2)', value: gain, unit: 'but', weight: c.probability * gamma, contribution });
   c.score += contribution;
-  c.valueIfSuccess = (1 - gamma) * c.valueIfSuccess + gamma * maxEV;
-  c.response = { kind: 'press', delta };
+  c.valueIfSuccess += gamma * gain;
 }
 
 // ---------------------------------------------------------------------------
@@ -253,14 +274,24 @@ export function sameAction(a: Action, b: Action): boolean {
 }
 
 /**
- * Réponse quantale (§6.5, McKelvey & Palfrey) : softmax de température `temperature` sur les candidats à moins
- * de `epsilon` du meilleur ; température nulle (ou un seul candidat éligible) ⇒ argmax. `cands` est trié.
+ * Sélection (§6.5) parmi les candidats à moins de `epsilon` du meilleur (`cands` est trié par score décroissant) :
+ *  – température nulle : départage déterministe de l'égalité à ε près ⇒ plus grand P_a, puis plus petit T_a ;
+ *  – température > 0 : réponse quantale (McKelvey & Palfrey), softmax de température `temperature` sur la fenêtre ε.
+ * Un seul candidat éligible ⇒ argmax.
  */
 export function selectCandidate(cands: readonly Candidate[], epsilon: number, temperature: number, rng: { next(): number }): Candidate {
   const best = cands[0].score;
   let n = 1;
   while (n < cands.length && cands[n].score >= best - epsilon) n++;
-  if (n <= 1 || temperature <= 0) return cands[0];
+  if (n <= 1) return cands[0];
+  if (temperature <= 0) {
+    let pick = cands[0];
+    for (let i = 1; i < n; i++) {
+      const c = cands[i];
+      if (c.probability > pick.probability + 1e-12 || (Math.abs(c.probability - pick.probability) <= 1e-12 && (c.duration ?? 0) < (pick.duration ?? 0))) pick = c;
+    }
+    return pick;
+  }
   let total = 0;
   const w = new Array<number>(n);
   for (let i = 0; i < n; i++) { w[i] = Math.exp((cands[i].score - best) / temperature); total += w[i]; }
@@ -291,8 +322,9 @@ export function decideOnBall(input: DecisionInput, playerId: number, previous: D
   const K = Math.max(0, Math.floor(params.decision.topK));
   if (K > 0 && weights.gamma > 0) {
     const reducedParams: SimParams = { ...params, models: { ...params.models, interceptSamples: Math.min(REDUCED_SAMPLES, params.models.interceptSamples) } };
+    const shotNowEV = cands.find((c) => c.action.type === 'shoot')?.score ?? -Infinity;
     const expanded = cands.slice(0, Math.min(K, cands.length));
-    for (const c of expanded) expandLookahead(input, c, playerId, reducedParams, weights);
+    for (const c of expanded) expandLookahead(input, c, playerId, reducedParams, weights, shotNowEV);
   }
 
   // --- Hystérésis ---
@@ -309,7 +341,7 @@ export function decideOnBall(input: DecisionInput, playerId: number, previous: D
 
   // Les décompositions modifiées reçoivent une nouvelle phrase.
   const pressureBall = pressureAt(state, origin, team, params);
-  for (const c of cands) if (c.components.some((k) => k.key === 'lookahead' || k.key === 'hysteresis')) c.reason = buildReason(c, state, pressureBall);
+  for (const c of cands) if (c.components.some((k) => k.key === 'lookahead' || k.key === 'response' || k.key === 'hysteresis')) c.reason = buildReason(c, state, pressureBall);
 
   cands.sort(compareCandidates);
   const chosen = selectCandidate(cands, params.decision.epsilonTie, params.decision.softmaxTemperature, rng);
@@ -331,8 +363,10 @@ export function decideOnBall(input: DecisionInput, playerId: number, previous: D
     computeMs,
   };
   if (keptByHysteresis) decision.keptByHysteresis = true;
+  // Engagement (§6.5) : seules les actions qui gardent le ballon (dribble, conservation) durent ; une passe, un tir
+  // ou un dégagement sont exécutés immédiatement et libèrent le ballon.
   const a = chosen.action;
-  if ((a.type === 'pass' || a.type === 'shoot' || a.type === 'dribble' || a.type === 'clear') && chosen.duration !== undefined) {
+  if ((a.type === 'dribble' || a.type === 'hold') && chosen.duration !== undefined && chosen.duration > 0) {
     decision.committedUntil = state.time + chosen.duration;
   }
   decision.explanation = explainDecision(decision, state);

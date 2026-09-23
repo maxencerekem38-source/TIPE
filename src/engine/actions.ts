@@ -10,9 +10,8 @@ import type { Rng } from '../core/rng';
 import type { Vec2 } from '../core/vec2';
 import { clamp, clamp01 } from '../core/vec2';
 import { PITCH, clampToPitch } from '../core/pitch';
-import { GRAVITY } from './physics';
 import { pushEvent } from './rules';
-import { ballTravelTime, isFrozen, isOffsidePosition, keeperOf, launchSpeed, modelShotXG, nearestOpponent, playerById, pressureAt } from './helpers';
+import { GRAVITY, isFrozen, isOffsidePosition, keeperOf, launchSpeed, lobKinematics, modelShotXG, nearestOpponent, playerById, pressureAt } from './helpers';
 
 const DEG = Math.PI / 180;
 /** Les cibles de déplacement restent à 0,5 m à l'intérieur du terrain. */
@@ -28,8 +27,6 @@ const MISS_OUTSIDE_MIN = 1;
 const MISS_OUTSIDE_MAX = 3;
 const MISS_OVER_BAR_PROB = 0.3;
 const MISS_OVER_BAR_HEIGHT = 3.5;
-/** Durée maximale du vol d'un lob (s). */
-const LOB_MAX_FLIGHT = 3;
 /** Distance minimale d'une frappe (m) : en dessous, on frappe dans la direction d'attaque. */
 const MIN_KICK_DISTANCE = 0.5;
 
@@ -78,6 +75,15 @@ function doHold(state: MatchState, player: Player): boolean {
   return state.ball.ownerId === player.id;
 }
 
+/** Une prise à défaut suppose l'adversaire devant le dribbleur : cos(angle direction → adversaire) ≥ 0,5 (± 60°). */
+const TAKE_ON_MIN_COS = 0.5;
+
+/**
+ * Conduite de balle vers `direction` à `distance`. Un événement « dribble » (prise à défaut) n'est journalisé que si
+ * aucune prise à défaut n'est en cours et qu'un adversaire se trouve à moins de `takeOnRadius`, devant le dribbleur ;
+ * une conduite sans opposition ne compte pas. La prise à défaut en cours (`lastDribbleStart`) est gagnée par la
+ * physique (duel remporté, rules.ts), perdue (tacle, sortie) ou expire sans issue une fois le porteur dégagé.
+ */
 function doDribble(state: MatchState, player: Player, direction: Vec2, distance: number, params: SimParams): boolean {
   if (state.ball.ownerId !== player.id || isFrozen(state)) return false;
   let ux = direction.x, uy = direction.y;
@@ -86,10 +92,16 @@ function doDribble(state: MatchState, player: Player, direction: Vec2, distance:
   const d = Math.max(0, distance);
   player.target = clampToPitch({ x: player.pos.x + ux * d, y: player.pos.y + uy * d }, TARGET_MARGIN);
   player.targetSpeed = player.maxSpeed;
-  const ph = params.physics;
-  if (player.lastDribbleStart === undefined || state.time - player.lastDribbleStart >= ph.dribbleWonDelay) {
-    player.lastDribbleStart = state.time;
-    pushEvent(state, { time: state.time, kind: 'dribble', team: player.team, playerId: player.id, pos: { x: player.pos.x, y: player.pos.y } });
+  if (player.lastDribbleStart === undefined) {
+    const opp = nearestOpponent(state, player.pos, player.team);
+    if (opp) {
+      const ox = opp.pos.x - player.pos.x, oy = opp.pos.y - player.pos.y;
+      const od = Math.hypot(ox, oy);
+      if (od <= params.physics.takeOnRadius && (od < 1e-6 || (ox * ux + oy * uy) / od >= TAKE_ON_MIN_COS)) {
+        player.lastDribbleStart = state.time;
+        pushEvent(state, { time: state.time, kind: 'dribble', team: player.team, playerId: player.id, pos: { x: player.pos.x, y: player.pos.y } });
+      }
+    }
   }
   return true;
 }
@@ -119,14 +131,12 @@ function doKick(state: MatchState, player: Player, action: Extract<Action, { typ
   const cos = Math.cos(angle), sin = Math.sin(angle);
   let vx = cos * s0, vy = sin * s0, vz = 0;
   if (kind === 'lob' || isClear) {
-    // Vol balistique dont la durée ≈ temps de roulement équivalent : vitesse horizontale d/T, vz = g·T/2
-    let T = ballTravelTime(d, s0, ph);
-    if (!Number.isFinite(T)) T = (d / s0) * 1.3;
-    T = clamp(T, 0.3, LOB_MAX_FLIGHT);
-    const hs = d / T;
-    vx = cos * hs;
-    vy = sin * hs;
-    vz = (GRAVITY * T) / 2;
+    // Vol balistique à 45° (même modèle que la décision : lobKinematics) ; le bruit de vitesse porte sur la portée
+    const lob = lobKinematics(d * (ph.speedNoise > 0 ? 1 + rng.normal(0, ph.speedNoise) : 1), ph);
+    vx = cos * lob.hs;
+    vy = sin * lob.hs;
+    vz = lob.vz;
+    s0 = lob.initialSpeed;
   }
 
   ball.ownerId = null;
@@ -146,7 +156,7 @@ function doKick(state: MatchState, player: Player, action: Extract<Action, { typ
   player.lastKickTime = time;
 
   if (isClear) {
-    pushEvent(state, { time, kind: 'pass', team: player.team, playerId: player.id, pos: origin, label: `Dégagement de ${player.name}` });
+    pushEvent(state, { time, kind: 'clearance', team: player.team, playerId: player.id, pos: origin, label: `Dégagement de ${player.name}` });
   } else {
     if (kind === 'through') state.stats[player.team].throughBalls++;
     pushEvent(state, { time, kind: 'pass', team: player.team, playerId: player.id, targetId: action.targetId, pos: origin });

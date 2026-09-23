@@ -13,7 +13,11 @@ import { stepPhysics } from '@/engine/physics';
 import { executeAction } from '@/engine/actions';
 import { applyRules, updatePhases, pushEvent, MAX_EVENTS } from '@/engine/rules';
 import { createSimulation, type DecideFn } from '@/engine/loop';
-import { launchSpeed, ballTravelTime, localIsOffside } from '@/engine/helpers';
+import { launchSpeed, ballTravelTime, localIsOffside, lobKinematics, nearestOutfield } from '@/engine/helpers';
+import { flightModel } from '@/models/interception';
+import { FULL_POLICY } from '@/decision/coordinator';
+import type { PolicySet } from '@/decision/policy';
+import { sigmoid } from '@/core/vec2';
 
 // ---------------------------------------------------------------------------
 // Outils de test
@@ -217,21 +221,40 @@ describe('slotPosition', () => {
     expect(Math.abs(slotPosition(state, state.players[8], ball).y)).toBeGreaterThan(Math.abs(qa.y));
   });
 
-  it('en défense, la ligne défensive borne les défenseurs et la compacité contracte le bloc vers le ballon', () => {
+  it('en défense, le bloc est ré-instancié sur la ligne défensive (§9.2) : profondeur Λ = 45 − 25·compacité, bloc bas ≥ 15 m plus bas que pressing haut', () => {
     const state = createMatch(defaultConfig(3), new Rng(3));
     state.restart = null;
     state.possession = 'B';
     state.phase = { A: 'defence', B: 'attack' };
-    const ball = { x: 30, y: 0 };
-    const cb = state.players[2]; // LCB
-    const line = state.tactics.A.params.defensiveLine;
-    const q = slotPosition(state, cb, ball);
-    expect(q.x).toBeGreaterThanOrEqual(line - 1e-9);
-    // Sans plancher (ligne très basse), la compacité rapproche le poste du ballon par rapport au cas sans compacité
-    state.tactics.A = makeTactic('4-3-3', 'balanced', { defensiveLine: -50, compactness: 0 });
-    const loose = slotPosition(state, cb, ball);
-    state.tactics.A = makeTactic('4-3-3', 'balanced', { defensiveLine: -50, compactness: 1 });
-    const tight = slotPosition(state, cb, ball);
+    const ball = { x: 10, y: 0 };
+    const outfield = state.players.filter((p) => p.team === 'A' && p.role !== 'GK');
+    const xsFor = (style: 'low_block' | 'high_press'): number[] => {
+      state.tactics.A = makeTactic('4-3-3', style);
+      return outfield.map((p) => slotPosition(state, p, ball).x);
+    };
+    const low = xsFor('low_block');
+    const tp = state.tactics.A.params;
+    const lineLow = tp.defensiveLine + 0.35 * (ball.x - tp.defensiveLine); // ≈ −20 pour une ligne à −36
+    const lambdaLow = 45 - 25 * tp.compactness; // ≈ 24
+    expect(lineLow).toBeLessThan(ball.x - 3);
+    for (const x of low) {
+      expect(x).toBeGreaterThanOrEqual(lineLow - 1e-9);
+      expect(x).toBeLessThanOrEqual(lineLow + lambdaLow + 1e-9);
+    }
+    expect(Math.max(...low) - Math.min(...low)).toBeLessThanOrEqual(lambdaLow + 1e-9);
+    const high = xsFor('high_press');
+    expect(Math.min(...high) - Math.min(...low)).toBeGreaterThanOrEqual(15);
+    expect(Math.max(...high) - Math.min(...high)).toBeLessThanOrEqual(45 - 25 * state.tactics.A.params.compactness + 1e-9);
+    // La ligne ne dépasse jamais x_b − 3 (ballon profond dans son camp)
+    const deep = { x: -45, y: 0 };
+    expect(Math.min(...outfield.map((p) => slotPosition(state, p, deep).x))).toBeLessThanOrEqual(deep.x - 3 + 1e-9);
+    // La compacité contracte le bloc latéralement vers le ballon
+    const lb = state.players[1]; // LB
+    state.tactics.A = makeTactic('4-3-3', 'balanced', { compactness: 0 });
+    const loose = slotPosition(state, lb, ball);
+    state.tactics.A = makeTactic('4-3-3', 'balanced', { compactness: 1 });
+    const tight = slotPosition(state, lb, ball);
+    expect(Math.abs(tight.y - ball.y)).toBeLessThan(Math.abs(loose.y - ball.y));
     expect(dist(tight, ball)).toBeLessThan(dist(loose, ball));
     for (const p of state.players) {
       const s = slotPosition(state, p, ball);
@@ -667,19 +690,20 @@ describe('possession, phases, duels, dribbles', () => {
     expect(state.phase).toEqual({ A: 'defence', B: 'attack' });
   });
 
-  it('un porteur immobile entouré de 3 défenseurs est dépossédé par un tacle en moins de 5 s', () => {
+  it('un porteur immobile attaqué par 3 défenseurs est dépossédé par un tacle en moins de 8 s', () => {
     const state = buildState({ players: [
       { team: 'A', pos: { x: 0, y: 0 }, role: 'MF', number: 8 },
-      { team: 'B', pos: { x: 1, y: 0 }, role: 'DF', number: 4 },
-      { team: 'B', pos: { x: -0.5, y: 0.8 }, role: 'DF', number: 5 },
-      { team: 'B', pos: { x: -0.5, y: -0.8 }, role: 'DF', number: 6 },
+      { team: 'B', pos: { x: 2.5, y: 0 }, role: 'DF', number: 4 },
+      { team: 'B', pos: { x: -2, y: 1.5 }, role: 'DF', number: 5 },
+      { team: 'B', pos: { x: -2, y: -1.5 }, role: 'DF', number: 6 },
     ], ball: { ownerId: 0, pos: { x: 0, y: 0 } } });
+    for (const d of state.players) if (d.team === 'B') { d.target = { x: 0, y: 0 }; d.targetSpeed = d.maxSpeed; } // ils attaquent le porteur
     const cfg = configFor(state);
     const rng = new Rng(9);
     let lostAt = -1;
-    run(state, cfg, rng, 5, (s) => { if (lostAt < 0 && s.ball.ownerId !== 0) lostAt = s.time; });
+    run(state, cfg, rng, 8, (s) => { if (lostAt < 0 && s.ball.ownerId !== 0) lostAt = s.time; });
     expect(lostAt).toBeGreaterThan(0);
-    expect(lostAt).toBeLessThan(5);
+    expect(lostAt).toBeLessThan(8);
     expect(state.stats.B.tackles).toBeGreaterThanOrEqual(1);
     expect(hasEvent(state, 'tackle')).toBe(true);
     expect(state.stats.A.turnovers).toBeGreaterThanOrEqual(1);
@@ -687,31 +711,34 @@ describe('possession, phases, duels, dribbles', () => {
     expect(state.players[0].lastDribbleStart).toBeUndefined();
   });
 
-  it('un défenseur qui perd son duel est « passé » : immobile 0,5 s, sans nouveau duel', () => {
+  it('un défenseur qui perd son duel est « passé » : immobile beatenFreeze s, sans nouveau duel', () => {
     const params = quietParams({ duelMinProb: 0, duelMaxProb: 0 }); // le défenseur perd toujours
     const state = buildState({ players: [
       { team: 'A', pos: { x: 0, y: 0 }, role: 'MF', number: 8 },
-      { team: 'B', pos: { x: 1, y: 0 }, role: 'DF', number: 4 },
+      { team: 'B', pos: { x: 2.5, y: 0 }, role: 'DF', number: 4 },
     ], ball: { ownerId: 0, pos: { x: 0, y: 0 } } });
     const cfg = configFor(state, params);
     const rng = new Rng(9);
     const d = state.players[1];
-    d.target = { x: 30, y: 0 };
+    d.target = { x: -10, y: 0 }; // il fond sur le porteur
     d.targetSpeed = 8;
+    let duelAt = -1;
+    expect(runUntil(state, cfg, rng, 2, (s) => { if (d.beatenUntil !== undefined) { duelAt = s.time - DT; return true; } return false; })).toBe(true);
+    expect(duelAt).toBeGreaterThan(0.1); // il lui a fallu accélérer et entrer dans r_tackle
+    expect(d.beatenUntil).toBeCloseTo(duelAt + params.physics.beatenFreeze, 6);
+    expect(state.stats.A.dribblesWon).toBe(1); // duel remporté = prise à défaut réussie
+    const frozenPos = { ...d.pos };
     state.players[0].target = { x: -30, y: 0 }; // le porteur s'éloigne pendant l'immobilisation
     state.players[0].targetSpeed = 8;
-    run(state, cfg, rng, DT); // duel au premier tick (t = 0)
-    expect(d.beatenUntil).toBeCloseTo(params.physics.beatenFreeze, 6);
-    const frozenPos = { ...d.pos };
-    run(state, cfg, rng, 0.4);
+    run(state, cfg, rng, params.physics.beatenFreeze - 0.1);
     expect(d.pos).toEqual(frozenPos);
     expect(state.ball.ownerId).toBe(0);
-    run(state, cfg, rng, 0.8); // libéré à t = 0,5 s : ≈ 0,7 s de course depuis l'arrêt (a = 5 m/s² ⇒ > 1 m)
+    run(state, cfg, rng, 0.8); // libéré : ≈ 0,7 s de course depuis l'arrêt (a = 5 m/s² ⇒ > 1 m)
     expect(dist(d.pos, frozenPos)).toBeGreaterThan(0.5);
     expect(state.stats.B.tackles).toBe(0);
   });
 
-  it('un dribble déplace le porteur avec le ballon, compte un dribble puis un dribble réussi après 1,5 s', () => {
+  it('un dribble déplace le porteur avec le ballon ; sans adversaire à moins de takeOnRadius ce n’est pas une prise à défaut', () => {
     const params = quietParams();
     const state = buildState({ players: [
       { team: 'A', pos: { x: 0, y: 0 }, role: 'MF', number: 8 },
@@ -721,20 +748,47 @@ describe('possession, phases, duels, dribbles', () => {
     const rng = new Rng(1);
     const dribble: Action = { type: 'dribble', direction: { x: 1, y: 0 }, distance: 8 };
     expect(executeAction(state, 0, dribble, params, rng)).toBe(true);
-    expect(state.stats.A.dribbles).toBe(1);
+    expect(state.stats.A.dribbles).toBe(0); // conduite sans opposition : aucun événement
     expect(state.players[0].target).toEqual({ x: 8, y: 0 });
-    // Ré-émettre le même dribble ne le recompte pas
-    expect(executeAction(state, 0, dribble, params, rng)).toBe(true);
-    expect(state.stats.A.dribbles).toBe(1);
-    run(state, cfg, rng, 1);
+    for (let i = 0; i < 6; i++) { run(state, cfg, rng, 1); executeAction(state, 0, dribble, params, rng); }
+    expect(state.stats.A.dribbles).toBe(0);
+    expect(state.stats.A.dribblesWon).toBe(0);
+    expect(state.events.filter((e) => e.kind === 'dribble')).toHaveLength(0);
     expect(state.players[0].pos.x).toBeGreaterThan(2); // accélération 5 m/s² plafonnée à 0,75·v_max
     expect(state.ball.ownerId).toBe(0);
     expect(state.ball.pos.x).toBeGreaterThan(state.players[0].pos.x);
     expect(Math.hypot(state.players[0].vel.x, state.players[0].vel.y)).toBeLessThanOrEqual(state.players[0].maxSpeed * params.physics.dribbleSpeedFactor + 1e-9);
+  });
+
+  it('une prise à défaut (adversaire à moins de 3 m) compte un dribble, gagné seulement par un duel remporté', () => {
+    const params = quietParams({ duelMinProb: 0, duelMaxProb: 0 }); // le défenseur perd toujours
+    const state = buildState({ players: [
+      { team: 'A', pos: { x: 0, y: 0 }, role: 'MF', number: 8 },
+      { team: 'B', pos: { x: 2.5, y: 0 }, role: 'DF', number: 4 },
+    ], ball: { ownerId: 0, pos: { x: 0, y: 0 } } });
+    const cfg = configFor(state, params);
+    const rng = new Rng(1);
+    const dribble: Action = { type: 'dribble', direction: { x: 1, y: 0 }, distance: 8 };
+    expect(executeAction(state, 0, dribble, params, rng)).toBe(true);
+    expect(state.stats.A.dribbles).toBe(1);
+    expect(executeAction(state, 0, dribble, params, rng)).toBe(true); // ré-émettre ne recompte pas
+    expect(state.stats.A.dribbles).toBe(1);
+    // Sans contact pendant dribbleWonDelay, la prise à défaut expire sans être « gagnée » (le défenseur recule)
+    state.players[1].target = { x: 40, y: 0 };
+    state.players[1].targetSpeed = 8;
+    run(state, cfg, rng, params.physics.dribbleWonDelay + 0.1);
     expect(state.stats.A.dribblesWon).toBe(0);
-    run(state, cfg, rng, 0.6);
-    expect(state.stats.A.dribblesWon).toBe(1);
     expect(state.players[0].lastDribbleStart).toBeUndefined();
+    // Nouvelle prise à défaut : le défenseur fond sur le porteur et perd son duel ⇒ dribble réussi
+    const d = state.players[1];
+    d.pos = { x: state.players[0].pos.x + 2.5, y: 0 };
+    d.vel = { x: 0, y: 0 };
+    d.target = { x: -40, y: 0 };
+    executeAction(state, 0, dribble, params, rng);
+    expect(state.stats.A.dribbles).toBe(2);
+    expect(runUntil(state, cfg, rng, 3, (s) => s.stats.A.dribblesWon === 1)).toBe(true);
+    expect(state.players[0].lastDribbleStart).toBeUndefined();
+    expect(state.stats.A.dribbles).toBe(2); // le duel gagné ne recompte pas la tentative déjà journalisée
   });
 
   it('« hold » vise 1 m à l’opposé de l’adversaire le plus proche ; « move » borne la cible au terrain', () => {
@@ -870,5 +924,363 @@ describe('simulation', () => {
     expect(sim.state.events.some((e) => e.kind === 'restart' || e.kind === 'possession_change')).toBe(true);
     const teams: TeamId[] = ['A', 'B'];
     for (const t of teams) expect(s[t].possessionTime).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Régressions de réalisme (revue comportementale) : duels, ballons aériens, événements, regret, engagement
+// ---------------------------------------------------------------------------
+describe('duels : déclenchement, cadence, probabilité', () => {
+  const carrierAndDefender = (dx: number): MatchState => buildState({ players: [
+    { team: 'A', pos: { x: 0, y: 0 }, role: 'MF', number: 8 },
+    { team: 'B', pos: { x: dx, y: 0 }, role: 'DF', number: 4 },
+  ], ball: { ownerId: 0, pos: { x: 0, y: 0 } } });
+
+  it('un adversaire qui contient hors de r_tackle ne déclenche aucun duel ; au contact immobile il en déclenche un après duelContactTime, et aussitôt s’il fond sur le porteur', () => {
+    const params = quietParams();
+    // Contain à 2 m : jamais de duel
+    const far = carrierAndDefender(2);
+    run(far, configFor(far, params), new Rng(3), 3);
+    expect(far.players[1].lastDuelTime).toBeUndefined();
+    expect(far.players[1].duelContactSince).toBeUndefined();
+    expect(far.ball.ownerId).toBe(0);
+    // Face-à-face immobile à 1 m : pas de duel avant duelContactTime, duel juste après (le face-à-face ne dure pas)
+    const near = carrierAndDefender(1);
+    const cfgNear = configFor(near, params);
+    const rngNear = new Rng(3);
+    run(near, cfgNear, rngNear, params.physics.duelContactTime - 0.1);
+    expect(near.players[1].lastDuelTime).toBeUndefined();
+    expect(near.players[1].duelContactSince).toBeCloseTo(0, 9);
+    run(near, cfgNear, rngNear, 0.2);
+    expect(near.players[1].lastDuelTime).toBeCloseTo(params.physics.duelContactTime, 1);
+    // Défenseur qui fond sur le porteur depuis 2,5 m : duel dès l'entrée dans r_tackle (< duelContactTime)
+    const charge = carrierAndDefender(2.5);
+    const cfgCharge = configFor(charge, params);
+    const d = charge.players[1];
+    d.target = { x: -5, y: 0 };
+    d.targetSpeed = 8;
+    expect(runUntil(charge, cfgCharge, new Rng(3), 2, () => d.lastDuelTime !== undefined)).toBe(true);
+    expect(charge.time - d.duelContactSince!).toBeLessThan(params.physics.duelContactTime);
+  });
+
+  it('un porteur ne subit qu’un duel par duelCooldown même face à deux défenseurs, et aucun juste après sa prise de balle', () => {
+    const params = quietParams({ duelMinProb: 0, duelMaxProb: 0 }); // le porteur gagne toujours (le ballon reste)
+    const state = buildState({ players: [
+      { team: 'A', pos: { x: 0, y: 0 }, role: 'MF', number: 8 },
+      { team: 'B', pos: { x: 2.5, y: 0.6 }, role: 'DF', number: 4 },
+      { team: 'B', pos: { x: 2.5, y: -0.6 }, role: 'DF', number: 5 },
+      { team: 'B', pos: { x: -2.5, y: 0 }, role: 'DF', number: 6 },
+    ], ball: { ownerId: 0, pos: { x: 0, y: 0 } } });
+    for (const d of state.players) if (d.team === 'B') { d.target = { x: 0, y: 0 }; d.targetSpeed = 8; }
+    const cfg = configFor(state, params);
+    const rng = new Rng(5);
+    const duels = (): number => state.stats.A.dribblesWon; // chaque duel gagné = un dribble réussi
+    expect(runUntil(state, cfg, rng, 2, () => duels() >= 1)).toBe(true);
+    const first = state.time;
+    run(state, cfg, rng, params.physics.duelCooldown - 0.1);
+    expect(duels()).toBe(1);
+    run(state, cfg, rng, 1.5);
+    expect(duels()).toBeGreaterThanOrEqual(2);
+    expect(state.time - first).toBeGreaterThan(params.physics.duelCooldown - 0.1);
+    // Délai de grâce après une prise de balle
+    const fresh = carrierAndDefender(1.2);
+    fresh.players[0].lastControlTime = 0;
+    fresh.players[1].target = { x: -5, y: 0 };
+    fresh.players[1].targetSpeed = 8;
+    fresh.players[1].vel = { x: -3, y: 0 };
+    const cfg2 = configFor(fresh, params);
+    run(fresh, cfg2, new Rng(1), params.physics.duelCarrierGrace - 0.05);
+    expect(fresh.players[1].lastDuelTime).toBeUndefined();
+  });
+
+  it('P_def d’un défenseur seul, de face, à qualité égale vaut σ(duelBase + duelGoalSide) : le tacleur n’est pas compté dans la pression', () => {
+    const params = quietParams({ duelMinProb: 0, duelMaxProb: 1 });
+    const state = carrierAndDefender(2.5);
+    const cfg = configFor(state, params);
+    const d = state.players[1];
+    d.target = { x: -10, y: 0 };
+    d.targetSpeed = 8;
+    expect(runUntil(state, cfg, new Rng(2), 2, () => d.lastDuelTime !== undefined)).toBe(true);
+    const ev = state.events.find((e) => (e.kind === 'tackle' || e.kind === 'dribble') && typeof e.value === 'number')!;
+    expect(ev).toBeDefined();
+    expect(ev.value).toBeCloseTo(sigmoid(params.physics.duelBase + params.physics.duelGoalSide), 6);
+    expect(sigmoid(params.physics.duelBase + params.physics.duelGoalSide)).toBeLessThan(0.55);
+  });
+
+  it('une perte de balle sur tacle « ballon libre » est attribuée à la victime, pas au tacleur', () => {
+    const params = quietParams({ duelMinProb: 1, duelMaxProb: 1, tackleKeepProb: 0 });
+    const state = carrierAndDefender(2.5);
+    const cfg = configFor(state, params);
+    const d = state.players[1];
+    d.target = { x: -10, y: 0 };
+    d.targetSpeed = 8;
+    expect(runUntil(state, cfg, new Rng(2), 4, (s) => s.possession === 'B')).toBe(true);
+    const turnover = state.events.find((e) => e.kind === 'turnover')!;
+    expect(turnover.team).toBe('A');
+    expect(turnover.playerId).toBe(0);
+  });
+});
+
+describe('ballons aériens : cinématique partagée et atterrissage', () => {
+  it('lobKinematics et flightModel(« lob ») prévoient la même durée de vol, et la simulation la respecte à 5 %', () => {
+    const params = quietParams();
+    for (const d of [20, 30, 45, 60]) {
+      const k = lobKinematics(d, params.physics);
+      expect(flightModel('lob', d, params).travelTime).toBeCloseTo(k.T, 9);
+      expect(k.hs * k.T).toBeCloseTo(d, 9); // portée exacte
+      const state = buildState({ players: [
+        { team: 'A', pos: { x: -30, y: 0 }, role: 'MF', number: 8 },
+        { team: 'A', pos: { x: -30 + d, y: 12 }, role: 'FW', number: 9 }, // receveur écarté : le ballon retombe seul
+      ], ball: { ownerId: 0, pos: { x: -30, y: 0 } } });
+      const cfg = configFor(state, params);
+      const rng = new Rng(1);
+      stepPhysics(state, params, rng, DT);
+      state.time += DT;
+      const t0 = state.time;
+      expect(executeAction(state, 0, { type: 'pass', targetId: 1, targetPoint: { x: -30 + d, y: 0 }, kind: 'lob', speed: 6 }, params, rng)).toBe(true);
+      expect(runUntil(state, cfg, rng, 8, (s) => s.ball.flight?.landed === true)).toBe(true);
+      const T = state.time - t0;
+      expect(Math.abs(T - k.T) / k.T).toBeLessThan(0.05);
+      expect(dist(state.ball.pos, { x: -30 + d, y: 0 })).toBeLessThan(2);
+      expect(Math.hypot(state.ball.vel.x, state.ball.vel.y)).toBeLessThanOrEqual(params.physics.lobLandingSpeed + 1e-9);
+    }
+  });
+
+  it('un lob de 30 m et de 45 m est contrôlable au point visé (fenêtre ≥ 0,15 s) et s’arrête à moins de 15 m ; un receveur immobile le contrôle en 0,5 s', () => {
+    const params = quietParams();
+    for (const d of [30, 45]) {
+      // Sans receveur au point visé : fenêtre de contrôle et distance d'arrêt
+      const free = buildState({ players: [
+        { team: 'A', pos: { x: -30, y: 0 }, role: 'MF', number: 8 },
+        { team: 'A', pos: { x: -30 + d, y: 12 }, role: 'FW', number: 9 },
+      ], ball: { ownerId: 0, pos: { x: -30, y: 0 } } });
+      const target = { x: -30 + d, y: 0 };
+      const rng = new Rng(1);
+      stepPhysics(free, params, rng, DT);
+      executeAction(free, 0, { type: 'pass', targetId: 1, targetPoint: target, kind: 'lob', speed: 6 }, params, rng);
+      let windowTicks = 0;
+      run(free, configFor(free, params), rng, 12, (s) => {
+        const b = s.ball;
+        if (dist(b.pos, target) <= params.physics.controlRadius + params.physics.controlSlowBonus && b.z < params.physics.controlMaxHeight && Math.hypot(b.vel.x, b.vel.y) < params.physics.controlMaxRelSpeed) windowTicks++;
+      });
+      expect(windowTicks * DT).toBeGreaterThanOrEqual(0.15); // ≈ 1,3 m de portée franchis à lobLandingSpeed après un atterrissage à < 0,5 m
+      expect(free.ball.vel).toEqual({ x: 0, y: 0 });
+      expect(dist(free.ball.pos, target)).toBeLessThan(15);
+      expect(Math.abs(free.ball.pos.y)).toBeLessThan(PITCH.halfWidth);
+      // Receveur immobile au point visé : contrôle dans les 0,5 s suivant le premier contact au sol
+      const recv = buildState({ players: [
+        { team: 'A', pos: { x: -30, y: 0 }, role: 'MF', number: 8 },
+        { team: 'A', pos: { x: -30 + d, y: 0 }, role: 'FW', number: 9 },
+      ], ball: { ownerId: 0, pos: { x: -30, y: 0 } } });
+      const rng2 = new Rng(1);
+      stepPhysics(recv, params, rng2, DT);
+      executeAction(recv, 0, { type: 'pass', targetId: 1, targetPoint: target, kind: 'lob', speed: 6 }, params, rng2);
+      const cfg = configFor(recv, params);
+      let landedAt = -1;
+      expect(runUntil(recv, cfg, rng2, 8, (s) => { if (landedAt < 0 && (s.ball.flight?.landed || s.ball.ownerId !== null)) landedAt = s.time; return s.ball.ownerId === 1; })).toBe(true);
+      expect(recv.time - landedAt).toBeLessThanOrEqual(0.5 + 1e-9);
+      expect(hasEvent(recv, 'pass_complete')).toBe(true);
+    }
+  });
+
+  it('un receveur qui court au-devant d’une passe rapide (ballon 11 m/s + joueur 4 m/s) la contrôle', () => {
+    const params = quietParams();
+    const state = buildState({ players: [
+      { team: 'A', pos: { x: -20, y: 0 }, role: 'MF', number: 8 },
+      { team: 'A', pos: { x: -4, y: 0 }, role: 'MF', number: 6 },
+    ], ball: { ownerId: 0, pos: { x: -20, y: 0 } } });
+    const cfg = configFor(state, params);
+    const rng = new Rng(1);
+    const r = state.players[1];
+    r.target = { x: -20, y: 0 }; // il vient au-devant du ballon
+    r.targetSpeed = 4;
+    r.vel = { x: -4, y: 0 };
+    stepPhysics(state, params, rng, DT);
+    executeAction(state, 0, { type: 'pass', targetId: 1, targetPoint: { x: -4, y: 0 }, kind: 'ground', speed: 10 }, params, rng);
+    expect(state.ball.flight!.initialSpeed).toBeGreaterThan(10);
+    expect(runUntil(state, cfg, rng, 3, (s) => s.ball.ownerId === 1)).toBe(true);
+    expect(hasEvent(state, 'pass_complete')).toBe(true);
+  });
+});
+
+describe('événements : contres, dégagements, remises en jeu', () => {
+  it('un tir contré produit un événement « block » (pas de tacle) et la perte est attribuée au tireur', () => {
+    const params = quietParams({ saveProb: 0 });
+    const state = buildState({ players: [
+      { team: 'A', pos: { x: 30, y: 0 }, role: 'FW', number: 9 },
+      { team: 'B', pos: { x: 31.5, y: 0.1 }, role: 'DF', number: 4 },
+      { team: 'B', pos: { x: 51, y: 0 }, role: 'GK', number: 1 },
+    ], ball: { ownerId: 0, pos: { x: 30, y: 0 } } });
+    const cfg = configFor(state, params);
+    const rng = new Rng(1);
+    stepPhysics(state, params, rng, DT);
+    executeAction(state, 0, { type: 'shoot', targetPoint: { x: 52.5, y: 0 }, power: 1, xg: 0 }, params, rng);
+    expect(runUntil(state, cfg, rng, 2, (s) => hasEvent(s, 'block'))).toBe(true);
+    expect(state.stats.B.blocks).toBe(1);
+    expect(state.stats.B.tackles).toBe(0);
+    expect(hasEvent(state, 'tackle')).toBe(false);
+    expect(state.score.A).toBe(0);
+    expect(runUntil(state, cfg, rng, 3, (s) => s.possession === 'B')).toBe(true);
+    const turnover = state.events.find((e) => e.kind === 'turnover')!;
+    expect(turnover.playerId).toBe(0);
+  });
+
+  it('un tir dont l’issue tirée est « but » n’est jamais contré (les contreurs sont déjà dans le xG) : fréquence de but = xG', () => {
+    const params = quietParams({ saveProb: 0 });
+    let goals = 0;
+    const N = 300;
+    for (let seed = 0; seed < N; seed++) {
+      const state = buildState({ players: [
+        { team: 'A', pos: { x: 30, y: 0 }, role: 'FW', number: 9 },
+        { team: 'B', pos: { x: 31.5, y: 0.2 }, role: 'DF', number: 4 },
+        { team: 'B', pos: { x: 32.5, y: -0.3 }, role: 'DF', number: 5 },
+        { team: 'B', pos: { x: 51, y: 0 }, role: 'GK', number: 1 },
+      ], ball: { ownerId: 0, pos: { x: 30, y: 0 } } });
+      const rng = new Rng(seed + 500);
+      stepPhysics(state, params, rng, DT);
+      executeAction(state, 0, { type: 'shoot', targetPoint: { x: 52.5, y: 0 }, power: 1, xg: 0.3 }, params, rng);
+      run(state, configFor(state, params), rng, 1.5);
+      goals += state.score.A;
+    }
+    expect(Math.abs(goals / N - 0.3)).toBeLessThan(0.06);
+  });
+
+  it('un dégagement produit un événement « clearance » et ne compte pas comme une passe', () => {
+    const params = quietParams();
+    const state = buildState({ players: [
+      { team: 'A', pos: { x: -40, y: 0 }, role: 'DF', number: 4 },
+      { team: 'A', pos: { x: 0, y: 0 }, role: 'MF', number: 8 },
+    ], ball: { ownerId: 0, pos: { x: -40, y: 0 } } });
+    const rng = new Rng(1);
+    stepPhysics(state, params, rng, DT);
+    expect(executeAction(state, 0, { type: 'clear', targetPoint: { x: 0, y: 10 } }, params, rng)).toBe(true);
+    expect(state.stats.A.clearances).toBe(1);
+    expect(state.stats.A.passes).toBe(0);
+    expect(state.events.at(-1)!.kind).toBe('clearance');
+    expect(state.ball.flight!.kind).toBe('clearance');
+  });
+
+  it('une touche ou un corner n’est jamais remis par le gardien, même s’il est le plus proche : il ne bouge pas', () => {
+    const params = quietParams();
+    const state = buildState({ players: [
+      { team: 'A', pos: { x: 0, y: 0 }, role: 'MF', number: 8 },
+      { team: 'B', pos: { x: 6, y: 30 }, role: 'GK', number: 1 },
+      { team: 'B', pos: { x: 30, y: 0 }, role: 'DF', number: 4 },
+    ], ball: { pos: { x: 5, y: 33.9 } } });
+    state.ball.vel = { x: 0, y: 6 };
+    state.ball.lastTouchId = 0;
+    state.possession = 'A';
+    const gk = state.players[1];
+    const gkPos = { ...gk.pos };
+    expect(nearestOutfield(state, { x: 5, y: 34 }, 'B')!.id).toBe(2);
+    run(state, configFor(state, params), new Rng(1), 0.5);
+    const restart = state.events.find((e) => e.kind === 'restart')!;
+    expect(restart).toBeDefined();
+    expect(state.restart!.kind).toBe('throw_in');
+    expect(restart.playerId).toBe(2);
+    expect(gk.pos).toEqual(gkPos);
+    expect(state.ball.ownerId).toBe(2);
+  });
+});
+
+describe('boucle : regret du porteur et décisions engagées', () => {
+  it('le regret n’est comptabilisé que pour les décisions du porteur (pas pour les tâches de déplacement)', () => {
+    const decide: DecideFn = (state) => {
+      const out = new Map<number, Decision>();
+      for (const p of state.players) {
+        if (state.ball.ownerId === p.id) {
+          const chosen = candidate({ type: 'hold' }, 0.1, 0.9);
+          out.set(p.id, { ...decisionOf(state, p.id, { type: 'hold' }), chosen, candidates: [candidate({ type: 'hold' }, 0.15, 0.9), chosen] });
+        } else {
+          const action: Action = { type: 'move', target: { ...p.pos }, intent: 'zone', speed: 0 };
+          const chosen = candidate(action, -3, 1);
+          out.set(p.id, { ...decisionOf(state, p.id, action), chosen, candidates: [candidate(action, 0, 1), chosen] }); // « meilleur » écart de 3 s
+        }
+      }
+      return out;
+    };
+    const sim = createSimulation(defaultConfig(7), { decide });
+    sim.state.restart = null;
+    sim.advance(1);
+    const s = sim.state.stats;
+    const owner = sim.state.players[sim.state.ball.ownerId!];
+    expect(s.A.regret + s.B.regret).toBeCloseTo(5 * 0.05, 9);
+    expect(s[owner.team].onBallDecisions).toBe(5);
+    expect(s.A.decisions + s.B.decisions).toBe(5 * 22);
+  });
+
+  it('un dribble engagé (committedUntil) n’est pas re-décidé : onBall n’est pas rappelé et les compteurs n’augmentent pas', () => {
+    const params = quietParams();
+    const cfg = defaultConfig(8, params);
+    let onBallCalls = 0;
+    const policy: PolicySet = {
+      ...FULL_POLICY,
+      name: 'test',
+      onBall: (input, playerId, previous) => {
+        onBallCalls++;
+        const state = input.state;
+        const action: Action = { type: 'dribble', direction: { x: attackDir(state.players[playerId].team), y: 0 }, distance: 8 };
+        const d = decisionOf(state, playerId, action);
+        d.chosen.duration = 1.0;
+        d.committedUntil = state.time + 1.0;
+        void previous;
+        return d;
+      },
+    };
+    const sim = createSimulation(cfg, { policies: { A: policy, B: policy } });
+    sim.state.restart = null;
+    sim.advance(0.2);
+    expect(onBallCalls).toBe(1);
+    const ownerId = sim.state.ball.ownerId!;
+    const first = sim.decisions.get(ownerId)!;
+    const decisionsAfterFirst = sim.state.stats.A.decisions + sim.state.stats.B.decisions;
+    sim.advance(0.6); // 3 cycles de plus, tous dans la fenêtre d'engagement
+    expect(onBallCalls).toBe(1);
+    expect(sim.decisions.get(ownerId)).toBe(first);
+    expect(sim.state.players[ownerId].decision).toBe(first);
+    expect(sim.state.stats.A.decisions + sim.state.stats.B.decisions).toBe(decisionsAfterFirst + 3 * 21);
+    // Engagement écoulé (t ≥ 1,0 s) : le prochain porteur (le même ou un adversaire après un duel) est re-décidé
+    for (let i = 0; i < 90 && onBallCalls < 2; i++) sim.step();
+    expect(onBallCalls).toBeGreaterThanOrEqual(2);
+    expect(sim.state.time).toBeLessThanOrEqual(1.2 + 3 + 1e-9);
+    // Sans engagement, chaque cycle re-décide
+    let plainCalls = 0;
+    const plain: PolicySet = { ...policy, onBall: (input, playerId, previous) => { plainCalls++; const d = policy.onBall(input, playerId, previous); delete d.committedUntil; return d; } };
+    const sim2 = createSimulation(cfg, { policies: { A: plain, B: plain } });
+    sim2.state.restart = null;
+    sim2.advance(1);
+    expect(plainCalls).toBe(5);
+  });
+});
+
+describe('réalisme : match de 3 minutes avec l’algorithme complet', () => {
+  it('tacles ≤ 2,5 par minute et par équipe, pertes de balle < 6 par minute, dribbles < 4 par minute, pas de NaN, gardiens près de leur but', () => {
+    const sim = createSimulation({ ...defaultConfig(3), tactics: { A: makeTactic('4-3-3', 'possession'), B: makeTactic('4-4-2', 'counter') }, durationSec: 180 });
+    let keeperFar = 0, samples = 0;
+    while (!sim.finished) {
+      sim.step();
+      if (sim.state.tick % 30 === 0) {
+        samples++;
+        for (const p of sim.state.players) {
+          if (p.role !== 'GK') continue;
+          const goalX = -attackDir(p.team) * PITCH.halfLength;
+          if (Math.hypot(p.pos.x - goalX, p.pos.y) > 25) keeperFar++;
+        }
+      }
+    }
+    const s = sim.state.stats;
+    const minutes = 3;
+    for (const team of ['A', 'B'] as const) {
+      expect(s[team].tackles / minutes).toBeLessThanOrEqual(2.5); // avant correction : 3,5–7 tacles/min
+      expect(s[team].turnovers / minutes).toBeLessThan(6); // avant correction : 6–8 pertes/min
+      expect(s[team].dribbles / minutes).toBeLessThan(4);
+      expect(s[team].passesCompleted).toBeLessThanOrEqual(s[team].passes);
+      for (const v of Object.values(s[team])) expect(Number.isFinite(v)).toBe(true);
+    }
+    expect(keeperFar / Math.max(1, samples)).toBeLessThan(0.02);
+    for (const p of sim.state.players) {
+      expect(Math.abs(p.pos.x)).toBeLessThanOrEqual(PITCH.halfLength + 2 + 1e-9);
+      expect(Math.abs(p.pos.y)).toBeLessThanOrEqual(PITCH.halfWidth + 2 + 1e-9);
+    }
   });
 });

@@ -17,7 +17,7 @@ import { FORMATIONS } from '@/tactics/formations';
 import { makeTactic } from '@/tactics/styles';
 import { computeFields } from '@/models/fields';
 import { createMatch, giveBall } from '@/engine/match';
-import { decideDefence, generateTasks, pressingTrigger, taskCost, defenderInfo, outfieldDefenders, INFEASIBLE_COST } from '@/decision/defence';
+import { decideDefence, generateTasks, pressingTrigger, taskCost, defenderInfo, outfieldDefenders, containDistance, INFEASIBLE_COST } from '@/decision/defence';
 import { decideKeeper, bisectorPosition } from '@/decision/keeper';
 import type { DecisionInput } from '@/decision/policy';
 
@@ -173,7 +173,7 @@ describe('defence — pressing et marquage tactiques', () => {
 
   it('bloc bas : aucun presseur quand le ballon est dans la moitié adverse ; un défenseur contient le porteur côté but', () => {
     const state = matchState(3, 6, v(-15, 4), { A: makeTactic('4-3-3', 'balanced'), B: makeTactic('4-4-2', 'low_block') });
-    state.players[17].pos = { x: -20, y: 6 }; // un milieu B à 5 m du porteur : il le contient, les autres tiennent le bloc
+    state.players[17].pos = { x: -13, y: 4 }; // un milieu B à 2 m côté but du porteur : il le contient, les autres tiennent le bloc (bas, §9.2)
     const input = inputFor(state, 'B');
     const info = pressingTrigger(input, 'B', outfieldDefenders(state, 'B'), null);
     expect(info.pressing).toBe(false);
@@ -184,7 +184,11 @@ describe('defence — pressing et marquage tactiques', () => {
     const contain = state.players.filter((p) => p.team === 'B' && move(out.get(p.id)!)?.intent === 'cover');
     expect(contain).toHaveLength(1);
     const t = move(out.get(contain[0].id)!)!.target;
-    expect(dist(t, state.ball.pos)).toBeCloseTo(P.defence.containOffset, 6);
+    // Distance de contain modulée par pressIntensity : un bloc bas contient de plus loin qu'un pressing haut.
+    const lowBlock = containDistance(P.defence, state.tactics.B.params.pressIntensity);
+    expect(dist(t, state.ball.pos)).toBeCloseTo(lowBlock, 6);
+    expect(lowBlock).toBeGreaterThan(containDistance(P.defence, makeTactic('4-4-2', 'high_press').params.pressIntensity) + 1);
+    expect(containDistance(P.defence, 1)).toBeCloseTo(P.defence.containOffset, 9);
     expect(dist(t, ownGoalCentre(attackDir('B')))).toBeLessThan(dist(state.ball.pos, ownGoalCentre(attackDir('B'))));
     expect(its.filter((i) => i === 'recover').length).toBeGreaterThanOrEqual(3); // le bloc tient sa forme
     expect(out.get(contain[0].id)!.explanation).toMatch(/Bloc en place/);

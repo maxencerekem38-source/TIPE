@@ -2,22 +2,25 @@
  * Coordonnateur (docs/CONCEPTION.md §13.2) : un cycle de décision complet pour les 22 joueurs.
  *  1. champs spatiaux : computeFields → state.fields (seule écriture dans l'état) ;
  *  2. équipe attaquante = équipe du porteur, sinon équipe en possession ;
- *  3. porteur → onBall ; coéquipiers → offBall (gardien → decideKeeper) ; équipe adverse → defence (gardien inclus) ;
- *  4. ballon libre : receveur désigné d'une passe → « receive » ; par équipe, le joueur au plus petit temps
- *     d'interception du ballon → « chase » / « intercept » (jusqu'à 2 par équipe si le ballon est disputé) ;
- *     les autres gardent leur comportement de phase ;
+ *  3. porteur de champ → onBall ; gardien → decideKeeper (relance §8.6 s'il est porteur, sinon placement) ;
+ *     coéquipiers → offBall ; équipe adverse → defence (gardien inclus) ;
+ *  4. ballon libre : receveur désigné d'une passe → « receive » (l'équipe du passeur n'a alors pas d'autre coureur) ;
+ *     sortie du gardien (decideKeeper, ballon libre dans sa surface et gardien premier dessus) = chasseur de son équipe ;
+ *     sinon, par équipe, le joueur au plus petit temps d'interception du ballon → « chase » / « intercept » (jusqu'à 2 par
+ *     équipe si le ballon est disputé) ; le frappeur sous immunité (physics.kickerImmunity) ne court pas après sa passe ;
+ *     les autres gardent leur comportement de phase ; les points de rencontre sont stables (conservés à < 3 m) ;
  *  5. gel de remise en jeu : tous les joueurs rejoignent leur poste (« hold_shape »), le remetteur conserve le ballon.
+ * Écritures dans l'état : `state.fields` (champs) et `state.slotBallRef` (référence de ballon lissée des postes, §7.2).
  * Retourne une décision pour CHAQUE joueur.
  */
 import type { Decision, MatchState, Player, SimParams, TeamId } from '../core/types';
 import { attackDir, otherTeam, TEAMS } from '../core/types';
 import type { Rng } from '../core/rng';
 import { computeFields } from '../models/fields';
-import { slotPosition } from '../engine/match';
 import { fmtFr, fmtPoint } from './explain';
 import { decideDefence } from './defence';
 import { decideKeeper } from './keeper';
-import { rankChasers, receiveTarget, simpleHoldDecision, simpleMoveDecision } from './loose';
+import { rankChasers, receiveTarget, simpleHoldDecision, simpleMoveDecision, stableMeetingPoint, teamSlot, updateSlotBallRef } from './loose';
 import { decideOffBall } from './offball';
 import { decideOnBall } from './onball';
 import type { DecisionInput, PolicySet } from './policy';
@@ -41,12 +44,13 @@ const inputFor = (state: MatchState, params: SimParams, rng: Rng, team: TeamId):
 
 /** Décision de repli au poste pendant un gel de remise en jeu. */
 function freezeDecision(input: DecisionInput, p: Player): Decision {
-  const target = slotPosition(input.state, p);
+  const target = teamSlot(input.state, p);
   return simpleMoveDecision(input, p, target, 'hold_shape', p.maxSpeed * FREEZE_SPEED, `Remise en jeu : retour au poste ${fmtPoint(target)} pendant le gel.`);
 }
 
 export function decideAll(state: MatchState, params: SimParams, policies: Record<TeamId, PolicySet>, previous: Map<number, Decision>, rng: Rng): Map<number, Decision> {
   state.fields = computeFields(state, params);
+  updateSlotBallRef(state, params);
   const out = new Map<number, Decision>();
   const inputs: Record<TeamId, DecisionInput> = { A: inputFor(state, params, rng, 'A'), B: inputFor(state, params, rng, 'B') };
   const ball = state.ball;
@@ -70,9 +74,10 @@ export function decideAll(state: MatchState, params: SimParams, policies: Record
   const att = inputs[attacking];
   for (const p of state.players) {
     if (p.team !== attacking) continue;
-    if (owner && p.id === owner.id) out.set(p.id, policies[attacking].onBall(att, p.id, previous.get(p.id) ?? null));
-    else if (p.role === 'GK') out.set(p.id, decideKeeper(att, p.id, previous.get(p.id) ?? null));
-    else out.set(p.id, policies[attacking].offBall(att, p.id, previous.get(p.id) ?? null));
+    const prev = previous.get(p.id) ?? null;
+    if (p.role === 'GK') out.set(p.id, decideKeeper(att, p.id, prev)); // relance §8.6 s'il est porteur, sinon placement
+    else if (owner && p.id === owner.id) out.set(p.id, policies[attacking].onBall(att, p.id, prev));
+    else out.set(p.id, policies[attacking].offBall(att, p.id, prev));
   }
 
   // --- Équipe défendante (gardien inclus par decideDefence ; sinon ajouté) ---
@@ -84,34 +89,50 @@ export function decideAll(state: MatchState, params: SimParams, policies: Record
     out.set(p.id, p.role === 'GK' ? decideKeeper(def, p.id, previous.get(p.id) ?? null) : freezeDecision(def, p));
   }
 
-  // --- Ballon libre : receveur, chasseurs ---
+  // --- Ballon libre : receveur, sortie du gardien, chasseurs ---
   if (!owner) {
     const flight = ball.flight;
     const isPass = !!flight && (flight.kind === 'pass' || flight.kind === 'through' || flight.kind === 'lob');
+    const kicker = flight ? state.players.find((p) => p.id === flight.kickerId) ?? null : null;
+    const kickerTeam: TeamId | null = kicker ? kicker.team : null;
     let receiverId: number | null = null;
     if (isPass && flight!.targetId !== null) {
       const r = state.players.find((p) => p.id === flight!.targetId);
       if (r) {
         receiverId = r.id;
-        const target = receiveTarget(state, params, r);
+        const target = stableMeetingPoint(previous.get(r.id), 'receive', receiveTarget(state, params, r));
         out.set(r.id, simpleMoveDecision(inputs[r.team], r, target, 'receive', r.maxSpeed, `Passe en cours vers ${r.name} : course au point de rencontre ${fmtPoint(target)}.`));
       }
     }
-    const ranked: Record<TeamId, ReturnType<typeof rankChasers>> = { A: rankChasers(state, params, 'A'), B: rankChasers(state, params, 'B') };
+    // Sortie du gardien (decideKeeper : ballon libre dans sa surface, gardien premier dessus) : chasseur de son équipe.
+    const chasers = new Set<number>();
+    const keeperChasing: Record<TeamId, boolean> = { A: false, B: false };
+    for (const p of state.players) {
+      if (p.role !== 'GK') continue;
+      const a = out.get(p.id)?.chosen.action;
+      if (a?.type === 'move' && a.intent === 'chase') { chasers.add(p.id); keeperChasing[p.team] = true; }
+    }
+    // Classement des joueurs de champ ; le frappeur d'une passe encore sous immunité ne court pas après son propre ballon.
+    const immune = isPass && kicker && state.time - flight!.startTime < params.physics.kickerImmunity ? kicker.id : -1;
+    const ranked: Record<TeamId, ReturnType<typeof rankChasers>> = {
+      A: rankChasers(state, params, 'A').filter((c) => c.id !== immune),
+      B: rankChasers(state, params, 'B').filter((c) => c.id !== immune),
+    };
     const bestA = ranked.A[0]?.time ?? Infinity, bestB = ranked.B[0]?.time ?? Infinity;
     const contested = Math.abs(bestA - bestB) < CONTESTED_MARGIN;
-    const chasers = new Set<number>();
     for (const team of TEAMS) {
-      const n = contested ? 2 : 1;
-      const kickerTeam = flight ? state.players.find((p) => p.id === flight.kickerId)?.team ?? null : null;
+      // Passe avec receveur désigné : le receveur est le coureur de l'équipe du passeur, pas de second chasseur.
+      if (receiverId !== null && kickerTeam === team) continue;
+      const n = (contested ? 2 : 1) - (keeperChasing[team] ? 1 : 0);
       const intercepting = isPass && kickerTeam !== null && kickerTeam !== team;
-      for (const c of ranked[team].slice(0, n)) {
+      for (const c of ranked[team].slice(0, Math.max(0, n))) {
         if (c.id === receiverId) continue;
         const p = state.players.find((q) => q.id === c.id)!;
         const intent = intercepting ? 'intercept' : 'chase';
         const other = team === 'A' ? bestB : bestA;
         const reason = `${intent === 'intercept' ? 'Interception' : 'Course au ballon libre'} : ${p.name} rejoint le ballon en ${fmtFr(c.time, 1)} s (adversaire le plus rapide : ${Number.isFinite(other) ? fmtFr(other, 1) + ' s' : 'aucun'})${contested ? ', ballon disputé' : ''}.`;
-        out.set(p.id, simpleMoveDecision(inputs[team], p, c.point, intent, p.maxSpeed, reason));
+        const target = stableMeetingPoint(previous.get(p.id), intent, c.point);
+        out.set(p.id, simpleMoveDecision(inputs[team], p, target, intent, p.maxSpeed, reason));
         chasers.add(p.id);
       }
     }

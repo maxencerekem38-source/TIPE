@@ -18,6 +18,7 @@ import type {
 import { timeToArrive } from '../models/motion';
 import { controlFor, pressureOn } from '../models/fields';
 import { localSuperiority } from '../models/structure';
+import { slotPosition } from '../engine/match';
 import { fmtFr, fmtPoint, INTENT_LABELS } from './explain';
 import type { DecisionInput } from './policy';
 
@@ -34,6 +35,12 @@ const BALL_SAMPLES = 8;
 const PRESSURE_SCALE = 0.5;
 /** Rayon (m) dans lequel un coéquipier compte comme « disponible » (contexte). */
 const AVAILABLE_RADIUS = 30;
+/** Itérations de bissection pour affiner l'instant de rencontre avec le ballon (précision ≈ stop.time / (8·2⁶)). */
+const BISECTION_STEPS = 6;
+/** Vitesse par défaut (m/s) de la référence de ballon des postes (offBall.slotFollowRate absent). */
+const DEFAULT_SLOT_FOLLOW_RATE = 6;
+/** Point de rencontre (course au ballon, réception) conservé d'un cycle à l'autre s'il bouge de moins de cette distance (m). */
+export const MEETING_KEEP_RADIUS = 3;
 
 // ---------------------------------------------------------------------------
 // Ballon libre
@@ -61,24 +68,36 @@ export function ballPositionAt(ball: Ball, t: number, physics: PhysicsParams): V
 }
 
 /**
- * Temps d'interception d'un ballon libre par un joueur : min_s max(T_j(b(t_s)), t_s) sur des échantillons
- * temporels de la trajectoire (le joueur doit être au point quand le ballon y passe, ou l'attendre au point
- * d'arrêt). Retourne aussi le point de rencontre.
+ * Temps d'interception d'un ballon libre par un joueur : premier instant t où il peut être sur la trajectoire
+ * avant ou quand le ballon y passe (T_j(b(t)) ≤ t), sinon attente du ballon à son point d'arrêt
+ * (max(T_j(point d'arrêt), t_arrêt), toujours faisable). La trajectoire est échantillonnée, puis l'instant de
+ * rencontre est affiné par bissection entre le dernier échantillon infaisable et le premier faisable
+ * (g(t) = T_j(b(t)) − t est continue). Un point que le ballon a déjà dépassé n'est jamais un point de rencontre.
+ * Retourne aussi le point de rencontre.
  */
 export function timeToBall(player: Player, ball: Ball, params: SimParams): { time: number; point: Vec2 } {
   const stop = ballStopPoint(ball, params.physics);
   const m = params.models;
-  if (stop.time <= 0) {
-    return { time: timeToArrive(player.pos, player.vel, stop.point, player.maxSpeed, player.maxAccel, m), point: stop.point };
-  }
-  let best = Infinity;
+  const arrive = (q: Vec2): number => timeToArrive(player.pos, player.vel, q, player.maxSpeed, player.maxAccel, m);
+  if (stop.time <= 0) return { time: arrive(stop.point), point: stop.point };
+  // Point d'arrêt : on peut toujours l'attendre (repli).
+  let best = Math.max(arrive(stop.point), stop.time);
   let bestPoint = stop.point;
-  for (let s = 0; s <= BALL_SAMPLES; s++) {
+  let lo = 0; // dernier instant échantillonné infaisable (T > t) — à t = 0 le ballon est en mouvement, donc infaisable.
+  for (let s = 1; s < BALL_SAMPLES; s++) {
     const ts = (stop.time * s) / BALL_SAMPLES;
-    const p = s === BALL_SAMPLES ? stop.point : ballPositionAt(ball, ts, params.physics);
-    const T = timeToArrive(player.pos, player.vel, p, player.maxSpeed, player.maxAccel, m);
-    const val = Math.max(T, ts);
-    if (val < best) { best = val; bestPoint = p; }
+    const p = ballPositionAt(ball, ts, params.physics);
+    if (arrive(p) <= ts) {
+      let hi = ts, hiP = p;
+      for (let k = 0; k < BISECTION_STEPS; k++) {
+        const mid = 0.5 * (lo + hi);
+        const q = ballPositionAt(ball, mid, params.physics);
+        if (arrive(q) <= mid) { hi = mid; hiP = q; } else lo = mid;
+      }
+      if (hi < best) { best = hi; bestPoint = hiP; }
+      break;
+    }
+    lo = ts;
   }
   return { time: best, point: bestPoint };
 }
@@ -107,6 +126,47 @@ export function receiveTarget(state: MatchState, params: SimParams, receiver: Pl
   if (flight.kind === 'lob' || flight.kind === 'clearance') return clampToPitch(flight.targetPoint, 0.5);
   return meet.point;
 }
+
+/**
+ * Point de rencontre stable : si la décision précédente avait la même intention (course au ballon, réception) et une
+ * cible à moins de MEETING_KEEP_RADIUS m du nouveau point, l'ancienne cible est conservée (pas de cible qui « tremble »
+ * d'un cycle à l'autre le long de la trajectoire).
+ */
+export function stableMeetingPoint(previous: Decision | null | undefined, intent: MoveIntent, point: Vec2): Vec2 {
+  const a = previous?.chosen.action;
+  if (a && a.type === 'move' && a.intent === intent && dist(a.target, point) < MEETING_KEEP_RADIUS) return a.target;
+  return point;
+}
+
+// ---------------------------------------------------------------------------
+// Postes instanciés lissés (§7.2, lissage) : référence de ballon filtrée par le coordonnateur
+// ---------------------------------------------------------------------------
+/**
+ * Met à jour la référence de ballon des postes (`state.slotBallRef`) : elle suit le ballon à `offBall.slotFollowRate`
+ * m/s au plus (bloc qui coulisse à vitesse finie), et se recale instantanément sur le ballon à la première
+ * décision, pendant un gel de remise en jeu ou si le temps recule (nouvel état).
+ */
+export function updateSlotBallRef(state: MatchState, params: SimParams): void {
+  const rate = params.offBall.slotFollowRate ?? DEFAULT_SLOT_FOLLOW_RATE;
+  const ball = state.ball.pos;
+  const ref = state.slotBallRef;
+  const frozen = !!state.restart && state.time < state.restart.resumeAt - 1e-9;
+  if (!ref || rate <= 0 || frozen || state.time < ref.time) {
+    state.slotBallRef = { time: state.time, pos: { x: ball.x, y: ball.y } };
+    return;
+  }
+  const maxStep = rate * (state.time - ref.time);
+  const dx = ball.x - ref.pos.x, dy = ball.y - ref.pos.y;
+  const d = Math.sqrt(dx * dx + dy * dy);
+  if (d <= maxStep) { ref.pos.x = ball.x; ref.pos.y = ball.y; } else { ref.pos.x += (dx / d) * maxStep; ref.pos.y += (dy / d) * maxStep; }
+  ref.time = state.time;
+}
+
+/** Référence de ballon des postes instanciés : ballon filtré si le coordonnateur l'a posée, sinon ballon courant. */
+export const slotBallRef = (state: MatchState): Vec2 => state.slotBallRef?.pos ?? state.ball.pos;
+
+/** Poste instancié d'un joueur calculé sur la référence de ballon lissée (offball, défense, coordonnateur). */
+export const teamSlot = (state: MatchState, player: Player): Vec2 => slotPosition(state, player, slotBallRef(state));
 
 // ---------------------------------------------------------------------------
 // Fabrique de composantes, candidats, contexte et décisions

@@ -9,9 +9,12 @@ import { buildState, buildFullState, type PlayerSpec } from '@/core/state-builde
 import { PITCH, goalAngle } from '@/core/pitch';
 import type { MatchState, SimParams, TeamId } from '@/core/types';
 import type { Vec2 } from '@/core/vec2';
-import { timeToArrive, runTime, launchSpeed, ballTravelTime, ballDistanceAt, ballSpeedAt } from '@/models/motion';
+import { timeToArrive, runTime, runTimeFrom, dribbleTime, launchSpeed, ballTravelTime, ballDistanceAt, ballSpeedAt, lobFlight, lobHeightAt, GRAVITY } from '@/models/motion';
+import { executeAction } from '@/engine/actions';
+import { stepPhysics } from '@/engine/physics';
+import { Rng } from '@/core/rng';
 import { computeFields, pitchControlAt, pressureAt, threatAt, geometricXG, availableSpace } from '@/models/fields';
-import { analyseInterception, passingLaneQuality, arrivalLogistic, lineBreaks, laneAngularMargin } from '@/models/interception';
+import { analyseInterception, flightModel, passingLaneQuality, arrivalLogistic, lineBreaks, laneAngularMargin } from '@/models/interception';
 import { passProbability, throughBallProbability, dribbleProbability, shotProbability, holdProbability, keeperCoverage } from '@/models/probability';
 import { localSuperiority, compactness, offsideLine, isOffsidePosition, voronoiArea, convexHull, polygonArea } from '@/models/structure';
 
@@ -104,6 +107,38 @@ describe('motion — modèle cinématique (§3.2, §4.1)', () => {
       const s = launchSpeed(d, sArr, PH);
       expect(ballDistanceAt(s, ballTravelTime(d, s, PH), PH)).toBeCloseTo(d, 6);
     }
+  });
+
+  it('runTimeFrom : v0 = 0 ⇔ runTime, décroissant en v0, continu en d_acc ; dribbleTime plafonné à v_drib et sans réaction', () => {
+    for (const d of [1, 3, 6.4, 10, 30]) expect(runTimeFrom(d, 0, 8, 5)).toBeCloseTo(runTime(d, 8, 5), 12);
+    let prev = Infinity;
+    for (const v0 of [0, 2, 4, 6, 8]) { const t = runTimeFrom(10, v0, 8, 5); expect(t).toBeLessThan(prev); prev = t; }
+    expect(runTimeFrom(10, 8, 8, 5)).toBeCloseTo(10 / 8, 12); // déjà à vitesse max : vitesse constante
+    expect(runTimeFrom(10, 12, 8, 5)).toBeCloseTo(10 / 8, 12); // v0 borné à v_max
+    const dAcc = (64 - 16) / (2 * 5);
+    expect(runTimeFrom(dAcc + 1e-9, 4, 8, 5)).toBeCloseTo(runTimeFrom(dAcc - 1e-9, 4, 8, 5), 6);
+    // dribble : 4 m départ arrêté à v_drib = 6 m/s, a = 5 (d_acc = 3,6 m) ⇒ 1,27 s (et non d/v_drib = 0,67 s)
+    const t4 = dribbleTime(v(0, 0), v(0, 0), v(4, 0), 8, 5, PH);
+    expect(t4).toBeCloseTo(runTimeFrom(4, 0, 6, 5), 9);
+    expect(t4).toBeCloseTo(6 / 5 + (4 - 3.6) / 6, 6);
+    expect(t4).toBeGreaterThan(4 / 6);
+    // lancé à 6 m/s dans la direction du dribble : d/v_drib exactement ; vers l'arrière : comme à l'arrêt
+    expect(dribbleTime(v(0, 0), v(6, 0), v(4, 0), 8, 5, PH)).toBeCloseTo(4 / 6, 6);
+    expect(dribbleTime(v(0, 0), v(-6, 0), v(4, 0), 8, 5, PH)).toBeCloseTo(t4, 6);
+    expect(dribbleTime(v(3, 2), v(0, 0), v(3, 2), 8, 5, PH)).toBe(0);
+  });
+
+  it('lobFlight : portée exacte sous la pesanteur, apogée g T²/8, hauteur nulle aux extrémités', () => {
+    for (const d of [10, 25, 40, 60]) {
+      const lf = lobFlight(d, PH);
+      expect(lf.horizontalSpeed * lf.travelTime).toBeCloseTo(d, 9);
+      expect(lf.vz * lf.travelTime - 0.5 * GRAVITY * lf.travelTime * lf.travelTime).toBeCloseTo(0, 9); // retombe à z = 0 en T
+      expect(lf.apex).toBeCloseTo((GRAVITY * lf.travelTime * lf.travelTime) / 8, 9);
+      expect(lobHeightAt(lf.apex, 0)).toBe(0);
+      expect(lobHeightAt(lf.apex, 1)).toBe(0);
+      expect(lobHeightAt(lf.apex, 0.5)).toBeCloseTo(lf.apex, 9);
+    }
+    expect(lobFlight(25, PH).travelTime).toBeGreaterThan(lobFlight(10, PH).travelTime);
   });
 
   it('ballTravelTime = Infinity au-delà de la portée, distance bornée à la portée, vitesse bornée à s₀ᵐᵃˣ', () => {
@@ -201,6 +236,22 @@ describe('fields — contrôle du terrain (§4.2)', () => {
     expect(availableSpace(f, 1, v(0, 0), 8)).toBe(0);
   });
 
+  it('arrivalTime n’est alloué que sur demande ; les tampons réutilisés donnent les mêmes champs (états différents à la suite)', () => {
+    const a = buildFullState({ ballPos: v(0, 0), ownerId: 9 });
+    const b = simple([{ team: 'A', pos: v(-30, 10) }, { team: 'B', pos: v(20, -5) }, { team: 'B', pos: v(0, 0) }], null);
+    const fa1 = computeFields(a, P);
+    expect(fa1.arrivalTime).toBeUndefined();
+    computeFields(b, P); // état plus petit entre deux calculs : les tampons ne doivent rien laisser fuir
+    const fa2 = computeFields(a, P);
+    expect(Array.from(fa2.controlA.data)).toEqual(Array.from(fa1.controlA.data));
+    expect(fa2.exposureA).toBe(fa1.exposureA);
+    const withT = computeFields(a, P, true);
+    expect(withT.arrivalTime).toHaveLength(a.players.length);
+    const p = a.players[3];
+    const q = v(withT.controlA.xOf(10), withT.controlA.yOf(7));
+    expect(withT.arrivalTime![3].get(10, 7)).toBeCloseTo(timeToArrive(p.pos, p.vel, q, p.maxSpeed, p.maxAccel, M), 4);
+  });
+
   it('budget de performance : computeFields < 8 ms (22 joueurs, grille 2 m)', () => {
     const st = buildFullState({ ballPos: v(0, 0), ownerId: 9 });
     for (let i = 0; i < 5; i++) computeFields(st, P);
@@ -219,6 +270,33 @@ describe('fields — menace et xG géométrique (§4.3)', () => {
     expect(Math.abs(geometricXG(v(52.5 - 18, 0), 'A', P) - 0.10)).toBeLessThan(0.03);
     expect(Math.abs(geometricXG(v(52.5 - 30, 0), 'A', P) - 0.03)).toBeLessThan(0.015);
     expect(geometricXG(v(-10, 0), 'A', P)).toBeLessThan(0.005);
+  });
+
+  it('derrière la ligne de but, xG et menace valent ceux du point de la ligne (pas de menace hors du terrain)', () => {
+    // sans garde, l'angle de tir reste grand derrière le but : threatA(60, 0) ≈ 0,62 et le nœud x = 53,5 ≈ 1
+    const onLine = threatAt(v(PITCH.halfLength, 0), 'A', P);
+    expect(threatAt(v(60, 0), 'A', P)).toBeCloseTo(onLine, 12);
+    expect(threatAt(v(53.5, 0), 'A', P)).toBeCloseTo(onLine, 12);
+    expect(geometricXG(v(53.5, 0), 'A', P)).toBeCloseTo(geometricXG(v(PITCH.halfLength, 0), 'A', P), 12);
+    expect(threatAt(v(0, 40), 'A', P)).toBeCloseTo(threatAt(v(0, PITCH.halfWidth), 'A', P), 12);
+    // le nœud hors terrain (x = 53,5 m) ne dépasse jamais la valeur sur la ligne de but
+    const f = computeFields(buildFullState({ ballPos: v(0, 0), ownerId: 9 }), P);
+    const last = f.threatA.cols - 1;
+    expect(f.threatA.xOf(last)).toBeGreaterThan(PITCH.halfLength);
+    for (let j = 0; j < f.threatA.rows; j++) expect(f.threatA.get(last, j)).toBeLessThanOrEqual(onLine + 1e-6);
+  });
+
+  it('exposition : A et B sont exactement miroir (les nœuds hors du terrain sont exclus de la somme)', () => {
+    const st = buildFullState({ ballPos: v(0, 0), ownerId: 9 });
+    const f = computeFields(st, P);
+    const fm = computeFields(mirrorState(st), P);
+    // la grille elle-même n'est pas miroir (nœuds −52,5 … 51,5 | 53,5 avec Δ = 2 m) : tolérance 1 % (2 % avant l'exclusion)
+    expect(Math.abs(f.exposureA! - fm.exposureB!)).toBeLessThan(0.01 * f.exposureA!);
+    expect(Math.abs(f.exposureB! - fm.exposureA!)).toBeLessThan(0.01 * f.exposureB!);
+    // état symétrique (positions miroir, équipes échangées) ⇒ exposition égale des deux côtés
+    const sym = simple([{ team: 'A', pos: v(-20, 5) }, { team: 'A', pos: v(-5, -10) }, { team: 'B', pos: v(20, -5) }, { team: 'B', pos: v(5, 10) }], null);
+    const fs = computeFields(sym, P);
+    expect(Math.abs(fs.exposureA! - fs.exposureB!)).toBeLessThan(0.01 * fs.exposureA!);
   });
 
   it('xG géométrique décroît avec la distance et croît avec l’angle', () => {
@@ -324,22 +402,91 @@ describe('interception (§4.6)', () => {
     expect(fast).toBeLessThan(slow);
   });
 
-  it('lob : interceptable seulement dans les 20 % initiaux/finaux ; tir : ligne droite rapide', () => {
-    const mid = simple([{ team: 'A', pos: from }, { team: 'A', pos: v(40, 0) }, { team: 'B', pos: v(20, 1) }]);
-    const lobMid = analyseInterception(mid, from, v(40, 0), 'lob', 'A', P);
-    const passMid = analyseInterception(mid, from, v(40, 0), 'pass', 'A', P);
-    // le défenseur au milieu ne peut jouer que la zone de chute : P_int faible mais non nulle (course vers 32–40 m)
-    expect(lobMid.pIntercept).toBeLessThan(0.15);
+  it('lob : vol du moteur (45°), interceptable seulement sous la hauteur de contrôle et à l’atterrissage ; tir : ligne droite rapide', () => {
+    const target = v(40, 0);
+    const lf = lobFlight(40, PH);
+    const model = flightModel('lob', 40, P);
+    expect(model.travelTime).toBeCloseTo(lf.travelTime, 12);
+    expect(model.initialSpeed).toBeCloseTo(lf.initialSpeed, 12);
+    expect(model.heightAt(0.5)).toBeCloseTo(lf.apex, 12);
+    const mid = simple([{ team: 'A', pos: from }, { team: 'A', pos: target }, { team: 'B', pos: v(20, 1) }]);
+    const lobMid = analyseInterception(mid, from, target, 'lob', 'A', P);
+    const passMid = analyseInterception(mid, from, target, 'pass', 'A', P);
+    expect(lobMid.travelTime).toBeCloseTo(lf.travelTime, 12);
+    // le défenseur au milieu ne peut jouer que la zone de chute : P_int faible mais non nulle (course vers 40 m)
+    expect(lobMid.pIntercept).toBeLessThan(0.2);
     expect(passMid.pIntercept).toBeGreaterThan(0.5);
-    expect(lobMid.pIntercept).toBeLessThan(0.25 * passMid.pIntercept);
-    for (const s of lobMid.samples) if (s.point.x > 8.01 && s.point.x < 31.99) expect(s.phi).toBe(0);
-    // un défenseur dans la zone de chute (20 % finaux) intercepte le lob
-    const landing = simple([{ team: 'A', pos: from }, { team: 'A', pos: v(40, 0) }, { team: 'B', pos: v(37, 1) }]);
-    expect(analyseInterception(landing, from, v(40, 0), 'lob', 'A', P).pIntercept).toBeGreaterThan(0.5);
-    const shot = analyseInterception(mid, from, v(40, 0), 'shot', 'A', P);
+    expect(lobMid.pIntercept).toBeLessThan(0.3 * passMid.pIntercept);
+    // en vol au-dessus de physics.controlMaxHeight : aucune chance (même condition que la prise de balle du moteur)
+    for (let i = 0; i < lobMid.samples.length; i++) {
+      const f = (i + 1) / lobMid.samples.length;
+      if (f < 1 && lobHeightAt(lf.apex, f) >= PH.controlMaxHeight) expect(lobMid.samples[i].phi).toBe(0);
+    }
+    expect(lobMid.samples[lobMid.samples.length - 1].phi).toBeGreaterThan(0);
+    // un défenseur dans la zone de chute dispute le ballon retombé : P_int = η_land · Φ_land
+    const landing = simple([{ team: 'A', pos: from }, { team: 'A', pos: target }, { team: 'B', pos: v(37, 1) }]);
+    const pl = analyseInterception(landing, from, target, 'lob', 'A', P).pIntercept;
+    expect(pl).toBeGreaterThan(0.5);
+    expect(pl).toBeLessThanOrEqual(M.interceptLandingEfficiency! + 1e-9);
+    // la fenêtre d'atterrissage : un défenseur qui arrive juste après le ballon garde une chance
+    const p0 = cloneParams(P); p0.models.interceptLandingWindow = 0;
+    const p1 = cloneParams(P); p1.models.interceptLandingWindow = 1;
+    const late = simple([{ team: 'A', pos: from }, { team: 'A', pos: target }, { team: 'B', pos: v(24, 0) }]);
+    expect(analyseInterception(late, from, target, 'lob', 'A', p1).pIntercept).toBeGreaterThan(analyseInterception(late, from, target, 'lob', 'A', p0).pIntercept);
+    // un lob court vole bas : le début et la fin du vol sont interceptables (hauteur < 1,6 m)
+    const short = flightModel('lob', 8, P);
+    expect(short.heightAt(1 / 12)).toBeLessThan(PH.controlMaxHeight);
+    const shot = analyseInterception(mid, from, target, 'shot', 'A', P);
     expect(shot.initialSpeed).toBe(PH.shotSpeed);
     expect(shot.travelTime).toBeCloseTo(40 / PH.shotSpeed, 9);
-    expect(shot.pIntercept).toBeLessThan(analyseInterception(mid, from, v(40, 0), 'pass', 'A', P).pIntercept);
+    expect(shot.pIntercept).toBeLessThan(analyseInterception(mid, from, target, 'pass', 'A', P).pIntercept);
+  });
+
+  it('lob : la durée prévue par le modèle est celle du ballon du moteur (executeAction sans bruit, retour à z = 0)', () => {
+    for (const d of [15, 25, 40]) {
+      const params = cloneParams(P);
+      params.physics.speedNoise = 0;
+      params.physics.executionNoiseDeg = 0;
+      params.physics.executionNoisePressure = 0;
+      const st = simple([{ team: 'A', pos: v(-20, 0) }, { team: 'A', pos: v(-20 + d, 0) }, { team: 'B', pos: v(40, 30) }]);
+      st.players[0].lastKickTime = -10;
+      const origin = { ...st.ball.pos };
+      const ok = executeAction(st, 0, { type: 'pass', targetId: 1, targetPoint: v(origin.x + d, origin.y), kind: 'lob', speed: 6 }, params, new Rng(1));
+      expect(ok).toBe(true);
+      const dt = params.physics.dt;
+      let t = 0, landed = -1;
+      // vol seul (le receveur est écarté pour ne pas prendre le ballon) : on cherche le premier retour au sol
+      st.players[1].pos = v(0, 30);
+      while (t < 6 && landed < 0) {
+        stepPhysics(st, params, new Rng(2), dt);
+        t += dt;
+        if (st.ball.z <= 0 && t > 2 * dt) landed = t;
+      }
+      const predicted = flightModel('lob', d, params).travelTime;
+      expect(landed).toBeGreaterThan(0);
+      expect(Math.abs(landed - predicted)).toBeLessThan(2.5 * dt);
+      // point de chute au tick près (le ballon avance de hs·dt par tick)
+      expect(Math.abs(Math.hypot(st.ball.pos.x - origin.x, st.ball.pos.y - origin.y) - d)).toBeLessThan(2 * lobFlight(d, params.physics).horizontalSpeed * dt);
+    }
+  });
+
+  it('trajectoire en cours (live) : temps balle mesurés depuis maintenant, points dépassés non interceptables', () => {
+    const to = v(24, 0);
+    const st = simple([{ team: 'A', pos: from }, { team: 'A', pos: to }, { team: 'B', pos: v(12, 1) }]);
+    const fresh = analyseInterception(st, from, to, 'pass', 'A', P);
+    expect(fresh.pIntercept).toBeGreaterThan(0.3); // défenseur à 1 m de la ligne, à mi-course
+    // 1,6 s après la frappe le ballon a dépassé 12 m (T_b(12) ≈ 1,3 s) : le défenseur ne peut plus le couper
+    const live = analyseInterception(st, from, to, 'pass', 'A', P, undefined, { elapsed: 1.6, initialSpeed: fresh.initialSpeed });
+    expect(live.travelTime).toBeCloseTo(fresh.travelTime - 1.6, 9);
+    for (let i = 0; i < live.samples.length; i++) {
+      expect(live.samples[i].ballTime).toBeCloseTo(fresh.samples[i].ballTime - 1.6, 9);
+      if (live.samples[i].ballTime < 0) expect(live.samples[i].phi).toBe(0);
+    }
+    expect(live.samples.some((s) => s.ballTime < 0)).toBe(true);
+    expect(live.pIntercept).toBeLessThan(fresh.pIntercept); // le ballon a déjà passé le défenseur
+    // vitesse réellement imprimée (bruit) : une balle plus rapide arrive plus tôt
+    const fast = analyseInterception(st, from, to, 'pass', 'A', P, undefined, { elapsed: 0, initialSpeed: fresh.initialSpeed * 1.2 });
+    expect(fast.travelTime).toBeLessThan(fresh.travelTime);
   });
 
   it('passingLaneQuality : ≈ 0 pour un défenseur sur la ligne, croissante avec la distance, extrémités', () => {
@@ -425,12 +572,24 @@ describe('probability — passes (§5.1, §5.2)', () => {
 
   it('passe en profondeur : hors-jeu ⇒ 0, receveur devancé ⇒ faible, receveur en avance ⇒ élevée', () => {
     const gk: PlayerSpec = { team: 'B', pos: v(50, 0), role: 'GK', number: 1 };
-    const base: PlayerSpec[] = [{ team: 'A', pos: v(0, 0) }, { team: 'A', pos: v(8, 6) }];
-    // défenseurs : ligne à x = 10 ; receveur (8, 6) en jeu
+    const base: PlayerSpec[] = [{ team: 'A', pos: v(0, 0) }, { team: 'A', pos: v(8, 6), vel: v(6, 1) }];
+    // défenseurs : ligne à x = 10 ; receveur (8, 6) en jeu, lancé vers la cible
     const onside = simple([...base, { team: 'B', pos: v(10, -14) }, { team: 'B', pos: v(10, 20) }, gk]);
     const target = v(22, 8);
     const r1 = throughBallProbability(onside, computeFields(onside, P), 0, 1, target, P);
     expect(r1.p).toBeGreaterThan(0.3);
+    // receveur au rendez-vous : lancé vers la cible il rejoint le ballon (facteur ≈ 1) ; à l'arrêt, 14 m à parcourir
+    // pendant les 2,2 s de trajet du ballon (9 m/s à l'arrivée) : il risque de le manquer (facteur < 0,6) ; un
+    // receveur très loin de la cible le manque sûrement, même sans défenseur
+    expect(r1.features.find((f) => f.key === 'receiverReach')!.value).toBeGreaterThan(0);
+    const still = simple([base[0], { team: 'A', pos: v(8, 6) }, { team: 'B', pos: v(10, -14) }, { team: 'B', pos: v(10, 20) }, gk]);
+    const rs = throughBallProbability(still, computeFields(still, P), 0, 1, target, P);
+    expect(rs.p).toBeLessThan(r1.p);
+    expect(Math.exp(rs.features.find((f) => f.key === 'receiverReach')!.contribution)).toBeLessThan(0.6);
+    const far = simple([base[0], { team: 'A', pos: v(-10, -20) }, { team: 'B', pos: v(10, -14) }, { team: 'B', pos: v(10, 20) }, gk]);
+    expect(throughBallProbability(far, computeFields(far, P), 0, 1, target, P).p).toBeLessThan(0.05);
+    const noSlack = cloneParams(P); noSlack.models.through.reachSlack = 0;
+    expect(throughBallProbability(still, computeFields(still, P), 0, 1, target, noSlack).p).toBeLessThan(rs.p);
     // même situation, receveur au-delà de la ligne (x = 14 > 10 + 0,5) ⇒ hors-jeu
     const offside = simple([base[0], { team: 'A', pos: v(14, 6) }, { team: 'B', pos: v(10, -14) }, { team: 'B', pos: v(10, 20) }, gk]);
     const r2 = throughBallProbability(offside, computeFields(offside, P), 0, 1, target, P);
@@ -502,6 +661,16 @@ describe('probability — dribble et conservation (§5.3, §5.5)', () => {
     expect(rc.features.find((f) => f.key === 'race')!.value).toBeLessThan(0);
     const logit = r4.features.reduce((s, f) => s + f.contribution, 0);
     expect(1 / (1 + Math.exp(-logit))).toBeCloseTo(r4.p, 9);
+    // course : le porteur paie la même cinématique que le défenseur (départ arrêté : 1,26 s pour 4 m, pas 0,67 s).
+    // Porteur à l'arrêt, défenseur à 3 m de la cible : T_j = 0,3 + √(6/5) = 1,40 s ⇒ marge +0,13 s (et non +0,73 s)
+    const raceSt = simple([{ team: 'A', pos: v(0, 0) }, { team: 'B', pos: v(4, 3) }]);
+    const rr = dribbleProbability(raceSt, computeFields(raceSt, P), 0, v(4, 0), P);
+    const margin = Math.atanh(rr.features.find((f) => f.key === 'race')!.value);
+    expect(margin).toBeCloseTo(0.3 + Math.sqrt(6 / 5) - runTimeFrom(4, 0, PH.dribbleSpeedFactor * 8, 5), 6);
+    expect(margin).toBeLessThan(0.3);
+    // porteur déjà lancé vers la cible : marge plus grande, P plus élevée
+    const moving = simple([{ team: 'A', pos: v(0, 0), vel: v(6, 0) }, { team: 'B', pos: v(4, 3) }]);
+    expect(dribbleProbability(moving, computeFields(moving, P), 0, v(4, 0), P).p).toBeGreaterThan(rr.p);
   });
 
   it('conservation : décroissante en la pression et au nombre d’adversaires à 2 m', () => {
@@ -565,6 +734,17 @@ describe('structure (§4.5, §4.7, §3.4)', () => {
     ];
     const stB = buildState({ players: playersB, ball: { pos: v(0, 0), ownerId: 3 } });
     expect(offsideLine(stB, 'B')).toBeCloseTo(-25, 9);
+    // sans défenseur (scénario réduit) : ligne = ligne de but adverse, aucun attaquant n'est hors-jeu
+    const none = buildState({ players: [{ team: 'A', pos: v(0, 0) }, { team: 'A', pos: v(10, 0) }], ball: { pos: v(0, 0), ownerId: 0 } });
+    expect(offsideLine(none, 'A')).toBeCloseTo(PITCH.halfLength, 9);
+    expect(isOffsidePosition(none, v(10, 0), 'A')).toBe(false);
+    expect(isOffsidePosition(none, v(50, 0), 'A')).toBe(false);
+    const noneB = buildState({ players: [{ team: 'B', pos: v(0, 0) }, { team: 'B', pos: v(-10, 0) }], ball: { pos: v(0, 0), ownerId: 0 } });
+    expect(offsideLine(noneB, 'B')).toBeCloseTo(-PITCH.halfLength, 9);
+    expect(isOffsidePosition(noneB, v(-30, 0), 'B')).toBe(false);
+    // un seul défenseur : sa ligne (inchangé)
+    const one = buildState({ players: [{ team: 'A', pos: v(0, 0) }, { team: 'B', pos: v(20, 0) }], ball: { pos: v(0, 0), ownerId: 0 } });
+    expect(offsideLine(one, 'A')).toBeCloseTo(20, 9);
   });
 
   it('position de hors-jeu : jamais dans son camp, tolérance 0,5 m, miroir pour B', () => {

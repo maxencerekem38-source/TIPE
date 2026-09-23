@@ -18,7 +18,8 @@ import { computeFields } from '@/models/fields';
 import { passProbability } from '@/models/probability';
 import { offsideLine } from '@/models/structure';
 import { createMatch, giveBall, slotPosition } from '@/engine/match';
-import { decideOffBall, decideReceive, deepRunPoints, isRestDefender, quickPassProbability } from '@/decision/offball';
+import { decideOffBall, decideReceive, deepRunPoints, isRestDefender, offBallSpeed, quickPassProbability } from '@/decision/offball';
+import { createSimulation } from '@/engine/loop';
 import { decideAll, FULL_POLICY } from '@/decision/coordinator';
 import type { DecisionInput, PolicySet } from '@/decision/policy';
 
@@ -136,14 +137,29 @@ describe('offball — modulation tactique', () => {
     expect(wide - narrow).toBeGreaterThan(2);
   });
 
-  it('tempo : la vitesse de consigne d’un déplacement non-appel vaut v_max·(0,5 + 0,5·tempo)', () => {
+  it('tempo et intention : vitesse = max(minSpeed, v_max·(0,5 + 0,5·tempo)·f(intention, distance)), appels au sprint', () => {
+    const p = matchState(6, 5, v(-20, 0)).players[2];
+    const f = P.offBall.intentSpeed!;
+    // Fractions par intention à courte distance, accélération linéaire de 5 à 20 m, bornes.
+    expect(offBallSpeed(p, 'hold_shape', 3, 0.5, P)).toBeCloseTo(Math.max(P.offBall.minSpeed!, p.maxSpeed * 0.75 * f.hold_shape), 9);
+    expect(offBallSpeed(p, 'support', 3, 0.5, P)).toBeCloseTo(Math.max(P.offBall.minSpeed!, p.maxSpeed * 0.75 * f.support), 9);
+    expect(offBallSpeed(p, 'exploit_space', 20, 0.5, P)).toBeCloseTo(p.maxSpeed * 0.75, 9); // cible lointaine : vitesse de tempo
+    expect(offBallSpeed(p, 'hold_shape', 12.5, 0.5, P)).toBeCloseTo(p.maxSpeed * 0.75 * (f.hold_shape + 0.5 * (1 - f.hold_shape)), 9);
+    expect(offBallSpeed(p, 'run', 3, 0.1, P)).toBeCloseTo(p.maxSpeed, 9);
+    expect(offBallSpeed(p, 'hold_shape', 1, 0, P)).toBeCloseTo(P.offBall.minSpeed!, 9);
+    // Le tempo module la vitesse d'un même déplacement, et la décision applique la formule.
+    let slow = 0, fast = 0;
     for (const tempo of [0.2, 0.9]) {
       const state = matchState(6, 5, v(-20, 0), { A: makeTactic('4-3-3', 'balanced', { tempo }), B: makeTactic('4-4-2', 'balanced') });
       const d = decideOffBall(inputFor(state, 'A'), 2, null); // défenseur central
       expect(intent(d)).not.toBe('run');
-      const p = state.players[2];
-      expect(d.chosen.action.type === 'move' ? d.chosen.action.speed : 0).toBeCloseTo(Math.max(3, p.maxSpeed * (0.5 + 0.5 * tempo)), 6);
+      const a = d.chosen.action as Extract<typeof d.chosen.action, { type: 'move' }>;
+      const q = d.chosen.successPoint!;
+      expect(a.speed).toBeCloseTo(offBallSpeed(state.players[2], a.intent, dist(q, state.players[2].pos), tempo, P), 9);
+      expect(a.speed).toBeLessThanOrEqual(state.players[2].maxSpeed * (0.5 + 0.5 * tempo) + 1e-9);
+      if (tempo < 0.5) slow = a.speed; else fast = a.speed;
     }
+    expect(fast).toBeGreaterThanOrEqual(slow);
   });
 
   it('counterAttackBias : en transition offensive, les candidats vers l’avant ont un poids de valeur recevable renforcé', () => {
@@ -222,22 +238,89 @@ describe('offball — appels, hors-jeu, défenseurs de repos', () => {
 
 // ---------------------------------------------------------------------------
 describe('offball — hystérésis, réception, symétrie, probabilité rapide', () => {
-  it('hystérésis : la cible est conservée au cycle suivant (bonus h_off) puis ré-examinée après reexamineEvery', () => {
+  it('hystérésis : cible engagée jusqu’à committedUntil (héritée de cycle en cycle, bonus h_off), puis ré-examinée sans bonus', () => {
     const state = matchState(11, 6, v(0, 0));
     const input = inputFor(state, 'A');
     // Premier joueur de champ (hors porteur) qui décide de se déplacer.
     const mover = state.players.find((p) => p.team === 'A' && p.role !== 'GK' && p.id !== 6 && intent(decideOffBall(input, p.id, null)) !== 'hold_shape')!;
     expect(mover).toBeDefined();
     const first = decideOffBall(input, mover.id, null);
-    state.time += P.decisionPeriod;
-    const second = decideOffBall(input, mover.id, first);
-    expect(dist(target(second), target(first))).toBeLessThan(1e-6);
-    expect(second.keptByHysteresis).toBe(true);
-    expect(second.chosen.components.find((c) => c.key === 'hysteresis')!.contribution).toBeCloseTo(P.offBall.hysteresis, 9);
-    state.time += P.offBall.reexamineEvery + 1;
-    const third = decideOffBall(input, mover.id, first);
+    expect(first.committedUntil).toBeCloseTo(state.time + P.offBall.reexamineEvery, 9);
+    // Chaînage réaliste : chaque cycle reçoit la décision du cycle précédent (toujours vieille de decisionPeriod).
+    let prev = first;
+    let cycles = 0;
+    while (state.time + P.decisionPeriod < first.committedUntil! - 1e-9) {
+      state.time += P.decisionPeriod;
+      const next = decideOffBall(input, mover.id, prev);
+      expect(dist(target(next), target(first))).toBeLessThan(1e-6);
+      expect(next.keptByHysteresis).toBe(true);
+      expect(next.chosen.components.find((c) => c.key === 'hysteresis')!.contribution).toBeCloseTo(P.offBall.hysteresis, 9);
+      expect(next.committedUntil).toBeCloseTo(first.committedUntil!, 9); // l'échéance est héritée, pas repoussée
+      prev = next;
+      cycles++;
+    }
+    expect(cycles).toBeGreaterThanOrEqual(5);
+    // Échéance atteinte : ré-examen forcé, aucun bonus.
+    state.time = first.committedUntil! + 1e-6;
+    const third = decideOffBall(input, mover.id, prev);
     expect(third.keptByHysteresis).toBeUndefined();
     expect(third.chosen.components.some((c) => c.key === 'hysteresis')).toBe(false);
+    expect(third.committedUntil).toBeCloseTo(state.time + P.offBall.reexamineEvery, 9);
+  });
+
+  it('hystérésis : une cible atteinte devient « tenir sa place » (le candidat sur place porte le bonus, cible = position)', () => {
+    const state = matchState(11, 6, v(0, 0));
+    const input = inputFor(state, 'A');
+    const mover = state.players.find((p) => p.team === 'A' && p.role !== 'GK' && p.id !== 6 && intent(decideOffBall(input, p.id, null)) !== 'hold_shape')!;
+    const first = decideOffBall(input, mover.id, null);
+    // Le joueur est téléporté à 1 m de sa cible, côté ballon (atteinte au sens de §7.2, sans passer hors-jeu), dans la fenêtre d'engagement.
+    const t = target(first);
+    mover.pos = { x: t.x - 1, y: t.y };
+    state.time += P.decisionPeriod;
+    state.fields = null;
+    const next = decideOffBall(inputFor(state, 'A'), mover.id, first);
+    expect(next.keptByHysteresis).toBe(true);
+    expect(intent(next)).toBe('hold_shape');
+    expect(dist(target(next), mover.pos)).toBeLessThan(1e-9);
+    expect(next.chosen.components.find((c) => c.key === 'hysteresis')!.contribution).toBeCloseTo(P.offBall.hysteresis, 9);
+  });
+
+  it('réalisme (5 min de match) : distance < 1,8 km / 10 min et vitesse < 3 m/s par joueur de champ, changements de cible < 0,5 /(joueur·s)', () => {
+    const cfg = { seed: 3, tactics: { A: makeTactic('4-3-3', 'balanced'), B: makeTactic('4-4-2', 'balanced') }, params: P, durationSec: 300 };
+    const sim = createSimulation(cfg, { policies: POLICIES });
+    const distance = new Map<number, number>();
+    const prevPos = new Map<number, Vec2>();
+    const prevTarget = new Map<number, { x: number; y: number; intent: string }>();
+    let speedSum = 0, speedN = 0, changes = 0, offBallCycles = 0;
+    sim.advance(300, {
+      onDecisions: (decisions, state) => {
+        const owner = state.ball.ownerId;
+        const poss = owner !== null ? state.players[owner].team : state.possession;
+        for (const p of state.players) {
+          if (p.role === 'GK') continue;
+          const pp = prevPos.get(p.id);
+          if (pp) distance.set(p.id, (distance.get(p.id) ?? 0) + dist(pp, p.pos));
+          prevPos.set(p.id, { x: p.pos.x, y: p.pos.y });
+          speedSum += Math.hypot(p.vel.x, p.vel.y);
+          speedN++;
+          // Changements de cible hors-ballon (même définition que le harnais : possession, hors porteur, saut > 2 m).
+          const a = decisions.get(p.id)!.chosen.action;
+          if (a.type !== 'move' || p.team !== poss || p.id === owner) { prevTarget.delete(p.id); continue; }
+          const pt = prevTarget.get(p.id);
+          if (pt && (pt.intent !== a.intent || Math.hypot(pt.x - a.target.x, pt.y - a.target.y) > 2)) changes++;
+          if (pt) offBallCycles++;
+          prevTarget.set(p.id, { x: a.target.x, y: a.target.y, intent: a.intent });
+        }
+      },
+    });
+    const kmPer10 = [...distance.values()].map((d) => d / 1000 * (600 / 300));
+    const meanKm = kmPer10.reduce((a, b) => a + b, 0) / kmPer10.length;
+    const meanSpeed = speedSum / speedN;
+    const churn = changes / (offBallCycles * P.decisionPeriod);
+    console.log(`réalisme : ${meanKm.toFixed(2)} km / joueur / 10 min, vitesse moyenne ${meanSpeed.toFixed(2)} m/s, changements de cible ${churn.toFixed(3)} /(joueur·s)`);
+    expect(meanKm).toBeLessThan(1.8);
+    expect(meanSpeed).toBeLessThan(3);
+    expect(churn).toBeLessThan(0.5);
   });
 
   it('receveur d’une passe en cours : intention « receive » vers le point de rencontre', () => {

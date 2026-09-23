@@ -96,7 +96,8 @@ export function offsideLine(state: MatchState, attackingTeam: TeamId): number {
   const xs: number[] = [];
   for (const p of state.players) if (p.team === def) xs.push(dir * p.pos.x);
   xs.sort((a, b) => b - a); // décroissant dans le repère de l'attaquant : xs[0] = dernier défenseur
-  const secondLast = xs.length >= 2 ? xs[1] : xs.length === 1 ? xs[0] : -PITCH.halfLength;
+  // Sans défenseur (scénarios réduits), la ligne est la ligne de but adverse : aucun hors-jeu possible.
+  const secondLast = xs.length >= 2 ? xs[1] : xs.length === 1 ? xs[0] : PITCH.halfLength;
   const ballX = dir * state.ball.pos.x;
   return dir * Math.max(secondLast, ballX);
 }

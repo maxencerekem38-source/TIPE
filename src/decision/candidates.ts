@@ -10,9 +10,9 @@
 import type { Vec2 } from '../core/vec2';
 import { dist, normalize } from '../core/vec2';
 import { PITCH, clampToPitch, distToGoal, isInsidePitch } from '../core/pitch';
-import type { Action, MatchState, Player, SimParams, TeamId } from '../core/types';
+import type { Action, FieldSet, MatchState, Player, SimParams, TeamId } from '../core/types';
 import { attackDir, otherTeam } from '../core/types';
-import { launchSpeed, ballTravelTime } from '../models/motion';
+import { launchSpeed, ballTravelTime, timeToArrive } from '../models/motion';
 import { pressureAt } from '../models/fields';
 import { isOffsidePosition } from '../models/structure';
 import { isAimCovered } from '../models/probability';
@@ -28,6 +28,8 @@ export interface Proposal {
   successPoint: Vec2;
   /** Vitesse d'arrivée souhaitée (m/s, passes au sol). */
   arrivalSpeed?: number;
+  /** Partie logistique du logit de P_pass déjà calculée pour la même cible (variante lobée d'une passe évaluée). */
+  logit?: number;
 }
 
 /** Ordonnées des trois points de visée sur la ligne de but (§3.2). */
@@ -43,6 +45,16 @@ const CLEAR_RANGE = 40;
 const CLEAR_WING_Y = 25;
 /** Vitesse (m/s) en dessous de laquelle un coéquipier est considéré à l'arrêt (direction de course = axe d'attaque). */
 const RUN_SPEED_MIN = 0.5;
+/**
+ * Passes en profondeur vers l'espace (§6.1) : nombre de points de plus grand danger D(q) retenus parmi un motif polaire
+ * centré sur le ballon (distances × angles autour de l'axe d'attaque, portée ≤ 35 m devant le ballon). Le motif est
+ * relatif au ballon (et non aux nœuds de la grille) afin que la génération respecte la symétrie miroir du terrain.
+ */
+const DANGER_TARGETS = 6;
+const DANGER_DISTANCES: readonly number[] = [8, 16, 24, 32];
+const DANGER_ANGLES: readonly number[] = [-60, -30, 0, 30, 60].map((deg) => (deg * Math.PI) / 180);
+/** Deux cibles de profondeur à moins de cette distance (m) sont confondues (dédoublonnage). */
+const TARGET_MERGE = 1.0;
 
 /** Point de départ de l'action : le ballon s'il est au joueur, sinon la position du joueur. */
 export const actionOrigin = (state: MatchState, player: Player): Vec2 => (state.ball.ownerId === player.id ? state.ball.pos : player.pos);
@@ -78,7 +90,7 @@ export function proposePass(state: MatchState, passer: Player, receiver: Player,
 }
 
 /** Variante lobée d'une passe (même cible) : utilisée quand la ligne au sol est fermée et la distance > 25 m. */
-export function proposeLob(pass: Proposal): Proposal {
+export function proposeLob(pass: Proposal, logit?: number): Proposal {
   const a = pass.action as Extract<Action, { type: 'pass' }>;
   return {
     kind: 'lob',
@@ -86,36 +98,70 @@ export function proposeLob(pass: Proposal): Proposal {
     receiverId: pass.receiverId,
     successPoint: pass.successPoint,
     arrivalSpeed: pass.arrivalSpeed,
+    logit: logit ?? pass.logit,
   };
 }
 
 /**
  * Passes en profondeur (§6.1) : pour chaque coéquipier k en jeu (pas hors-jeu), q = p_k + λ·û_k,
- * λ ∈ params.decision.throughDistances, û_k = direction de course de k mélangée 50/50 à l'axe d'attaque ;
- * seuls les points devant le ballon et à l'intérieur du terrain sont retenus.
+ * λ ∈ params.decision.throughDistances, û_k = direction de course de k mélangée 50/50 à l'axe d'attaque
+ * (rabattue sur l'axe d'attaque si le mélange n'est pas dirigé vers l'avant : un receveur qui recule n'appelle pas
+ * de passe « en profondeur » à ses pieds) ; plus, si `fields` est fourni, les DANGER_TARGETS cellules de plus grand
+ * danger D(q) à moins de DANGER_RANGE m devant le ballon (receveur = coéquipier en jeu au plus petit T_i(q)).
+ * Seuls les points devant le ballon et à l'intérieur du terrain sont retenus ; les cibles confondues (< 1 m) sont dédoublonnées.
  */
-export function proposeThroughBalls(state: MatchState, passer: Player, params: SimParams): Proposal[] {
+export function proposeThroughBalls(state: MatchState, passer: Player, params: SimParams, fields?: FieldSet): Proposal[] {
   const team = passer.team;
   const dir = attackDir(team);
   const origin = actionOrigin(state, passer);
   const out: Proposal[] = [];
   const speed = params.physics.throughArrivalSpeed;
+  const receivers: Player[] = [];
   for (const k of state.players) {
     if (k.team !== team || k.id === passer.id || k.role === 'GK') continue;
     if (isOffsidePosition(state, k.pos, team)) continue;
+    receivers.push(k);
+  }
+  const push = (k: Player, q: Vec2): void => {
+    if (!isInsidePitch(q, -PITCH_MARGIN)) return;
+    if (dir * (q.x - origin.x) <= 0) return;
+    for (const o of out) if (o.receiverId === k.id && dist(o.successPoint, q) < TARGET_MERGE) return;
+    out.push({
+      kind: 'through',
+      action: { type: 'pass', targetId: k.id, targetPoint: q, kind: 'through', speed },
+      receiverId: k.id,
+      successPoint: q,
+      arrivalSpeed: speed,
+    });
+  };
+  for (const k of receivers) {
     const run = Math.hypot(k.vel.x, k.vel.y) >= RUN_SPEED_MIN ? normalize(k.vel) : { x: dir, y: 0 };
-    const u = normalize({ x: 0.5 * run.x + 0.5 * dir, y: 0.5 * run.y });
-    for (const lambda of params.decision.throughDistances) {
-      const q = { x: k.pos.x + lambda * u.x, y: k.pos.y + lambda * u.y };
-      if (!isInsidePitch(q, -PITCH_MARGIN)) continue;
-      if (dir * (q.x - origin.x) <= 0) continue;
-      out.push({
-        kind: 'through',
-        action: { type: 'pass', targetId: k.id, targetPoint: q, kind: 'through', speed },
-        receiverId: k.id,
-        successPoint: q,
-        arrivalSpeed: speed,
-      });
+    let u = normalize({ x: 0.5 * run.x + 0.5 * dir, y: 0.5 * run.y });
+    if (dir * u.x <= 1e-6) u = { x: dir, y: 0 };
+    for (const lambda of params.decision.throughDistances) push(k, { x: k.pos.x + lambda * u.x, y: k.pos.y + lambda * u.y });
+  }
+  // Cibles « espace » : points de plus grand danger devant le ballon, servis au coéquipier qui y arrive le premier.
+  const danger = fields ? (team === 'A' ? fields.dangerA : fields.dangerB) : undefined;
+  if (danger && receivers.length > 0) {
+    const best: { value: number; x: number; y: number }[] = [];
+    for (const d of DANGER_DISTANCES) {
+      for (const a of DANGER_ANGLES) {
+        const x = origin.x + dir * d * Math.cos(a), y = origin.y + d * Math.sin(a);
+        if (!isInsidePitch({ x, y }, -PITCH_MARGIN)) continue;
+        const value = danger.sample({ x, y });
+        if (best.length < DANGER_TARGETS) { best.push({ value, x, y }); best.sort((a, b) => b.value - a.value); }
+        else if (value > best[best.length - 1].value) { best[best.length - 1] = { value, x, y }; best.sort((a, b) => b.value - a.value); }
+      }
+    }
+    for (const cell of best) {
+      const q = { x: cell.x, y: cell.y };
+      let receiver: Player | null = null;
+      let tBest = Infinity;
+      for (const k of receivers) {
+        const t = timeToArrive(k.pos, k.vel, q, k.maxSpeed, k.maxAccel, params.models);
+        if (t < tBest) { tBest = t; receiver = k; }
+      }
+      if (receiver) push(receiver, q);
     }
   }
   return out;

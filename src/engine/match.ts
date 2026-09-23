@@ -24,10 +24,28 @@ const KICKOFF_HALF_MARGIN = 2;
 const KICKOFF_SECOND: Vec2 = { x: -1, y: 3 };
 /** Marge (m) à l'intérieur du terrain pour les postes instanciés. */
 const SLOT_MARGIN = 1;
-/** Contraction du bloc vers le ballon en défense : facteur 1 − 0,35·compacité sur l'écart poste − ballon. */
-const COMPACTNESS_GAIN = 0.35;
-/** Un défenseur n'est jamais maintenu plus de 3 m devant le ballon par la ligne défensive. */
+/** Défense (§9.2) : la ligne x_line remonte de 35 % de l'avance du ballon sur elle (α_x du bloc défensif)… */
+const LINE_FOLLOW = 0.35;
+/** … mais reste toujours ≥ 3 m derrière le ballon. */
 const LINE_BALL_MARGIN = 3;
+/** Λ = 45 − 25·compacité (m) : profondeur du bloc défensif (§13.3). */
+const LAMBDA_BASE = 45;
+const LAMBDA_COMPACT = 25;
+/** Contraction latérale du bloc vers le ballon en défense : facteur 1 − 0,5·compacité. */
+const Y_COMPACTNESS_GAIN = 0.5;
+
+/** Étendue en x des postes de champ d'une formation (repère équipe), calculée une fois par formation. */
+const outfieldSpan = new Map<string, { min: number; max: number }>();
+function outfieldXRange(formation: Formation): { min: number; max: number } {
+  let r = outfieldSpan.get(formation.id);
+  if (!r) {
+    let min = Infinity, max = -Infinity;
+    for (const s of formation.slots) if (s.role !== 'GK') { min = Math.min(min, s.x); max = Math.max(max, s.x); }
+    r = { min, max: max > min ? max : min + 1 };
+    outfieldSpan.set(formation.id, r);
+  }
+  return r;
+}
 
 function drawAttributes(rng: Rng, role: Role): PlayerAttributes {
   const draw = (): number => clamp(rng.normal(ATTR_MEAN, ATTR_SD), ATTR_MIN, ATTR_MAX);
@@ -139,6 +157,7 @@ export function setupKickoff(state: MatchState, team: TeamId, config: MatchConfi
     p.beatenUntil = undefined;
     p.lastDribbleStart = undefined;
     p.lastDuelTime = undefined;
+    p.duelContactSince = undefined;
   }
   const [striker] = kickoffTakers(state.players.filter((p) => p.team === team), FORMATIONS[state.tactics[team].formation]);
   const ball = state.ball;
@@ -156,13 +175,17 @@ export function setupKickoff(state: MatchState, team: TeamId, config: MatchConfi
   state.phaseSince[team] = state.time;
   state.phaseSince[otherTeam(team)] = state.time;
   state.restart = { kind: 'kickoff', team, pos: { x: 0, y: 0 }, resumeAt: state.time + config.params.physics.kickoffFreeze };
+  state.lastRestart = { ...state.restart, pos: { x: 0, y: 0 }, playerId: ball.ownerId ?? undefined };
   state.lastKickoff = team;
 }
 
 /**
- * Position de référence (repère terrain) du poste d'un joueur, ajustée au ballon et à la tactique (§9.2) :
- * poste + (followX·Δx, followY·Δy) dans le repère équipe, largeur y·(0,7 + 0,6·widthUsage) ; en phase défensive,
- * contraction du bloc vers le ballon (1 − 0,35·compactness) et ligne défensive comme plancher pour les défenseurs.
+ * Position de référence (repère terrain) du poste d'un joueur, ajustée au ballon et à la tactique (§9.2).
+ * Attaque : poste + (followX·Δx, followY·Δy) dans le repère équipe, largeur y·(0,7 + 0,6·widthUsage).
+ * Défense (et transition défensive) : les postes de champ sont ré-instanciés dans un bloc de profondeur
+ * Λ = 45 − 25·compacité posé sur la ligne x_line = min(x_b − 3, defensiveLine + 0,35·max(0, x_b − defensiveLine)) :
+ * x = x_line + x_norm·Λ (x_norm = rang du poste dans l'étendue x de la formation), y contracté vers le ballon
+ * d'un facteur 1 − 0,5·compacité. La ligne basse (défenseurs, x_norm = 0) est donc tenue à x_line (hors-jeu).
  */
 export function slotPosition(state: MatchState, player: Player, ballPos?: Vec2): Vec2 {
   const team = player.team;
@@ -176,10 +199,12 @@ export function slotPosition(state: MatchState, player: Player, ballPos?: Vec2):
   let y = slot.y * (0.7 + 0.6 * tactic.widthUsage) + slot.followY * b.y;
   const phase = state.phase[team];
   if ((phase === 'defence' || phase === 'transition_defence') && slot.role !== 'GK') {
-    const k = 1 - COMPACTNESS_GAIN * tactic.compactness;
-    x = b.x + (x - b.x) * k;
-    y = b.y + (y - b.y) * k;
-    if (slot.role === 'DF') x = Math.max(x, Math.min(tactic.defensiveLine, b.x - LINE_BALL_MARGIN));
+    const line = Math.min(b.x - LINE_BALL_MARGIN, tactic.defensiveLine + LINE_FOLLOW * Math.max(0, b.x - tactic.defensiveLine));
+    const lambda = LAMBDA_BASE - LAMBDA_COMPACT * tactic.compactness;
+    const range = outfieldXRange(formation);
+    const xNorm = clamp((slot.x - range.min) / (range.max - range.min), 0, 1);
+    x = line + xNorm * lambda;
+    y = b.y + (y - b.y) * (1 - Y_COMPACTNESS_GAIN * tactic.compactness);
   }
   x = clamp(x, -PITCH.halfLength + SLOT_MARGIN, PITCH.halfLength - SLOT_MARGIN);
   y = clamp(y, -PITCH.halfWidth + SLOT_MARGIN, PITCH.halfWidth - SLOT_MARGIN);
@@ -222,6 +247,7 @@ export function cloneState(state: MatchState): MatchState {
     events: state.events.map((e) => ({ ...e, pos: e.pos ? { ...e.pos } : undefined })),
     fields: state.fields,
     lastKickoff: state.lastKickoff,
+    lastRestart: state.lastRestart ? { ...state.lastRestart, pos: { ...state.lastRestart.pos } } : undefined,
   };
 }
 
@@ -244,6 +270,7 @@ export function giveBall(state: MatchState, playerId: number, placeOthers = fals
   ball.ownerId = playerId;
   ball.lastTouchId = playerId;
   ball.flight = null;
+  p.lastControlTime = state.time;
   if (state.possession !== p.team) {
     state.possession = p.team;
     state.possessionSince = state.time;

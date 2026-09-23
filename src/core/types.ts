@@ -142,8 +142,12 @@ export interface Player {
   lastDribbleStart?: number;
   /** (moteur) Défenseur « passé » : immobile et sans nouveau duel jusqu'à cet instant. */
   beatenUntil?: number;
-  /** (moteur) Instant du dernier duel engagé par ce joueur (au plus un duel par `physics.duelCooldown`). */
+  /** (moteur) Instant du dernier duel engagé par ce joueur (au plus un duel par `physics.duelCooldown`), porteur compris. */
   lastDuelTime?: number;
+  /** (moteur) Instant de la dernière prise de balle (délai de grâce `physics.duelCarrierGrace` avant un duel). */
+  lastControlTime?: number;
+  /** (moteur) Défenseur : instant d'entrée dans r_tackle du porteur (duel après `physics.duelContactTime` s de contact). */
+  duelContactSince?: number;
 }
 
 export type BallFlightKind = 'pass' | 'through' | 'lob' | 'shot' | 'clearance' | 'loose';
@@ -166,6 +170,8 @@ export interface BallFlight {
   receiverOffside?: boolean;
   /** (moteur) Probabilité de réussite estimée par la couche décision (calibration §11.6). */
   expectedP?: number;
+  /** (moteur) Ballon aérien déjà retombé une première fois (amortissement à l'atterrissage appliqué). */
+  landed?: boolean;
 }
 
 export interface Ball {
@@ -238,8 +244,10 @@ export interface Candidate {
   components: ScoreComponent[];
   /** Phrase d'explication en français (≤ 140 caractères). */
   reason: string;
-  /** Adversaires susceptibles d'intercepter / contrer (pour la visualisation). */
+  /** Adversaires susceptibles d'intercepter / contrer (pour la visualisation) ; le point faible (W = max φ) en tête. */
   threats?: number[];
+  /** Adversaire réalisant le point faible de la ligne W = max φ (§4.6) — nommé dans l'explication du risque. */
+  weakOpponentId?: number;
   /** Durée estimée de l'action (s). */
   duration?: number;
   /** Point d'arrivée en cas de succès et point de perte en cas d'échec (visualisation). */
@@ -339,7 +347,9 @@ export interface Restart {
 export type MatchEventKind =
   | 'goal' | 'shot' | 'pass' | 'pass_complete' | 'pass_intercepted' | 'pass_failed'
   | 'dribble' | 'dribble_failed' | 'tackle' | 'turnover' | 'out' | 'restart' | 'save' | 'possession_change'
-  | 'offside';
+  | 'offside'
+  // --- Ajouts du moteur (append-only) : tir contré (distinct d'un tacle), dégagement (distinct d'une passe) ---
+  | 'block' | 'clearance';
 
 export interface MatchEvent {
   time: number;
@@ -375,6 +385,13 @@ export interface TeamStats {
   decisionMs: number;
   /** Regret cumulé : Σ (meilleur score − score de l'action réellement exécutée) — 0 pour l'algorithme optimal. */
   regret: number;
+  // --- Compteurs ajoutés par le moteur (append-only, optionnels : absents = 0) ---
+  /** Décisions du porteur (passe, tir, dribble, conservation, dégagement) : dénominateur du regret (§11.1). */
+  onBallDecisions?: number;
+  /** Tirs contrés par un défenseur de champ (ne comptent pas comme des tacles). */
+  blocks?: number;
+  /** Dégagements (ne comptent pas comme des passes). */
+  clearances?: number;
 }
 
 export interface MatchStats {
@@ -402,6 +419,12 @@ export interface MatchState {
   fields: FieldSet | null;
   /** Équipe qui a engagé au dernier coup d'envoi. */
   lastKickoff: TeamId;
+  /** (moteur, append-only) Dernière remise en jeu mise en place, conservée après la reprise (remetteur `playerId`) :
+   * permet à la décision de traiter la première action du remetteur comme une remise (§3.4 : candidats restreints aux passes). */
+  lastRestart?: Restart & { playerId?: number };
+  /** (décision, append-only) Référence de ballon filtrée des postes instanciés (§7.2, lissage) : le coordonnateur la fait
+   * suivre le ballon à `offBall.slotFollowRate` m/s au plus, pour que les postes (et le bloc) ne sautent pas à chaque cycle. */
+  slotBallRef?: { time: number; pos: Vec2 };
 }
 
 // ---------------------------------------------------------------------------
@@ -453,11 +476,22 @@ export interface PhysicsParams {
   blockWindow: number; // fraction initiale du vol pendant laquelle un tir peut être contré
   dribbleWonDelay: number; // s, conservation du ballon nécessaire pour compter un dribble réussi
   defaultShotXG: number; // xG utilisé si ni la décision ni le modèle ne le fournissent
+  // --- Ajouts du moteur (append-only) ---
+  duelClosingSpeed: number; // m/s, vitesse de rapprochement défenseur–porteur minimale pour qu'un duel soit engagé
+  duelCarrierGrace: number; // s, délai après une prise de balle pendant lequel le porteur ne subit pas de duel
+  duelContactTime: number; // s, contact continu (défenseur dans r_tackle) au bout duquel un duel est engagé même sans rapprochement
+  takeOnRadius: number; // m, distance d'un adversaire en deçà de laquelle un dribble est un « dribble » (prise à défaut)
+  lobLandingSpeed: number; // m/s, vitesse horizontale maximale conservée par un ballon aérien à son premier contact au sol
+  lobBounce: number; // restitution verticale au premier contact au sol d'un ballon aérien (amortissement pelouse)
 }
 
 /** Coefficients d'un modèle logistique P = σ(base + Σ coef·feature). */
 export interface PassModel { base: number; distance: number; longDistance: number; passerPressure: number; receiverPressure: number }
-export interface ThroughModel { base: number; distance: number; passerPressure: number }
+export interface ThroughModel {
+  base: number; distance: number; passerPressure: number;
+  /** (modèles, append-only) Marge de temps (s) accordée au receveur pour rejoindre le ballon après son passage au point visé (§5.2), défaut 0,6. */
+  reachSlack?: number;
+}
 export interface DribbleModel { base: number; pathPressure: number; distance: number; control: number; /** coefficient du terme tanh(min_j T_j(q) − d/v_drib) (§5.3), défaut 1,0 */ race?: number }
 export interface ShotModel { base: number; angle: number; distance: number; keeperCoverage: number; blockers: number; pressure: number }
 export interface HoldModel { base: number; pressure: number; closeOpponents: number }
@@ -501,6 +535,10 @@ export interface ModelParams {
   superiorityHorizon?: number;
   /** R_s : rayon de l'espace disponible (m), défaut 8 (§4.5). */
   spaceRadius?: number;
+  /** η_land : efficacité de la chance d'interception à l'atterrissage d'un ballon aérien (§4.6), défaut 0,6. */
+  interceptLandingEfficiency?: number;
+  /** t_land : fenêtre (s) après l'atterrissage pendant laquelle le ballon retombé reste disputable près du point de chute, défaut 0,3. */
+  interceptLandingWindow?: number;
 }
 
 /** Poids de la fonction d'évaluation du porteur (modulés ensuite par les paramètres tactiques). */
@@ -524,6 +562,13 @@ export interface DecisionWeights {
   epsilonGame: number; // seuil de déclenchement du jeu 2×2
   holdDuration: number; // s, durée d'une conservation
   passArrivalSpeeds: number[]; // m/s, vitesses d'arrivée candidates
+  // --- Ajouts de la décision du porteur (append-only, optionnels : repli sur les défauts de evaluate.ts) ---
+  /** xG minimal pour qu'un tir soit candidat (modulé : shotMinXg·(1,5 − shotEagerness)), défaut 0,04. */
+  shotMinXg?: number;
+  /** w_len : pénalité de longueur de passe (but par longueur de terrain) au-delà de tactic.supportDistance, ← ·(1 − directness), défaut 0,1. */
+  wLength?: number;
+  /** Part de la possession courante Θ(b) comptée perdue par un tir manqué (coût d'opportunité du tir), défaut 1. */
+  wShotPossession?: number;
 }
 
 /** Poids de l'utilité de déplacement sans ballon (attaque). */
@@ -544,6 +589,16 @@ export interface OffBallWeights {
   reexamineEvery: number; // s, ré-examen forcé de la cible
   /** (décision hors-ballon) Bonus gaussien d'un candidat de soutien situé à `tactic.supportDistance` du ballon, défaut 0,1. */
   wSupport?: number;
+  // --- Ajouts de la décision hors-ballon (append-only, défauts dans params.ts) ---
+  /** Vitesse de consigne minimale (m/s) d'un déplacement sans ballon, défaut 2. */
+  minSpeed?: number;
+  /** Fraction de la vitesse de tempo v_max·(0,5 + 0,5·tempo) par intention (les appels restent au sprint) ; une cible
+   * lointaine (> 5 m) tend linéairement vers la vitesse de tempo à 20 m. Défauts : conservation 0,35, soutien/largeur 0,5, espace 0,6. */
+  intentSpeed?: { hold_shape: number; support: number; width: number; exploit_space: number; create_space: number };
+  /** Distance (m) sous laquelle une cible « conservation de la structure » est remplacée par la position courante (le joueur tient sa place), défaut 1,5 (< 2 m : aucun saut de cible mesurable). */
+  standDistance?: number;
+  /** Vitesse maximale (m/s) de la référence de ballon des postes instanciés (`MatchState.slotBallRef`) ; ≤ 0 = ballon instantané. Défaut 6. */
+  slotFollowRate?: number;
 }
 
 /** Coûts de l'affectation défensive. */
@@ -562,6 +617,14 @@ export interface DefenceWeights {
   minReassignGain: number; // s, gain minimal de coût total pour changer l'affectation
   containOffset: number; // m, distance côté but du porteur en mode « contain »
   tackleRadius: number; // m
+  // --- Ajouts de la décision défensive (append-only, défauts dans params.ts) ---
+  /** Distance supplémentaire (m) de « contain » par unité de (1 − pressIntensity) : un bloc bas contient de plus loin, défaut 2. */
+  containSlack?: number;
+  /** Vitesses de consigne (fractions de v_max) des tâches non urgentes ; press / intercept / chase restent au sprint.
+   * Défauts : contain 0,8 ; zone 0,5 ; mark 0,6 + 0,4·priorité ; recover 0,35 + 0,35·recoverPriority. */
+  taskSpeed?: { contain: number; zone: number; markBase: number; markGain: number; recoverBase: number; recoverGain: number };
+  /** Distance (m) sous laquelle une tâche zone / repli est tenue sur place (cible = position courante), défaut 2. */
+  standDistance?: number;
 }
 
 export interface SimParams {

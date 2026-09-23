@@ -13,8 +13,11 @@ import { dist } from '@/core/vec2';
 import { makeTactic } from '@/tactics/styles';
 import { createMatch, giveBall, slotPosition } from '@/engine/match';
 import { createSimulation } from '@/engine/loop';
+import { computeFields } from '@/models/fields';
 import { decideAll, FULL_POLICY, attackingTeam } from '@/decision/coordinator';
-import { ballStopPoint, timeToBall, rankChasers } from '@/decision/loose';
+import { ballPositionAt, ballStopPoint, timeToBall, rankChasers, stableMeetingPoint, updateSlotBallRef } from '@/decision/loose';
+import { timeToArrive } from '@/models/motion';
+import { decideKeeper } from '@/decision/keeper';
 import { BASELINES, pickGreedyProgress, pickGreedySafe, pickRandom, withChosen, candidateEndPoint } from '@/decision/baselines';
 import type { PolicySet } from '@/decision/policy';
 
@@ -58,6 +61,8 @@ function matchState(seed: number, ownerId: number, ballPos: Vec2, tactics = { A:
 }
 
 const move = (d: Decision) => (d.chosen.action.type === 'move' ? d.chosen.action : null);
+/** Champs spatiaux d'un état (calcul synchrone). */
+const await0 = (state: MatchState) => computeFields(state, P);
 
 /** Décision « synthétique » du porteur avec des candidats de scores/probabilités donnés (tests des baselines). */
 function syntheticDecision(specs: { score: number; p: number; x: number }[]): Decision {
@@ -201,6 +206,107 @@ describe('coordinator — cycle complet', () => {
     times.sort((a, b) => a - b);
     console.log(`decideAll : moyenne ${mean.toFixed(2)} ms, médiane ${times[Math.floor(times.length / 2)].toFixed(2)} ms, p95 ${times[Math.floor(0.95 * times.length)].toFixed(2)} ms (22 joueurs, porteur ${onBallAvailable() ? 'complet' : 'indisponible'})`);
     expect(mean).toBeLessThan(30);
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe('coordinator — ballon libre : faisabilité, passeur, gardien', () => {
+  it('timeToBall : le point de rencontre est atteint avant ou quand le ballon y passe (jamais un point déjà dépassé) ; le passeur n’est pas premier', () => {
+    const state = matchState(13, 6, v(0, 0));
+    const ball = state.ball;
+    ball.ownerId = null;
+    ball.pos = { x: 0.6, y: 0 };
+    ball.vel = { x: 9, y: 0 };
+    ball.flight = { kind: 'pass', kickerId: 6, targetId: 9, targetPoint: { x: 20, y: 0 }, origin: { x: 0, y: 0 }, startTime: state.time, initialSpeed: 9 };
+    state.players[6].pos = { x: 0, y: 0 };
+    state.players[9].pos = { x: 20, y: 0 };
+    for (const p of state.players) p.vel = { x: 0, y: 0 };
+    const ranked = rankChasers(state, P, 'A');
+    expect(ranked[0].id).not.toBe(6);
+    expect(ranked[0].id).toBe(9);
+    for (const p of state.players) {
+      const r = timeToBall(p, ball, P);
+      // Faisabilité : T_j(point) ≤ temps de rencontre, et le ballon est bien au point à cet instant.
+      expect(timeToArrive(p.pos, p.vel, r.point, p.maxSpeed, p.maxAccel, P.models)).toBeLessThanOrEqual(r.time + 1e-9);
+      expect(dist(ballPositionAt(ball, r.time, P.physics), r.point)).toBeLessThan(0.5);
+    }
+    // Le passeur ne « rencontre » plus le ballon à sa position courante : son point de rencontre est loin devant lui.
+    const passer = timeToBall(state.players[6], ball, P);
+    expect(dist(passer.point, ball.pos)).toBeGreaterThan(15);
+    expect(passer.time).toBeGreaterThan(3);
+  });
+
+  it('passe en cours : l’équipe du passeur n’a pas de second coureur (seul le receveur court), le passeur ne chasse pas sa passe', () => {
+    const state = matchState(14, 6, v(0, 0));
+    const ball = state.ball;
+    ball.ownerId = null;
+    ball.pos = { x: 0.6, y: 0 };
+    ball.vel = { x: 9, y: 0 };
+    ball.flight = { kind: 'pass', kickerId: 6, targetId: 9, targetPoint: { x: 20, y: 0 }, origin: { x: 0, y: 0 }, startTime: state.time, initialSpeed: 9 };
+    state.players[6].pos = { x: 0, y: 0 };
+    state.players[9].pos = { x: 20, y: 0 };
+    const out = decideAll(state, P, POLICIES, new Map(), new Rng(14));
+    expect(move(out.get(9)!)!.intent).toBe('receive');
+    const runnersA = state.players.filter((p) => p.team === 'A' && ['chase', 'intercept', 'receive'].includes(move(out.get(p.id)!)?.intent ?? ''));
+    expect(runnersA.map((p) => p.id)).toEqual([9]);
+    expect(move(out.get(6)!)!.intent).not.toBe('chase');
+    expect(state.players.filter((p) => p.team === 'B' && move(out.get(p.id)!)?.intent === 'intercept').length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('sortie du gardien : dans decideAll, le gardien premier sur un ballon libre de sa surface garde « chase » et aucun joueur de champ n’est envoyé', () => {
+    const state = matchState(15, 20, v(10, 0));
+    const ball = state.ball;
+    ball.ownerId = null;
+    ball.pos = { x: -44, y: 3 };
+    ball.vel = { x: -2, y: 0 };
+    ball.flight = null;
+    state.possession = 'B';
+    for (const p of state.players) if (p.team === 'B') p.pos = { x: 20 + (p.id % 5) * 3, y: -20 + (p.id % 11) * 4 };
+    state.players[0].pos = { x: -50, y: 0 };
+    state.fields = null;
+    const alone = decideKeeper({ state, fields: (state.fields = (await0(state))), params: P, tactic: state.tactics.A, rng: new Rng(1) }, 0, null);
+    expect(move(alone)!.intent).toBe('chase');
+    const out = decideAll(state, P, POLICIES, new Map(), new Rng(15));
+    expect(move(out.get(0)!)!.intent).toBe('chase');
+    expect(dist(move(out.get(0)!)!.target, ball.pos)).toBeLessThan(4);
+    const contested = Math.abs(rankChasers(state, P, 'A')[0].time - rankChasers(state, P, 'B')[0].time) < 0.5;
+    const outfieldChasers = state.players.filter((p) => p.team === 'A' && p.role !== 'GK' && move(out.get(p.id)!)?.intent === 'chase');
+    expect(outfieldChasers.length).toBe(contested ? 1 : 0);
+  });
+
+  it('gardien porteur (hors gel) : decideAll passe par la relance §8.6 — action « pass », aucun candidat dribble / tir', () => {
+    const state = matchState(16, 0, v(-46, 0));
+    expect(state.restart).toBeNull();
+    const out = decideAll(state, P, { A: FULL_POLICY, B: FULL_POLICY }, new Map(), new Rng(16));
+    const d = out.get(0)!;
+    expect(d.chosen.action.type).toBe('pass');
+    expect(d.candidates.every((c) => c.action.type === 'pass' || c.action.type === 'hold')).toBe(true);
+    expect(d.explanation).toMatch(/^Relance/);
+  });
+
+  it('point de rencontre stable : conservé si la nouvelle estimation bouge de moins de 3 m, remplacé sinon ou si l’intention change', () => {
+    const prev: Decision = { playerId: 1, time: 0, chosen: { action: { type: 'move', target: { x: 10, y: 0 }, intent: 'chase', speed: 8 }, score: 0, probability: 1, valueIfSuccess: 0, valueIfFailure: 0, components: [], reason: '' }, candidates: [], context: { phase: 'attack', style: 'balanced', formation: '4-3-3', pressure: 0, availableTeammates: 0, localSuperiority: 0 }, explanation: '', computeMs: 0 };
+    expect(stableMeetingPoint(prev, 'chase', { x: 12, y: 0 })).toEqual({ x: 10, y: 0 });
+    expect(stableMeetingPoint(prev, 'chase', { x: 14, y: 0 })).toEqual({ x: 14, y: 0 });
+    expect(stableMeetingPoint(prev, 'receive', { x: 11, y: 0 })).toEqual({ x: 11, y: 0 });
+    expect(stableMeetingPoint(null, 'chase', { x: 11, y: 0 })).toEqual({ x: 11, y: 0 });
+  });
+
+  it('référence de ballon des postes : recalée au premier cycle, suit le ballon à slotFollowRate m/s au plus, recalée pendant un gel', () => {
+    const state = matchState(17, 6, v(0, 0));
+    updateSlotBallRef(state, P);
+    expect(state.slotBallRef!.pos).toEqual({ x: 0, y: 0 });
+    state.ball.pos = { x: 30, y: 0 };
+    state.time += 1;
+    updateSlotBallRef(state, P);
+    expect(state.slotBallRef!.pos.x).toBeCloseTo(P.offBall.slotFollowRate!, 9);
+    state.time += 10;
+    updateSlotBallRef(state, P);
+    expect(state.slotBallRef!.pos.x).toBeCloseTo(30, 9);
+    state.ball.pos = { x: -40, y: 10 };
+    state.restart = { kind: 'throw_in', team: 'A', pos: { x: -40, y: 10 }, resumeAt: state.time + 1 };
+    updateSlotBallRef(state, P);
+    expect(state.slotBallRef!.pos).toEqual({ x: -40, y: 10 });
   });
 });
 

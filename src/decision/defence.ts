@@ -9,6 +9,10 @@
  *     hystérésis globale (nouvelle affectation adoptée seulement si le coût total baisse de ΔC_min) ;
  *  4. conversion en actions `move` (press / mark / cover / zone / recover / intercept / chase), candidats = 3 meilleures
  *     tâches du défenseur, explication en français ; gardien via decideKeeper.
+ * Vitesses de consigne (réalisme) : press / intercept / chase au sprint, contain 0,8 v_max, marquage 0,6 + 0,4·priorité,
+ * zone 0,5, repli 0,35 + 0,35·recoverPriority (`defence.taskSpeed`) ; une zone ou un repli à moins de `standDistance` m
+ * est tenu sur place. « Contain » se fait à containOffset + containSlack·(1 − pressIntensity) m (un bloc bas contient de
+ * plus loin, un pressing haut colle au porteur).
  * Contre-pressing : en `transition_defence` pendant counterPressWindow s, les 3 défenseurs les plus proches du ballon
  * reçoivent des tâches press/cover à priorité renforcée (règle des 5 secondes).
  * Repère : coordonnées terrain, direction d'attaque `dir` explicite (symétrie miroir A/B).
@@ -25,11 +29,10 @@ import { timeToArrive } from '../models/motion';
 import { getPlayer } from '../models/probability';
 import { quickPassProbability } from './offball';
 import { localSuperiority } from '../models/structure';
-import { slotPosition } from '../engine/match';
 import { FORMATIONS } from '../tactics/formations';
 import { fmtFr, fmtPoint } from './explain';
 import { decideKeeper } from './keeper';
-import { ballStopPoint, component, decisionContext, makeDecision, moveCandidate, TARGET_MARGIN } from './loose';
+import { ballStopPoint, component, decisionContext, makeDecision, moveCandidate, TARGET_MARGIN, teamSlot } from './loose';
 import type { DecisionInput } from './policy';
 
 // ---------------------------------------------------------------------------
@@ -85,13 +88,10 @@ const FW_MARK_ROLE = 2 / 3;
 const COUNTER_PRESS_PLAYERS = 3;
 const COUNTER_PRESS_BOOST = 0.5;
 const COUNTER_PRESS_RADIUS = 15;
-/** Vitesses de consigne (fractions de v_max). */
-const CONTAIN_SPEED = 0.8;
-const ZONE_SPEED = 0.7;
-const MARK_SPEED_BASE = 0.7;
-const MARK_SPEED_GAIN = 0.3;
-const RECOVER_SPEED_BASE = 0.5;
-const RECOVER_SPEED_GAIN = 0.5;
+/** Vitesses de consigne (fractions de v_max) par défaut (`defence.taskSpeed`), distance de maintien sur place (m), marge de contain (m). */
+const DEFAULT_TASK_SPEED: NonNullable<SimParams['defence']['taskSpeed']> = { contain: 0.8, zone: 0.5, markBase: 0.6, markGain: 0.4, recoverBase: 0.35, recoverGain: 0.35 };
+const DEFAULT_STAND_DISTANCE = 2;
+const DEFAULT_CONTAIN_SLACK = 2;
 /** Nombre de candidats (tâches) conservés par défenseur. */
 const KEPT_CANDIDATES = 3;
 /** Granularité (m) des clés de zone (hystérésis). */
@@ -270,12 +270,16 @@ export function generateTasks(input: DecisionInput, team: TeamId, defenders: rea
       }
     } else {
       const u = normalize(sub(ownGoal, ball.pos));
-      tasks.push({ kind: 'contain', point: { x: ball.pos.x + dw.containOffset * u.x, y: ball.pos.y + dw.containOffset * u.y }, priority: CONTAIN_PRIORITY, key: 'contain', label: `contenir le porteur ${carrier.name}` });
+      const off = containDistance(dw, tp.pressIntensity);
+      tasks.push({ kind: 'contain', point: { x: ball.pos.x + off * u.x, y: ball.pos.y + off * u.y }, priority: CONTAIN_PRIORITY, key: 'contain', label: `contenir le porteur ${carrier.name}` });
     }
   } else if (ball.ownerId === null) {
     const flight = ball.flight;
     if (flight && (flight.kind === 'pass' || flight.kind === 'through' || flight.kind === 'lob') && getPlayer(state, flight.kickerId).team === opp) {
-      const inter = analyseInterception(state, ball.pos, flight.targetPoint, flight.kind, opp, params);
+      // Trajectoire en cours : analyse depuis l'origine de la frappe avec la vitesse réellement imprimée et le temps écoulé
+      // (les temps balle sont mesurés depuis maintenant, les points déjà dépassés ne sont plus interceptables).
+      const inter = analyseInterception(state, flight.origin, flight.targetPoint, flight.kind, opp, params, undefined,
+        { elapsed: state.time - flight.startTime, initialSpeed: flight.initialSpeed });
       let n = 0;
       for (const s of inter.samples) {
         if (s.opponentTime <= s.ballTime + INTERCEPT_SLACK && s.ballTime > 0) {
@@ -334,7 +338,7 @@ export function generateTasks(input: DecisionInput, team: TeamId, defenders: rea
 
   // --- Repli : un poste par défenseur ---
   for (const d of defenders) {
-    tasks.push({ kind: 'recover', point: slotPosition(state, d), priority: 0, ownerId: d.id, key: `recover:${d.id}`, label: 'se replier à son poste' });
+    tasks.push({ kind: 'recover', point: teamSlot(state, d), priority: 0, ownerId: d.id, key: `recover:${d.id}`, label: 'se replier à son poste' });
   }
 
   // Défenseurs les plus proches du ballon (contre-pressing).
@@ -361,7 +365,7 @@ export function defenderInfo(input: DecisionInput, team: TeamId, defender: Playe
   const isDM = !!formationSlot && /DM$/.test(formationSlot.label);
   const retreat = state.phase[team] === 'transition_defence' && dir * defender.pos.x > dir * state.ball.pos.x;
   return {
-    slot: slotPosition(state, defender),
+    slot: teamSlot(state, defender),
     nu: params.defence.nuShape * (isDM ? 2 : 1) * (retreat ? 2 : 1),
     prevKey: previousTaskKey(previous.get(defender.id), defender.id),
     counterEligible: info.counterPress && nearestToBall.includes(defender.id),
@@ -467,7 +471,9 @@ export function decideDefence(input: DecisionInput, team: TeamId, previous: Map<
     }
 
     const tSetup = performance.now();
+    const standDistance = dw.standDistance ?? DEFAULT_STAND_DISTANCE;
     for (let j = 0; j < defenders.length; j++) {
+      const tj = performance.now();
       const d = defenders[j];
       const ti = assignment[j] >= 0 ? assignment[j] : tasks.findIndex((t) => t.kind === 'recover' && t.ownerId === d.id);
       const task = tasks[ti];
@@ -482,7 +488,9 @@ export function decideDefence(input: DecisionInput, team: TeamId, previous: Map<
         const t = tasks[i];
         const comps = costComponents(breakdown[j][i], dw);
         if (i === ti && breakdown[j][i].cost > minCost) comps.push(component('coordination', 'Coordination collective (affectation optimale)', breakdown[j][i].cost - minCost, 1, 's'));
-        const c = moveCandidate(t.point, INTENT_OF[t.kind], taskSpeed(t, d, tp.recoverPriority), comps, taskReason(t, breakdown[j][i]), {
+        // Zone / repli déjà tenus (cible à moins de standDistance) : le défenseur reste sur place.
+        const held = (t.kind === 'zone' || t.kind === 'recover') && dist(t.point, d.pos) < standDistance;
+        const c = moveCandidate(held ? d.pos : t.point, INTENT_OF[t.kind], taskSpeed(t, d, tp.recoverPriority, dw), comps, taskReason(t, breakdown[j][i]), {
           markId: t.markId,
           duration: breakdown[j][i].arrival,
           successPoint: t.point,
@@ -492,8 +500,8 @@ export function decideDefence(input: DecisionInput, team: TeamId, previous: Map<
       }
       const explanation = explainDefender(task, breakdown[j][ti], dw, info, order.slice(1, KEPT_CANDIDATES).map((x) => ({ t: tasks[x.i], b: x.b })).filter((x) => x.t !== task), keptGlobal);
       const dec = makeDecision(d.id, state.time, chosen!, candidates, decisionContext(input, d, superiority), explanation, t0);
-      // Le temps de calcul de l'affectation collective est réparti entre les défenseurs.
-      dec.computeMs = (tSetup - t0) / defenders.length + (performance.now() - tSetup);
+      // Le temps de calcul de l'affectation collective est réparti entre les défenseurs ; le temps propre est celui de cette itération.
+      dec.computeMs = (tSetup - t0) / defenders.length + (performance.now() - tj);
       out.set(d.id, dec);
     }
   }
@@ -502,13 +510,20 @@ export function decideDefence(input: DecisionInput, team: TeamId, previous: Map<
   return out;
 }
 
-function taskSpeed(task: DefenceTask, d: Player, recoverPriority: number): number {
+/** Distance de « contain » (m) : containOffset + containSlack·(1 − pressIntensity). */
+export function containDistance(dw: SimParams['defence'], pressIntensity: number): number {
+  return dw.containOffset + (dw.containSlack ?? DEFAULT_CONTAIN_SLACK) * Math.max(0, 1 - pressIntensity);
+}
+
+/** Vitesse de consigne (m/s) d'une tâche défensive (`defence.taskSpeed`). */
+export function taskSpeed(task: DefenceTask, d: Player, recoverPriority: number, dw: SimParams['defence']): number {
+  const ts = dw.taskSpeed ?? DEFAULT_TASK_SPEED;
   switch (task.kind) {
     case 'press': case 'intercept': case 'chase': return d.maxSpeed;
-    case 'contain': return d.maxSpeed * CONTAIN_SPEED;
-    case 'mark': return d.maxSpeed * (MARK_SPEED_BASE + MARK_SPEED_GAIN * task.priority);
-    case 'zone': return d.maxSpeed * ZONE_SPEED;
-    default: return d.maxSpeed * (RECOVER_SPEED_BASE + RECOVER_SPEED_GAIN * recoverPriority);
+    case 'contain': return d.maxSpeed * ts.contain;
+    case 'mark': return d.maxSpeed * Math.min(1, ts.markBase + ts.markGain * task.priority);
+    case 'zone': return d.maxSpeed * ts.zone;
+    default: return d.maxSpeed * Math.min(1, ts.recoverBase + ts.recoverGain * recoverPriority);
   }
 }
 

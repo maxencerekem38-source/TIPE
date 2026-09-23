@@ -72,13 +72,20 @@ export const directionLabel = (direction: Vec2, team: TeamId): string => DIRECTI
 /** Flèche compacte (→ = vers le but adverse). */
 export const directionArrow = (direction: Vec2, team: TeamId): string => DIRECTION_ARROWS[directionSector(direction, team)];
 
-/** Équipe d'un candidat : celle du joueur `playerId` s'il est connu, sinon l'équipe en possession (A par défaut). */
+/** Joueur `id` de l'état (indexation directe, sinon recherche), undefined s'il est inconnu. */
+function findPlayer(state: MatchState, id: number): MatchState['players'][number] | undefined {
+  const direct = state.players[id];
+  return direct && direct.id === id ? direct : state.players.find((q) => q.id === id);
+}
+
+/** Équipe d'un candidat : celle du joueur `playerId` s'il est connu, sinon celle du porteur, sinon l'équipe en possession (A par défaut). */
 function teamOf(state: MatchState, playerId: number | undefined): TeamId {
   if (playerId !== undefined) {
-    const p = state.players[playerId]?.id === playerId ? state.players[playerId] : state.players.find((q) => q.id === playerId);
+    const p = findPlayer(state, playerId);
     if (p) return p.team;
   }
-  return state.ball.ownerId !== null ? teamOf(state, state.ball.ownerId) : state.possession ?? 'A';
+  const owner = state.ball.ownerId !== null ? findPlayer(state, state.ball.ownerId) : undefined;
+  return owner?.team ?? state.possession ?? 'A';
 }
 
 // ---------------------------------------------------------------------------
@@ -159,8 +166,11 @@ const WHY_NOT_LABELS: Record<string, string> = {
   support: 'moins de soutien numérique',
   lines: 'moins de lignes franchies',
   risk: 'risque de perte plus élevé',
+  possession: 'possession abandonnée plus précieuse',
   time: 'action plus lente',
+  length: 'passe plus longue',
   offside: 'risque de hors-jeu',
+  response: 'réponse adverse plus pénalisante',
   lookahead: 'suite moins prometteuse',
   tactic: 'moins conforme à la tactique',
   hysteresis: 'changement d’intention pénalisé',
@@ -234,18 +244,21 @@ const MAX_ALTERNATIVES = 3;
 
 /**
  * Explication multi-lignes (≤ 12 lignes) d'une décision :
- *   ACTION OPTIMALE / CIBLE / SCORE — PROBABILITÉ / RAISON / Alternatives (3, avec « pourquoi pas ») / Menaces.
+ *   ACTION CHOISIE / CIBLE / SCORE — PROBABILITÉ / RAISON / Alternatives (3, avec « pourquoi pas ») / Menaces.
  * Fonctionne pour toute décision, y compris les déplacements sans ballon (intention étiquetée en français).
+ * Lorsque l'action choisie n'est pas le premier candidat (départage à ε près par P puis T, ou réponse quantale),
+ * la raison le signale — l'explication reste une lecture exacte de la décomposition.
  */
 export function explainDecision(decision: Decision, state: MatchState): string {
   const c = decision.chosen;
   const pid = decision.playerId;
   const lines: string[] = [];
-  lines.push(`ACTION OPTIMALE : ${actionLabel(c, state, pid)}`);
+  lines.push(`ACTION CHOISIE : ${actionLabel(c, state, pid)}`);
   lines.push(`CIBLE : ${targetLabel(c.action, state, pid)}`);
   lines.push(`SCORE : ${fmtFr(c.score, 2)} — PROBABILITÉ : ${fmtPct(c.probability)}`);
   let reason = c.reason && c.reason.length > 0 ? c.reason : 'aucune justification disponible';
   if (decision.keptByHysteresis) reason += ' (intention conservée par hystérésis)';
+  else if (decision.candidates.length > 0 && c !== decision.candidates[0]) reason += ' (départage quantal)';
   lines.push(`RAISON : ${reason}`);
   if (c.response && c.response.delta > 1e-4) {
     const kind = { hold: 'tenir la forme', press: 'presser le receveur', cover: 'couvrir la ligne', drop: 'reculer' }[c.response.kind];

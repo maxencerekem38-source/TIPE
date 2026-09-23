@@ -4,12 +4,17 @@
  * Pour une trajectoire b → q on échantillonne M points q_m aux temps balle T_b(q_m) ; pour chaque
  * adversaire j, Φ_{j,m} = logit⁻¹((T_b(q_m) − T_j(q_m))/σ_T) est la probabilité qu'il arrive à temps ;
  * P_int = 1 − Π_m Π_j (1 − η Φ_{j,m}) (chances séquentielles indépendantes, η calibré par Monte-Carlo).
+ *
+ * Ballons aériens (lob, dégagement) : le vol est celui du moteur (`lobFlight`, tir à 45°) ; un échantillon n'est
+ * interceptable que si la hauteur z(f) = 4·apex·f·(1 − f) est inférieure à physics.controlMaxHeight (même
+ * condition que la prise de balle du moteur), et l'atterrissage (f = 1) est une chance supplémentaire de
+ * disputer le ballon retombé (efficacité η_land, fenêtre de temps t_land après le contact au sol, §4.6).
  */
 import type { Vec2 } from '../core/vec2';
 import { projectOnSegment, angleBetween, sub, len } from '../core/vec2';
 import type { BallFlightKind, MatchState, Player, SimParams, TeamId } from '../core/types';
 import { attackDir } from '../core/types';
-import { ballTravelTime, launchSpeed, timeToArrive } from './motion';
+import { ballTravelTime, launchSpeed, lobFlight, lobHeightAt, timeToArrive } from './motion';
 
 export interface InterceptionSample {
   point: Vec2;
@@ -38,12 +43,20 @@ export interface InterceptionAnalysis {
   weakLead: number;
 }
 
-/** Accélération de la pesanteur (m/s²), pour le temps de vol approché d'un ballon aérien. */
-const GRAVITY = 9.81;
-/** Fraction initiale / finale d'un ballon aérien pendant laquelle il est interceptable (au sol ou à hauteur de tête). */
-const AERIAL_WINDOW = 0.2;
+/** Trajectoire déjà en cours (ballon libre) : `from` est alors l'origine de la frappe, `elapsed` le temps écoulé depuis. */
+export interface LiveFlight {
+  /** Temps écoulé depuis la frappe (s) : les échantillons déjà dépassés par le ballon ne sont plus interceptables. */
+  elapsed: number;
+  /** Vitesse initiale réellement imprimée (ballon roulant, avec le bruit d'exécution) ; ignorée pour un ballon aérien. */
+  initialSpeed?: number;
+}
+
 /** Seuil de φ à partir duquel un adversaire est signalé comme menace. */
 const THREAT_PHI = 0.2;
+/** Efficacité de la chance d'atterrissage d'un ballon aérien (repli si models.interceptLandingEfficiency est absent). */
+const DEFAULT_LANDING_EFFICIENCY = 0.6;
+/** Fenêtre (s) après l'atterrissage pendant laquelle le ballon retombé reste disputable près du point de chute (repli). */
+const DEFAULT_LANDING_WINDOW = 0.3;
 
 /**
  * logit⁻¹ à l'échelle d'une loi logistique d'écart-type 1 : 1/(1 + e^{−πz/√3}) (§4.6).
@@ -51,29 +64,44 @@ const THREAT_PHI = 0.2;
  */
 export const arrivalLogistic = (z: number): number => 1 / (1 + Math.exp((-Math.PI / Math.sqrt(3)) * z));
 
-/** Modèle de vol d'un ballon selon le type de frappe : vitesse initiale, durée totale et temps au point d'abscisse curviligne f·d. */
-export function flightModel(kind: BallFlightKind, distance: number, params: SimParams, arrivalSpeed?: number): { initialSpeed: number; travelTime: number; timeAt: (f: number) => number; aerial: boolean } {
+export interface FlightModel {
+  initialSpeed: number;
+  travelTime: number;
+  /** Temps balle au point d'abscisse curviligne f·d. */
+  timeAt: (f: number) => number;
+  aerial: boolean;
+  /** Hauteur (m) du ballon à la fraction f du trajet (0 pour un ballon au sol). */
+  heightAt: (f: number) => number;
+}
+
+/**
+ * Modèle de vol d'un ballon selon le type de frappe : vitesse initiale, durée totale, temps et hauteur au point
+ * d'abscisse curviligne f·d. `initialSpeed` (ballon roulant) remplace la vitesse de lancement calculée depuis
+ * `arrivalSpeed` (trajectoire en cours, vitesse réellement imprimée).
+ */
+export function flightModel(kind: BallFlightKind, distance: number, params: SimParams, arrivalSpeed?: number, initialSpeed?: number): FlightModel {
   const ph = params.physics;
   const d = Math.max(0, distance);
+  const ground = (): number => 0;
   switch (kind) {
     case 'shot': {
       const s0 = ph.shotSpeed;
       const T = d / s0;
-      return { initialSpeed: s0, travelTime: T, timeAt: (f) => f * T, aerial: false };
+      return { initialSpeed: s0, travelTime: T, timeAt: (f) => f * T, aerial: false, heightAt: ground };
     }
     case 'lob':
     case 'clearance': {
-      // Ballon aérien : tir balistique à 45° (v₀ = √(g d), composante horizontale v₀/√2), approximation documentée (hors périmètre §13.6).
-      const s0 = Math.min(ph.passSpeedMax, Math.sqrt(GRAVITY * d));
-      const T = s0 > 0 ? d / (s0 / Math.SQRT2) : 0;
-      return { initialSpeed: s0, travelTime: T, timeAt: (f) => f * T, aerial: true };
+      // Ballon aérien : même cinématique que le moteur (tir à 45°, `lobFlight`), vitesse horizontale constante.
+      const lf = lobFlight(d, ph);
+      const T = lf.travelTime;
+      return { initialSpeed: lf.initialSpeed, travelTime: T, timeAt: (f) => f * T, aerial: true, heightAt: (f) => lobHeightAt(lf.apex, f) };
     }
     default: {
       // Ballon au sol (passe, passe en profondeur, ballon libre) : décélération constante μ.
       const sArr = arrivalSpeed ?? (kind === 'through' ? ph.throughArrivalSpeed : ph.passArrivalSpeed);
-      const s0 = launchSpeed(d, sArr, ph);
+      const s0 = initialSpeed !== undefined && initialSpeed > 0 ? initialSpeed : launchSpeed(d, sArr, ph);
       const T = ballTravelTime(d, s0, ph);
-      return { initialSpeed: s0, travelTime: T, timeAt: (f) => ballTravelTime(f * d, s0, ph), aerial: false };
+      return { initialSpeed: s0, travelTime: T, timeAt: (f) => ballTravelTime(f * d, s0, ph), aerial: false, heightAt: ground };
     }
   }
 }
@@ -82,17 +110,23 @@ export function flightModel(kind: BallFlightKind, distance: number, params: SimP
  * Analyse d'interception d'une passe de `from` vers `to` jouée par `team`
  * (les adversaires de `team` tentent d'intercepter).
  * `kind` : 'pass'/'through'/'loose' = ballon roulant (vitesse de lancement issue de `arrivalSpeed`
- * ou de physics.passArrivalSpeed / throughArrivalSpeed) ; 'lob'/'clearance' = interceptable seulement
- * dans les 20 % initiaux et finaux du vol ; 'shot' = ligne droite à physics.shotSpeed.
+ * ou de physics.passArrivalSpeed / throughArrivalSpeed) ; 'lob'/'clearance' = ballon aérien interceptable
+ * seulement quand il vole sous physics.controlMaxHeight, plus la chance d'atterrissage ; 'shot' = ligne droite à physics.shotSpeed.
+ * `live` : trajectoire déjà en cours (`from` = origine de la frappe) — les temps balle sont mesurés depuis maintenant
+ * (T_b − elapsed) et les points déjà dépassés ne sont plus interceptables.
  */
-export function analyseInterception(state: MatchState, from: Vec2, to: Vec2, kind: BallFlightKind, team: TeamId, params: SimParams, arrivalSpeed?: number): InterceptionAnalysis {
+export function analyseInterception(state: MatchState, from: Vec2, to: Vec2, kind: BallFlightKind, team: TeamId, params: SimParams, arrivalSpeed?: number, live?: LiveFlight): InterceptionAnalysis {
   const m = params.models;
   const M = Math.max(1, Math.floor(m.interceptSamples));
   const eta = m.interceptEfficiency;
+  const etaLand = m.interceptLandingEfficiency ?? DEFAULT_LANDING_EFFICIENCY;
+  const landingWindow = m.interceptLandingWindow ?? DEFAULT_LANDING_WINDOW;
+  const maxHeight = params.physics.controlMaxHeight;
   const invSigma = 1 / Math.max(1e-6, m.arrivalSigma);
   const dx = to.x - from.x, dy = to.y - from.y;
   const d = Math.sqrt(dx * dx + dy * dy);
-  const flight = flightModel(kind, d, params, arrivalSpeed);
+  const flight = flightModel(kind, d, params, arrivalSpeed, liveInitialSpeed(kind, live));
+  const elapsed = live ? Math.max(0, live.elapsed) : 0;
 
   const players = state.players;
   const opponents: Player[] = [];
@@ -106,17 +140,21 @@ export function analyseInterception(state: MatchState, from: Vec2, to: Vec2, kin
   for (let s = 0; s < M; s++) {
     const f = (s + 1) / M;
     const point = { x: from.x + dx * f, y: from.y + dy * f };
-    const tb = flight.timeAt(f);
-    const interceptable = !flight.aerial || f <= AERIAL_WINDOW || f >= 1 - AERIAL_WINDOW;
+    const tb = flight.timeAt(f) - elapsed;
+    const landing = flight.aerial && s === M - 1;
+    // Ballon au sol : toujours interceptable ; aérien : seulement sous la hauteur de contrôle, ou à l'atterrissage.
+    const interceptable = tb >= 0 && (!flight.aerial || landing || flight.heightAt(f) < maxHeight);
+    const etaHere = landing ? etaLand : eta;
+    const tbEff = landing ? tb + landingWindow : tb;
     let bestId = -1, bestT = Infinity, bestPhi = 0;
     for (let k = 0; k < opponents.length; k++) {
       const o = opponents[k];
       const T = timeToArrive(o.pos, o.vel, point, o.maxSpeed, o.maxAccel, m);
-      const phi = interceptable ? arrivalLogistic((tb - T) * invSigma) : 0;
-      survive *= 1 - eta * phi;
+      const phi = interceptable ? arrivalLogistic((tbEff - T) * invSigma) : 0;
+      survive *= 1 - etaHere * phi;
       if (phi >= THREAT_PHI) threatened[k] = 1;
       if (T < bestT) { bestT = T; bestId = o.id; bestPhi = phi; }
-      if (phi > weakPhi) { weakPhi = phi; weakSampleIndex = s; weakOpponentId = o.id; weakLead = tb - T; }
+      if (phi > weakPhi) { weakPhi = phi; weakSampleIndex = s; weakOpponentId = o.id; weakLead = tbEff - T; }
     }
     samples[s] = { point, ballTime: tb, opponentId: bestId, opponentTime: bestT, phi: bestPhi };
   }
@@ -129,12 +167,18 @@ export function analyseInterception(state: MatchState, from: Vec2, to: Vec2, kin
     samples,
     threats,
     initialSpeed: flight.initialSpeed,
-    travelTime: flight.travelTime,
+    travelTime: Math.max(0, flight.travelTime - elapsed),
     weakPhi: Math.max(0, weakPhi),
     weakSampleIndex,
     weakOpponentId,
     weakLead,
   };
+}
+
+/** Vitesse initiale à imposer au modèle de vol pour une trajectoire en cours (ballon roulant seulement). */
+function liveInitialSpeed(kind: BallFlightKind, live: LiveFlight | undefined): number | undefined {
+  if (!live || live.initialSpeed === undefined) return undefined;
+  return kind === 'lob' || kind === 'clearance' || kind === 'shot' ? undefined : live.initialSpeed;
 }
 
 /**

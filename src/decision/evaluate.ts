@@ -3,7 +3,10 @@
  *
  *   EV₁(a) = P_a · V⁺(a) − (1 − P_a) · λ_risk · L(q_a⁻) − C(a)
  *   V⁺(a) = Θ(q_a⁺) + w_prog · Δx/L + w_sup · sup(q_a⁺) + w_lb · n_lb(a)     (tir : V⁺ = 1, P = xG)
- *   C(a)  = w_time · T_a + w_off · 1[risque de hors-jeu]
+ *   C(a)  = w_time · T_a + w_off · 1[risque de hors-jeu] + w_len · P_a · max(0, d − d_sup)/L   (passes)
+ *
+ * Tir : EV₁ = xG · 1 − (1 − xG) · [λ · L(p_gk) + Θ(b)] − C, où Θ(b) = xT(b)·PC_att(b) est la possession abandonnée
+ * par un tir manqué (coût d'opportunité : sans lui, un tir lointain à xG 0,02 bat toute passe).
  *
  * Θ(q⁺) = xT(q⁺) · PC_att(q⁺) est lue sur l'état ANTICIPÉ (joueurs avancés de T_a à vitesse constante,
  * receveur au point d'arrivée) ; L(q⁻) = xT adverse au point de perte (point faible de la ligne pour une passe,
@@ -15,15 +18,18 @@
  *   progression P · w_prog · Δx / L
  *   support     P · w_sup · sup
  *   lines       P · w_lb · n_lb
+ *   possession  −(1 − P) · Θ(b)              (tir : possession abandonnée)
  *   risk        −(1 − P) · λ · L(q⁻)
  *   time        −w_time · T_a
- *   offside     −w_off · 1[risque]
+ *   length      −w_len · P · max(0, d − d_sup) / L   (passes : au-delà de la distance de soutien tactique)
+ *   offside     −w_off · 1[risque]           (receveur devant le ballon et à moins de 1 m de la ligne des défenseurs)
  *   tactic      bonus tactiques additifs (profondeur / lob : +0,5·directness·P·V⁺ ; tir : 0,05·(shotEagerness − 0,5) ;
  *               conservation : holdBias − 0,02·tempo)
- * (les composantes « lookahead » et « hysteresis » sont ajoutées par onball.ts).
+ * (les composantes « response », « lookahead » et « hysteresis » sont ajoutées par onball.ts).
  *
  * Modulation tactique (§13.3) : λ ← λ·(1,6 − 1,2·riskTolerance) ; w_prog, w_lb ← ·progressionBias
- * (× (1 + 1,5·counterAttackBias) en transition offensive) ; w_time ← ·(0,5 + tempo).
+ * (× (1 + 1,5·counterAttackBias) en transition offensive) ; w_time ← ·(0,5 + tempo) ; w_len ← w_len·(1 − directness),
+ * d_sup = supportDistance ; xG_min ← shotMinXg·(1,5 − shotEagerness).
  */
 import type { Vec2 } from '../core/vec2';
 import { dist } from '../core/vec2';
@@ -34,7 +40,7 @@ import { attackDir, otherTeam } from '../core/types';
 import { pitchControlAt, pressureAt, threatAt } from '../models/fields';
 import { analyseInterception, lineBreaks, passingLaneQuality, type InterceptionAnalysis } from '../models/interception';
 import { dribbleProbability, holdProbability, passProbability, shotProbability, throughBallProbability, type ProbabilityResult } from '../models/probability';
-import { offsideLine, smoothSuperiority } from '../models/structure';
+import { OFFSIDE_TOLERANCE, offsideLine, smoothSuperiority } from '../models/structure';
 import { sigmoid } from '../core/vec2';
 import { keeperOf, type Proposal, type ProposalKind } from './candidates';
 import { fmtFr, fmtPct, playerNumber } from './explain';
@@ -60,8 +66,14 @@ export const LANE_BLOCK_DISTANCE = 1.0;
 export const LANE_BLOCK_PHI = 0.8;
 /** Distance (m) au-delà de laquelle une ligne fermée est jouée en lob. */
 export const LOB_MIN_DISTANCE = 25;
-/** Marge (m) à la ligne de hors-jeu en deçà de laquelle une passe porte un « risque de hors-jeu » (§6.2). */
+/** Marge (m) à la ligne des défenseurs en deçà de laquelle une passe porte un « risque de hors-jeu » (§6.2). */
 const OFFSIDE_RISK_MARGIN = 1.0;
+/** Replis des paramètres optionnels ajoutés (append-only dans SimParams). */
+const DEFAULT_SHOT_MIN_XG = 0.04;
+const DEFAULT_W_LENGTH = 0.1;
+const DEFAULT_W_SHOT_POSSESSION = 1.0;
+/** Modulation du seuil de tir : xG_min ← shotMinXg · (SHOT_MIN_BASE − shotEagerness). */
+const SHOT_MIN_BASE = 1.5;
 /** Longueur maximale (caractères) d'une phrase d'explication. */
 const REASON_MAX = 140;
 
@@ -83,6 +95,14 @@ export interface OnBallWeights {
   shotBonus: number;
   /** Bonus additif (but) de la conservation (holdBias − pénalité de tempo). */
   holdBonus: number;
+  /** w_len modulé : pénalité (but par longueur de terrain) de la longueur de passe au-delà de `lengthFree`. */
+  wLength: number;
+  /** d_sup : longueur de passe (m) libre de pénalité (distance de soutien du style). */
+  lengthFree: number;
+  /** xG minimal d'un tir candidat (modulé par shotEagerness). */
+  shotMinXg: number;
+  /** Part de Θ(b) comptée perdue par un tir manqué. */
+  shotPossession: number;
 }
 
 /** Poids de l'évaluation après modulation tactique (§13.3). Tous les modulateurs à leur valeur neutre ⇒ défauts. */
@@ -101,6 +121,10 @@ export function modulatedWeights(params: SimParams, tactic: TacticParams, phase:
     directnessBonus: DIRECTNESS_GAIN * tactic.directness,
     shotBonus: SHOT_EAGERNESS_GAIN * (tactic.shotEagerness - 0.5),
     holdBonus: d.holdBias - TEMPO_HOLD_PENALTY * tactic.tempo,
+    wLength: (d.wLength ?? DEFAULT_W_LENGTH) * Math.max(0, 1 - tactic.directness),
+    lengthFree: tactic.supportDistance,
+    shotMinXg: (d.shotMinXg ?? DEFAULT_SHOT_MIN_XG) * Math.max(0, SHOT_MIN_BASE - tactic.shotEagerness),
+    shotPossession: d.wShotPossession ?? DEFAULT_W_SHOT_POSSESSION,
   };
 }
 
@@ -119,12 +143,20 @@ export interface EvalContext {
   origin: Vec2;
   /** Pression Π(b) sur le porteur. */
   pressureBall: number;
-  /** Ligne de hors-jeu (repère équipe). */
+  /** Ligne de hors-jeu (repère équipe) = max(avant-dernier défenseur, ballon). */
   offsideX: number;
+  /** Ligne des défenseurs seule (repère équipe, avant-dernier défenseur) : le risque de hors-jeu s'y mesure. */
+  defLineX: number;
+  /** Abscisse du ballon (repère équipe) : un receveur derrière le ballon ne peut pas être hors-jeu. */
+  ballX: number;
+  /** Θ(b) = xT(b)·PC_att(b) : valeur de la possession courante (coût d'opportunité d'un tir manqué). */
+  thetaBall: number;
   /** État anticipé partagé : copies superficielles des joueurs, positions réécrites pour chaque candidat. */
   pred: MatchState;
   /** Détail complet (échantillons d'interception) — désactivé pour le jeu réduit de la profondeur 2. */
   detailed: boolean;
+  /** Construire la phrase d'explication (désactivé pour le jeu réduit de la profondeur 2, dont les phrases sont jetées). */
+  explain: boolean;
 }
 
 /** Copie superficielle des joueurs (positions et vitesses dupliquées) pour l'état anticipé. */
@@ -137,17 +169,35 @@ export function shallowPlayers(players: readonly Player[]): Player[] {
   return out;
 }
 
-export function createEvalContext(state: MatchState, fields: FieldSet, params: SimParams, weights: OnBallWeights, me: Player, detailed: boolean): EvalContext {
+export function createEvalContext(state: MatchState, fields: FieldSet, params: SimParams, weights: OnBallWeights, me: Player, detailed: boolean, explain = true): EvalContext {
   const team = me.team;
   const dir = attackDir(team);
   const origin = state.ball.ownerId === me.id ? state.ball.pos : me.pos;
   const pred: MatchState = { ...state, players: shallowPlayers(state.players) };
+  const ballX = dir * origin.x;
   return {
     state, fields, params, weights, me, team, dir, origin,
     pressureBall: pressureAt(state, origin, team, params),
     offsideX: dir * offsideLine(state, team),
-    pred, detailed,
+    defLineX: defendersLineX(state, team),
+    ballX,
+    thetaBall: threatAt(origin, team, params) * pitchControlAt(state, origin, team, params),
+    pred, detailed, explain,
   };
+}
+
+/** Abscisse (repère de `team`) de l'avant-dernier défenseur adverse (gardien inclus) — la ligne de but adverse sans défenseur. */
+function defendersLineX(state: MatchState, team: TeamId): number {
+  const dir = attackDir(team);
+  const def = otherTeam(team);
+  let first = -Infinity, second = -Infinity;
+  for (const p of state.players) {
+    if (p.team !== def) continue;
+    const x = dir * p.pos.x;
+    if (x > first) { second = first; first = x; } else if (x > second) second = x;
+  }
+  if (second > -Infinity) return second;
+  return first > -Infinity ? first : PITCH.halfLength;
 }
 
 /**
@@ -190,6 +240,10 @@ export interface Evaluation {
   blocked: boolean;
   /** Distance de l'action (m). */
   distance: number;
+  /** Point faible W = max φ de la trajectoire (passes, dégagement) — élagage des passes en profondeur (§6.1). */
+  weakPhi: number;
+  /** Partie logistique du logit de P (passes au sol) : réutilisée par la variante lobée sans nouvelle analyse au sol. */
+  logit?: number;
 }
 
 /**
@@ -205,18 +259,21 @@ export function evaluateProposal(ctx: EvalContext, prop: Proposal): Evaluation |
   let failurePoint: Vec2;
   let receiver: Player | null = null;
   let blocked = false;
+  let logit: number | undefined;
   const distance = dist(origin, prop.successPoint);
 
   switch (prop.kind) {
     case 'pass':
     case 'lob': {
-      const pr = passProbability(state, fields, me.id, prop.receiverId, prop.successPoint, params, prop.arrivalSpeed);
-      inter = pr.interception!;
       if (prop.kind === 'lob') {
-        const lob = analyseInterception(state, origin, prop.successPoint, 'lob', team, params);
-        P = (1 - lob.pIntercept) * sigmoid(logitOf(pr));
-        inter = lob;
+        // Lob : partie logistique de la passe au sol (déjà connue si la proposition dérive d'une passe évaluée) × (1 − P_int aérien).
+        logit = prop.logit ?? logitOf(passProbability(state, fields, me.id, prop.receiverId, prop.successPoint, params, prop.arrivalSpeed));
+        inter = analyseInterception(state, origin, prop.successPoint, 'lob', team, params);
+        P = (1 - inter.pIntercept) * sigmoid(logit);
       } else {
+        const pr = passProbability(state, fields, me.id, prop.receiverId, prop.successPoint, params, prop.arrivalSpeed);
+        inter = pr.interception!;
+        logit = logitOf(pr);
         P = pr.p;
         blocked = inter.weakPhi > LANE_BLOCK_PHI && passingLaneQuality(state, origin, prop.successPoint, team) < LANE_BLOCK_DISTANCE;
       }
@@ -271,10 +328,14 @@ export function evaluateProposal(ctx: EvalContext, prop: Proposal): Evaluation |
   let valueIfSuccess: number;
   const successPoint = prop.successPoint;
 
+  let theta = 0;
   if (prop.kind === 'shot') {
     // Un but vaut 1 : V⁺ = 1, P = xG (§6.2).
     valueIfSuccess = 1;
     components.push(comp('threat', 'Valeur d’un but', 1, P, P, 'but'));
+    // Coût d'opportunité : un tir manqué rend le ballon ; la possession courante vaut Θ(b) = xT(b)·PC_att(b).
+    theta = w.shotPossession * ctx.thetaBall;
+    if (theta > 0) components.push(comp('possession', 'Possession abandonnée', ctx.thetaBall, -(1 - P) * w.shotPossession, -(1 - P) * theta, 'but'));
   } else {
     const actorId = receiver ? receiver.id : me.id;
     advancePrediction(ctx, duration, actorId, successPoint);
@@ -299,9 +360,16 @@ export function evaluateProposal(ctx: EvalContext, prop: Proposal): Evaluation |
   let offsideRisk = 0;
   if (receiver && (prop.kind === 'pass' || prop.kind === 'lob' || prop.kind === 'through')) {
     const xr = dir * receiver.pos.x;
-    if (xr > 0 && xr > ctx.offsideX - OFFSIDE_RISK_MARGIN) offsideRisk = 1;
+    // Un receveur derrière le ballon ne peut jamais être hors-jeu : le risque n'existe que s'il est devant le ballon,
+    // dans la moitié adverse, et à moins de OFFSIDE_RISK_MARGIN de la ligne des défenseurs (tolérance du moteur incluse).
+    if (xr > 0 && xr > ctx.ballX && xr > ctx.defLineX + OFFSIDE_TOLERANCE - OFFSIDE_RISK_MARGIN) offsideRisk = 1;
   }
   if (offsideRisk) components.push(comp('offside', 'Risque de hors-jeu', 1, -w.wOffside, -w.wOffside));
+  // Longueur de passe (style) : au-delà de la distance de soutien, une passe longue coûte w_len·P·(d − d_sup)/L.
+  if ((prop.kind === 'pass' || prop.kind === 'lob' || prop.kind === 'through') && w.wLength > 0) {
+    const excess = Math.max(0, distance - w.lengthFree);
+    if (excess > 0) components.push(comp('length', 'Longueur de la passe', distance, -(P * w.wLength) / L, -(P * w.wLength * excess) / L, 'm'));
+  }
   // Modulation tactique additive.
   let tactic = 0;
   if (prop.kind === 'through' || prop.kind === 'lob') tactic = w.directnessBonus * P * valueIfSuccess;
@@ -317,17 +385,30 @@ export function evaluateProposal(ctx: EvalContext, prop: Proposal): Evaluation |
     score,
     probability: P,
     valueIfSuccess,
-    valueIfFailure: -w.lambda * loss,
+    valueIfFailure: -(w.lambda * loss + theta),
     components,
     reason: '',
-    threats: inter ? inter.threats : undefined,
+    threats: inter ? orderedThreats(inter) : undefined,
+    weakOpponentId: inter && inter.weakOpponentId >= 0 ? inter.weakOpponentId : undefined,
     duration,
     successPoint: { x: successPoint.x, y: successPoint.y },
     failurePoint: { x: failurePoint.x, y: failurePoint.y },
   };
   if (ctx.detailed && inter) candidate.samples = inter.samples.map((s) => ({ point: s.point, phi: s.phi, opponentId: s.opponentId }));
-  candidate.reason = buildReason(candidate, state, ctx.pressureBall);
-  return { candidate, kind: prop.kind, blocked, distance };
+  if (ctx.explain) candidate.reason = buildReason(candidate, state, ctx.pressureBall);
+  return { candidate, kind: prop.kind, blocked, distance, weakPhi: inter ? inter.weakPhi : 0, logit };
+}
+
+/** Menaces de la trajectoire, l'adversaire du point faible (W = max φ) en tête ; les autres dans l'ordre de l'analyse. */
+function orderedThreats(inter: InterceptionAnalysis): number[] {
+  const t = inter.threats;
+  const weak = inter.weakOpponentId;
+  const i = t.indexOf(weak);
+  if (i <= 0) return t;
+  const out = t.slice();
+  out.splice(i, 1);
+  out.unshift(weak);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -362,10 +443,16 @@ function negativePhrase(c: ScoreComponent, cand: Candidate, state: MatchState): 
   switch (c.key) {
     case 'risk': {
       if ((a.type === 'pass' || a.type === 'clear') && cand.threats && cand.threats.length > 0) {
-        return `risque d’interception élevé (${playerNumber(state, cand.threats[0])})`;
+        return `risque d’interception élevé (${playerNumber(state, cand.weakOpponentId ?? cand.threats[0])})`;
       }
       return `risque de perte (${fmtPct(1 - cand.probability)})`;
     }
+    case 'possession':
+      return `abandon d’une possession dangereuse (Θ ${fmtFr(c.value, 2)})`;
+    case 'length':
+      return `passe longue (${fmtFr(c.value, 0)} m)`;
+    case 'response':
+      return `réponse adverse : press du receveur (−${fmtFr(-c.value, 3)})`;
     case 'control':
       return `zone contestée (${fmtPct(c.value + 0.5)})`;
     case 'progression':

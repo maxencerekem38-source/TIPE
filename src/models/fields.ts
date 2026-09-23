@@ -32,6 +32,16 @@ const inOwnBox = (side: number, x: number, y: number): boolean => side === 0 || 
 // xG géométrique et menace analytique (§4.3)
 // ---------------------------------------------------------------------------
 /**
+ * Point ramené dans l'aire de jeu : derrière la ligne de but l'angle de tir reste grand (le but est « vu de
+ * l'intérieur »), ce qui donnerait une menace maximale hors du terrain (nœud de grille x = 53,5 m, ballon sorti).
+ * La menace d'un point hors du terrain est celle du point de la ligne le plus proche.
+ */
+const clampInPlay = (q: Vec2): Vec2 =>
+  Math.abs(q.x) <= PITCH.halfLength && Math.abs(q.y) <= PITCH.halfWidth
+    ? q
+    : { x: Math.max(-PITCH.halfLength, Math.min(PITCH.halfLength, q.x)), y: Math.max(-PITCH.halfWidth, Math.min(PITCH.halfWidth, q.y)) };
+
+/**
  * xG géométrique (angle + distance uniquement, sans gardien explicite) — brique de la menace.
  *   xG_loc(q) = σ(base_shot + coef_gk·c_nominal + 3,0·ω(q) − 0,08·d_G(q))   (= σ(−1,96 + 3ω − 0,08 d_G) par défaut)
  * ω = angle sous lequel on voit les poteaux (rad), d_G = distance au centre du but attaqué.
@@ -41,18 +51,21 @@ export function geometricXG(q: Vec2, team: TeamId, params: SimParams): number {
   const dir = attackDir(team);
   const m = params.models;
   const cgk = m.threatKeeperCoverage ?? DEFAULT_THREAT_KEEPER_COVERAGE;
-  const z = m.shot.base + m.shot.keeperCoverage * cgk + m.shot.angle * goalAngle(q, dir) + m.shot.distance * distToGoal(q, dir);
+  const p = clampInPlay(q);
+  const z = m.shot.base + m.shot.keeperCoverage * cgk + m.shot.angle * goalAngle(p, dir) + m.shot.distance * distToGoal(p, dir);
   return sigmoid(z);
 }
+
 
 /**
  * Menace analytique xT (substitut de l'expected threat, §4.3) :
  *   xT(q) = xG_loc(q) + (1 − xG_loc(q))·κ·exp(−d_G/ρ_x)·exp(−y²/2ρ_y²).
  * Valeurs de contrôle : propre surface ≈ 0,005 ; rond central ≈ 0,03 ; entrée de surface axiale ≈ 0,22.
  */
-export function threatAt(q: Vec2, team: TeamId, params: SimParams): number {
+export function threatAt(q0: Vec2, team: TeamId, params: SimParams): number {
   const m = params.models;
   const dir = attackDir(team);
+  const q = clampInPlay(q0);
   const xg = geometricXG(q, team, params);
   const dG = distToGoal(q, dir);
   const carry = m.threatKappa * Math.exp(-dG / m.threatRhoX) * Math.exp(-(q.y * q.y) / (2 * m.threatRhoY * m.threatRhoY));
@@ -179,13 +192,19 @@ export function minArrivalTime(state: MatchState, q: Vec2, params: SimParams, te
 // ---------------------------------------------------------------------------
 // Calcul complet sur la grille
 // ---------------------------------------------------------------------------
+/** Tampon réutilisé pour les temps d'arrivée par joueur (P × |Γ| valeurs) : aucune allocation par cycle (§4). */
+let arrivalScratch = new Float32Array(0);
+/** Tampons réutilisés pour les minima et les sommes du softmin (taille |Γ|). */
+let minAllScratch = new Float32Array(0), minTScratch = new Float32Array(0), sumAScratch = new Float32Array(0), sumBScratch = new Float32Array(0);
+
 /**
  * Calcule l'ensemble des champs sur la grille (cellules de `params.fieldCellSize` m) :
- * controlA, threatA/B (cache), pressureByA/B, et les extras : arrivalTime[i], argminPlayer,
- * dangerA/B = xT·PC_att, exposureA/B = Σ D Δ²/(L·W).
+ * controlA, threatA/B (cache), pressureByA/B, et les extras : argminPlayer, dangerA/B = xT·PC_att,
+ * exposureA/B = Σ D Δ²/(L·W) (nœuds dans l'aire de jeu seulement). Les temps d'arrivée par joueur
+ * passent par un tampon interne réutilisé ; `withArrivalTime` les copie dans `arrivalTime[i]` (visualisation, tests).
  * Coût : 22 × |Γ| formes fermées + exponentielles (≈ 1 ms en Node sur la grille 2 m).
  */
-export function computeFields(state: MatchState, params: SimParams): FieldSet {
+export function computeFields(state: MatchState, params: SimParams, withArrivalTime = false): FieldSet {
   const cs = params.fieldCellSize;
   const m = params.models;
   const players = state.players;
@@ -209,9 +228,11 @@ export function computeFields(state: MatchState, params: SimParams): FieldSet {
   // --- 1. Temps d'arrivée par joueur (§4.1), avec argmin (tous joueurs) et min éligible (contrôle) ---
   // Le gardien ne participe au contrôle que dans sa propre surface (§4.2) : minT ne compte que les
   // joueurs éligibles, argminPlayer compte tout le monde (espace disponible, §4.5).
-  const arrivalTime: ScalarField[] = new Array(P);
-  const minAll = new Float32Array(n).fill(Infinity);
-  const minT = new Float32Array(n).fill(Infinity);
+  if (arrivalScratch.length < P * n) arrivalScratch = new Float32Array(P * n);
+  if (minAllScratch.length < n) { minAllScratch = new Float32Array(n); minTScratch = new Float32Array(n); sumAScratch = new Float32Array(n); sumBScratch = new Float32Array(n); }
+  const arrival = arrivalScratch;
+  const minAll = minAllScratch.fill(Infinity, 0, n);
+  const minT = minTScratch.fill(Infinity, 0, n);
   const boxSide = new Int8Array(P);
   const tau = m.reactionTime;
   for (let k = 0; k < P; k++) {
@@ -219,8 +240,7 @@ export function computeFields(state: MatchState, params: SimParams): FieldSet {
     const side = controlBoxSide(p);
     boxSide[k] = side;
     const id = p.id;
-    const field = new ScalarField(cs);
-    const data = field.data;
+    const base = k * n;
     const sx = p.pos.x + tau * p.vel.x, sy = p.pos.y + tau * p.vel.y;
     const vmax = p.maxSpeed, amax = p.maxAccel;
     const dAcc = (vmax * vmax) / (2 * amax);
@@ -236,21 +256,20 @@ export function computeFields(state: MatchState, params: SimParams): FieldSet {
         const dx = xs[i] - sx;
         const d = Math.sqrt(dx * dx + dy2);
         const t = tau + (d <= dAcc ? Math.sqrt(d * twoInvA) : tAcc + (d - dAcc) * invV);
-        data[idx] = t;
+        arrival[base + idx] = t;
         if (t < minAll[idx]) { minAll[idx] = t; argminPlayer[idx] = id; }
         if (t < minT[idx] && rowEligible && (side === 0 || side * xs[i] >= BOX_X)) minT[idx] = t;
       }
     }
-    arrivalTime[k] = field;
   }
 
   // --- 2. Contrôle : softmin centré sur le min (stable pour β → 0) ---
   // (Accumulateurs Float32 : un test A/B montre qu'une branche de coupure des petits poids coûte plus cher que l'exponentielle.)
-  const sumA = new Float32Array(n);
-  const sumB = new Float32Array(n);
+  const sumA = sumAScratch.fill(0, 0, n);
+  const sumB = sumBScratch.fill(0, 0, n);
   const invBeta = 1 / Math.max(1e-6, m.controlBeta);
   for (let k = 0; k < P; k++) {
-    const data = arrivalTime[k].data;
+    const base = k * n;
     const side = boxSide[k];
     const acc = players[k].team === 'A' ? sumA : sumB;
     for (let j = 0; j < rows; j++) {
@@ -258,7 +277,7 @@ export function computeFields(state: MatchState, params: SimParams): FieldSet {
       let idx = j * cols;
       for (let i = 0; i < cols; i++, idx++) {
         if (side !== 0 && side * xs[i] < BOX_X) continue;
-        acc[idx] += Math.exp(-(data[idx] - minT[idx]) * invBeta);
+        acc[idx] += Math.exp(-(arrival[base + idx] - minT[idx]) * invBeta);
       }
     }
   }
@@ -291,16 +310,27 @@ export function computeFields(state: MatchState, params: SimParams): FieldSet {
   }
 
   // --- 4. Danger et exposition (§4.3) ---
+  // La grille déborde du terrain (nœud x = 53,5 m avec Δ = 2 m) : ces nœuds servent à l'interpolation mais
+  // n'entrent pas dans l'exposition (sans cela le nœud derrière le but ajoutait ≈ 2 % à E et biaisait A par rapport à B).
   const tA = threatA.data, tB = threatB.data, dA = dangerA.data, dB = dangerB.data;
   let expA = 0, expB = 0;
-  for (let idx = 0; idx < n; idx++) {
-    const c = ctl[idx];
-    dA[idx] = tA[idx] * c;
-    dB[idx] = tB[idx] * (1 - c);
-    expA += dA[idx];
-    expB += dB[idx];
+  for (let j = 0; j < rows; j++) {
+    const inY = Math.abs(ys[j]) <= PITCH.halfWidth;
+    let idx = j * cols;
+    for (let i = 0; i < cols; i++, idx++) {
+      const c = ctl[idx];
+      dA[idx] = tA[idx] * c;
+      dB[idx] = tB[idx] * (1 - c);
+      if (inY && Math.abs(xs[i]) <= PITCH.halfLength) { expA += dA[idx]; expB += dB[idx]; }
+    }
   }
   const cellArea = (cs * cs) / (PITCH.length * PITCH.width);
+
+  let arrivalTime: ScalarField[] | undefined;
+  if (withArrivalTime) {
+    arrivalTime = new Array(P);
+    for (let k = 0; k < P; k++) arrivalTime[k] = new ScalarField(cs, arrival.slice(k * n, (k + 1) * n));
+  }
 
   return {
     time: state.time,
@@ -309,7 +339,7 @@ export function computeFields(state: MatchState, params: SimParams): FieldSet {
     threatB,
     pressureByA,
     pressureByB,
-    arrivalTime,
+    ...(arrivalTime ? { arrivalTime } : {}),
     argminPlayer,
     dangerA,
     dangerB,

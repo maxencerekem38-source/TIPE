@@ -1,6 +1,6 @@
 /**
  * Déplacement des attaquants sans ballon (docs/CONCEPTION.md §7) : optimisation d'une utilité sur des
- * positions candidates (poste instancié, 8 directions × {3, 8, 15} m, points de course derrière la ligne
+ * positions candidates (poste instancié, 8 directions × {6, 12, 20} m, points de course derrière la ligne
  * défensive), étiquette d'intention par terme dominant, hystérésis de cible, explication.
  *
  *   U(q) = w₁·P_pass(b→q)·xT(q) + w_sup·G(‖q−b‖ ; d_support) + w₂·[PC(q) − PC(p)] + w₃·ΔE_local(q)
@@ -9,6 +9,11 @@
  * Modulation tactique : widthUsage (élargit le poste, via slotPosition), supportDistance (bonus gaussien),
  * counterAttackBias (renforce les candidats vers l'avant en transition offensive), tempo (vitesse de consigne),
  * runFrequency (poids des appels), restDefenders (§7.2 : défenseurs de repos limités à leur poste).
+ * Hystérésis (§7.2) : la cible choisie est engagée pendant `reexamineEvery` s (`Decision.committedUntil`) avec le bonus
+ * h_off ; atteinte, elle devient « tenir sa place » (le candidat sur place porte le bonus) jusqu'au ré-examen forcé.
+ * Vitesse de consigne par intention (§7.2, réalisme) : appels au sprint, soutien / largeur / espace à une fraction de la
+ * vitesse de tempo, conservation de la structure au trot (une cible lointaine accélère) ; une cible de conservation à
+ * moins de `standDistance` m est remplacée par la position courante (le joueur tient sa place au lieu de ramper).
  * Repère : coordonnées terrain, direction d'attaque `dir` explicite (symétrie miroir A/B).
  */
 import type { Vec2 } from '../core/vec2';
@@ -19,13 +24,12 @@ import type { Candidate, Decision, FieldSet, MatchState, MoveIntent, Player, Sco
 import { attackDir } from '../core/types';
 import { controlFor, threatFor, pressureOn } from '../models/fields';
 import { arrivalLogistic } from '../models/interception';
-import { ballTravelTime, launchSpeed, runTime, timeToArrive } from '../models/motion';
+import { ballTravelTime, launchSpeed, runTime } from '../models/motion';
 import { getPlayer } from '../models/probability';
 import { OFFSIDE_TOLERANCE, offsideLine } from '../models/structure';
-import { slotPosition } from '../engine/match';
 import { FORMATIONS } from '../tactics/formations';
 import { fmtFr, fmtPoint, INTENT_LABELS } from './explain';
-import { component, decisionContext, makeDecision, moveCandidate, receiveTarget, simpleMoveDecision, TARGET_MARGIN } from './loose';
+import { component, decisionContext, makeDecision, moveCandidate, receiveTarget, simpleMoveDecision, stableMeetingPoint, TARGET_MARGIN, teamSlot } from './loose';
 import type { DecisionInput } from './policy';
 
 // ---------------------------------------------------------------------------
@@ -52,6 +56,8 @@ const PATCH_CELLS = 2;
 const IN_PLACE_DISTANCE = 2;
 /** Cible atteinte (hystérésis, §7.2). */
 const REACHED_DISTANCE = 1.5;
+/** Une cible « conservation de la structure » à moins de cette distance (m) du poste courant suit le poste (qui glisse avec le ballon). */
+const SLOT_TRACK_DISTANCE = 3;
 /** Distance maximale (m) des candidats d'un défenseur de repos. */
 const REST_RADIUS = 5;
 /** Un candidat « en avant » du ballon de plus de cette avance (m) est un appel, pas un soutien. */
@@ -59,10 +65,15 @@ const AHEAD_FOR_RUN = 10;
 /** Largeur (m, repère équipe) et distance au ballon au-delà desquelles le poste est une intention « largeur ». */
 const WIDTH_MIN_Y = 15;
 const WIDTH_MIN_BALL_DIST = 15;
-/** Vitesse de consigne : v_max·(SPEED_BASE + SPEED_TEMPO·tempo), appels au sprint. */
+/** Vitesse de tempo : v_max·(SPEED_BASE + SPEED_TEMPO·tempo) ; appels au sprint ; défauts des paramètres optionnels. */
 const SPEED_BASE = 0.5;
 const SPEED_TEMPO = 0.5;
-const MIN_SPEED = 3;
+const DEFAULT_MIN_SPEED = 2;
+const DEFAULT_INTENT_SPEED: NonNullable<SimParams['offBall']['intentSpeed']> = { hold_shape: 0.35, support: 0.5, width: 0.5, exploit_space: 0.6, create_space: 0.6 };
+const DEFAULT_STAND_DISTANCE = 1.5;
+/** Une cible au-delà de SPEED_FAR_START m accélère linéairement jusqu'à la vitesse de tempo à SPEED_FAR_FULL m. */
+const SPEED_FAR_START = 5;
+const SPEED_FAR_FULL = 20;
 /** Renforcement des candidats vers l'avant en transition offensive : (1 + COUNTER_GAIN·counterAttackBias). */
 const COUNTER_GAIN = 1.5;
 /** w_run ← w_run · RUN_FREQ_GAIN · runFrequency (§13.3). */
@@ -139,7 +150,9 @@ export function quickPassProbability(state: MatchState, fields: FieldSet, from: 
     const ex = from.x + dx * t - px, ey = from.y + dy * t - py;
     if (tau + runTime(Math.sqrt(ex * ex + ey * ey), o.maxSpeed, o.maxAccel) > limit) continue;
     for (let s = 0; s < M; s++) {
-      const T = timeToArrive(o.pos, o.vel, { x: sampleX[s], y: sampleY[s] }, o.maxSpeed, o.maxAccel, m);
+      // Temps d'arrivée inliné (= timeToArrive depuis le départ effectif p + τ v, sans allocation).
+      const sx = sampleX[s] - px, sy = sampleY[s] - py;
+      const T = tau + runTime(Math.sqrt(sx * sx + sy * sy), o.maxSpeed, o.maxAccel);
       survive *= 1 - eta * arrivalLogistic((sampleT[s] - T) * invSigma);
     }
   }
@@ -275,12 +288,12 @@ export function decideOffBall(input: DecisionInput, playerId: number, previous: 
   // Receveur d'une passe en cours : intention « réception » (le coordonnateur l'impose aussi).
   const flight = state.ball.flight;
   if (state.ball.ownerId === null && flight && flight.targetId === playerId && (flight.kind === 'pass' || flight.kind === 'through' || flight.kind === 'lob')) {
-    return decideReceive(input, playerId);
+    return decideReceive(input, playerId, previous);
   }
 
   const passer = passerOf(state, player);
   const origin = passer ? passOrigin(state, passer) : ball;
-  const slot = slotPosition(state, player);
+  const slot = teamSlot(state, player);
   const rest = isRestDefender(state, player, tp.restDefenders);
   // Ligne de hors-jeu (repère équipe) calculée une fois : hors-jeu(q) ⇔ x'_q > 0 et x'_q > ligne + tolérance (§3.4).
   const offLine = dir * offsideLine(state, team) + OFFSIDE_TOLERANCE;
@@ -314,15 +327,27 @@ export function decideOffBall(input: DecisionInput, playerId: number, previous: 
   }
   if (runner) for (const q of deepRunPoints(state, fields, player)) pushPoint(q, 'run');
 
-  // Hystérésis (§7.2) : cible précédente réévaluée, bonus h_off, sauf si atteinte ou trop ancienne.
+  // Hystérésis (§7.2) : la cible précédente reste engagée (bonus h_off) jusqu'à `committedUntil` (ré-examen forcé toutes
+  // les reexamineEvery s, échéance portée par la décision et héritée tant que la cible est conservée). Atteinte (≤ 1,5 m),
+  // elle devient « rester sur place » : le candidat sur place porte alors le bonus, le joueur tient sa position.
   let prevTarget: Vec2 | null = null;
-  if (previous && previous.playerId === playerId && previous.chosen.action.type === 'move' && OFFBALL_INTENTS.has(previous.chosen.action.intent)
-    && state.time - previous.time < w.reexamineEvery && dist(previous.chosen.action.target, pos) > REACHED_DISTANCE) {
-    prevTarget = previous.chosen.action.target;
-    const kind: CandidateKind = previous.chosen.action.intent === 'run' ? 'run' : 'previous';
-    let dup = false;
-    for (const p of points) if (dist2(p.q, prevTarget) < 0.25) { p.kind = p.kind === 'stay' ? 'stay' : kind === 'run' ? 'run' : p.kind; dup = true; break; }
-    if (!dup) points.push({ q: clampToPitch(prevTarget, TARGET_MARGIN), kind });
+  let inheritedDeadline: number | undefined;
+  const prevAction = previous && previous.playerId === playerId ? previous.chosen.action : null;
+  if (prevAction && prevAction.type === 'move' && OFFBALL_INTENTS.has(prevAction.intent)
+    && previous!.committedUntil !== undefined && state.time < previous!.committedUntil) {
+    inheritedDeadline = previous!.committedUntil;
+    // Cible au poste (conservation de la structure) : elle suit le poste instancié, qui glisse continûment avec le ballon.
+    if (prevAction.intent === 'hold_shape' && dist(prevAction.target, slot) <= SLOT_TRACK_DISTANCE && dist(slot, pos) > REACHED_DISTANCE) {
+      prevTarget = slot;
+      for (const p of points) if (p.kind === 'slot') { p.kind = 'previous'; break; }
+    } else if (dist(prevAction.target, pos) <= REACHED_DISTANCE) prevTarget = points[0].q;
+    else {
+      prevTarget = prevAction.target;
+      const kind: CandidateKind = prevAction.intent === 'run' ? 'run' : 'previous';
+      let dup = false;
+      for (const p of points) if (dist2(p.q, prevTarget) < 0.25) { p.kind = p.kind === 'stay' ? 'stay' : kind === 'run' ? 'run' : p.kind; dup = true; break; }
+      if (!dup) points.push({ q: clampToPitch(prevTarget, TARGET_MARGIN), kind });
+    }
   }
 
   // --- 2. Évaluation ---
@@ -357,7 +382,7 @@ export function decideOffBall(input: DecisionInput, playerId: number, previous: 
       component('offside', LABELS.offside, off, -w.wOffside),
       component('run', LABELS.run, isRun ? 1 : 0, wRun),
     ];
-    if (prevTarget && pt.kind !== 'stay' && dist2(q, prevTarget) < 0.25) comps.push(component('hysteresis', LABELS.hysteresis, 1, w.hysteresis));
+    if (prevTarget && dist2(q, prevTarget) < 0.25) comps.push(component('hysteresis', LABELS.hysteresis, 1, w.hysteresis));
     const c = moveCandidate(q, 'hold_shape', 0, comps, '', {
       probability: pass.p,
       valueIfSuccess: threat,
@@ -373,25 +398,46 @@ export function decideOffBall(input: DecisionInput, playerId: number, previous: 
   const best = evaluated[0];
   const keptByHysteresis = !!prevTarget && best.c.components.some((c) => c.key === 'hysteresis');
   const intent = classifyIntent(best, stay, pos, ball, dir, slot);
-  const speed = intent === 'run' ? player.maxSpeed : Math.max(MIN_SPEED, player.maxSpeed * (SPEED_BASE + SPEED_TEMPO * tp.tempo));
+  const standDistance = w.standDistance ?? DEFAULT_STAND_DISTANCE;
 
   // Intentions, vitesses et raisons construites pour les seuls candidats conservés (coût maîtrisé, §7.1).
   const kept = evaluated.slice(0, KEPT_CANDIDATES);
   for (const e of kept) {
     const it = e === best ? intent : classifyIntent(e, stay, pos, ball, dir, slot);
-    const sp = it === 'run' ? player.maxSpeed : speed;
-    e.c.action = { type: 'move', target: e.c.action.type === 'move' ? e.c.action.target : e.q, intent: it, speed: sp };
+    const dTarget = dist(e.q, pos);
+    // Conservation de la structure à moins de standDistance : le joueur tient sa place (cible = position courante).
+    const target = it === 'hold_shape' && dTarget < standDistance ? { x: pos.x, y: pos.y } : e.c.action.type === 'move' ? e.c.action.target : e.q;
+    e.c.action = { type: 'move', target, intent: it, speed: offBallSpeed(player, it, dTarget, tp.tempo, params, e.kind === 'run') };
     e.c.reason = candidateReason(e.c, it, e.q, pos, ball, e.pPass);
   }
   const candidates = kept.map((e) => e.c);
   const explanation = explain(best.c, evaluated[1]?.c, intent, pos, ball, keptByHysteresis, ballDistPos);
-  return makeDecision(playerId, state.time, best.c, candidates, decisionContext(input, player), explanation, t0, { keptByHysteresis: keptByHysteresis || undefined });
+  // Engagement (§7.2) : une cible conservée hérite de son échéance, une nouvelle cible ouvre une fenêtre de reexamineEvery s.
+  const committedUntil = keptByHysteresis && inheritedDeadline !== undefined ? inheritedDeadline : state.time + w.reexamineEvery;
+  return makeDecision(playerId, state.time, best.c, candidates, decisionContext(input, player), explanation, t0, { keptByHysteresis: keptByHysteresis || undefined, committedUntil });
+}
+
+/**
+ * Vitesse de consigne (m/s) d'un déplacement sans ballon : appel derrière la ligne (`deepRun`) et réception = sprint ;
+ * sinon fraction `intentSpeed[intent]` de la vitesse de tempo v_max·(0,5 + 0,5·tempo) (1 pour un appel ordinaire devant
+ * le ballon), fraction qui tend linéairement vers 1 entre SPEED_FAR_START et SPEED_FAR_FULL m (une cible lointaine est une
+ * course, une cible proche un replacement), bornée par `minSpeed`.
+ */
+export function offBallSpeed(player: Player, intent: MoveIntent, distance: number, tempo: number, params: SimParams, deepRun = intent === 'run'): number {
+  if (deepRun || intent === 'receive') return player.maxSpeed;
+  const w = params.offBall;
+  const tempoSpeed = player.maxSpeed * (SPEED_BASE + SPEED_TEMPO * tempo);
+  const table = w.intentSpeed ?? DEFAULT_INTENT_SPEED;
+  const base = (table as Partial<Record<MoveIntent, number>>)[intent] ?? 1;
+  const far = Math.max(0, Math.min(1, (distance - SPEED_FAR_START) / (SPEED_FAR_FULL - SPEED_FAR_START)));
+  const factor = base + (1 - base) * far;
+  return Math.min(player.maxSpeed, Math.max(w.minSpeed ?? DEFAULT_MIN_SPEED, tempoSpeed * factor));
 }
 
 /** Décision « réception » : le receveur désigné court vers le point de rencontre avec le ballon. */
-export function decideReceive(input: DecisionInput, playerId: number): Decision {
+export function decideReceive(input: DecisionInput, playerId: number, previous: Decision | null = null): Decision {
   const player = getPlayer(input.state, playerId);
-  const target = receiveTarget(input.state, input.params, player);
+  const target = stableMeetingPoint(previous, 'receive', receiveTarget(input.state, input.params, player));
   return simpleMoveDecision(input, player, target, 'receive', player.maxSpeed, `Passe en cours vers ${player.name} : course au point de rencontre ${fmtPoint(target)}.`);
 }
 

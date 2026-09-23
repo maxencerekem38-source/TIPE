@@ -104,6 +104,37 @@ export function createSimulation(config: MatchConfig, options: SimulationOptions
   return sim;
 }
 
+/** Un dribble engagé est abandonné lorsque le porteur est à moins de cette distance (m) de sa cible. */
+const COMMIT_ARRIVAL = 1.5;
+
+/**
+ * Décision engagée du porteur (§6.4–6.5, `committedUntil`) : un dribble en cours n'est pas re-décidé tant que sa
+ * durée n'est pas écoulée, que le porteur a toujours le ballon et n'a pas atteint sa cible, hors gel de jeu.
+ * Les passes, tirs et dégagements libèrent le ballon et n'ont pas besoin d'engagement.
+ */
+function committedDecision(sim: EngineSimulation): Decision | null {
+  const state = sim.state;
+  const ownerId = state.ball.ownerId;
+  if (ownerId === null || isFrozen(state)) return null;
+  const prev = sim.decisions.get(ownerId);
+  if (!prev || prev.playerId !== ownerId || prev.committedUntil === undefined || prev.committedUntil <= state.time) return null;
+  if (prev.chosen.action.type !== 'dribble') return null;
+  const player = playerById(state, ownerId);
+  if (!player || !player.target) return null;
+  if (Math.hypot(player.target.x - player.pos.x, player.target.y - player.pos.y) <= COMMIT_ARRIVAL) return null;
+  return prev;
+}
+
+/** Politiques dont la décision du porteur est remplacée par sa décision engagée (aucun calcul pour lui). */
+function withCommitment(policies: Record<TeamId, PolicySet>, committed: Decision): Record<TeamId, PolicySet> {
+  const out = { ...policies };
+  for (const team of ['A', 'B'] as const) {
+    const base = policies[team];
+    out[team] = { ...base, onBall: (input, playerId, previous) => (playerId === committed.playerId ? committed : base.onBall(input, playerId, previous)) };
+  }
+  return out;
+}
+
 /** Un pas de simulation (§13.2). */
 function stepOnce(sim: EngineSimulation, options: StepOptions): void {
   const state = sim.state;
@@ -115,9 +146,15 @@ function stepOnce(sim: EngineSimulation, options: StepOptions): void {
   const kickoffFreeze = state.restart !== null && state.restart.kind === 'kickoff' && isFrozen(state);
   if (state.time >= sim.nextDecisionTime - 1e-9 && !kickoffFreeze) {
     const decide = options.decide ?? coordinator.decideAll;
-    const policies = options.policies ?? defaultPolicies();
+    const committed = committedDecision(sim);
+    let policies = options.policies ?? defaultPolicies();
+    if (committed) policies = withCommitment(policies, committed);
     const decisions = decide(state, params, policies, sim.decisions, sim.rng);
-    for (const [id, decision] of decisions) applyDecision(state, id, decision, params, sim.rng);
+    if (committed) decisions.set(committed.playerId, committed); // même si `decide` ignore les politiques
+    for (const [id, decision] of decisions) {
+      if (decision === committed) continue; // engagée : cible de course inchangée, pas de nouvelle comptabilité
+      applyDecision(state, id, decision, params, sim.rng);
+    }
     sim.decisions = decisions;
     sim.nextDecisionTime = state.time + params.decisionPeriod;
     options.onDecisions?.(decisions, state);
@@ -144,8 +181,13 @@ function applyDecision(state: MatchState, playerId: number, decision: Decision, 
   const s = state.stats[player.team];
   s.decisions++;
   s.decisionMs += Number.isFinite(decision.computeMs) ? decision.computeMs : 0;
-  if (decision.candidates.length > 0) s.regret += Math.max(0, decision.candidates[0].score - chosen.score);
-  if (executed && (action.type === 'pass' || action.type === 'clear')) {
+  // Regret (§11.1) : uniquement la décision du porteur (scores en buts) ; les tâches défensives sont des coûts en
+  // secondes et l'affectation collective s'écarte volontairement de l'optimum individuel.
+  if (action.type !== 'move') {
+    s.onBallDecisions = (s.onBallDecisions ?? 0) + 1;
+    if (decision.candidates.length > 0) s.regret += Math.max(0, decision.candidates[0].score - chosen.score);
+  }
+  if (executed && action.type === 'pass') {
     const fl = state.ball.flight;
     if (fl && fl.kickerId === playerId) fl.expectedP = chosen.probability;
   }

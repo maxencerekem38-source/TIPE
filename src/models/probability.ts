@@ -19,7 +19,7 @@ import { attackDir } from '../core/types';
 import type { InterceptionAnalysis } from './interception';
 import { analyseInterception, arrivalLogistic } from './interception';
 import { controlFor, pressureAt, pressureOn, minArrivalTime } from './fields';
-import { timeToArrive } from './motion';
+import { dribbleTime, timeToArrive } from './motion';
 import { isOffsidePosition } from './structure';
 
 export interface ProbabilityResult {
@@ -36,6 +36,8 @@ const DEFAULT_KEEPER_BODY_WIDTH = 1.8;
 const LOG_ZERO = Math.log(1e-6);
 /** Rayon (m) du dénombrement des adversaires proches pour la conservation (§5.5). */
 const HOLD_CLOSE_RADIUS = 2;
+/** Marge (s) accordée au receveur d'une passe en profondeur pour rattraper le ballon (repli si through.reachSlack est absent). */
+const DEFAULT_THROUGH_REACH_SLACK = 0.6;
 
 const feat = (key: string, label: string, value: number, weight: number, unit?: string): ScoreComponent => ({
   key, label, value, unit, weight, contribution: weight * value,
@@ -99,8 +101,12 @@ export function passProbability(state: MatchState, fields: FieldSet, passerId: n
 // ---------------------------------------------------------------------------
 /**
  * Passe en profondeur vers `targetPoint`, destinée à `receiverId` (course) :
- *   P = (1 − P_int) · logit⁻¹((min_j T_j(q) − T_k(q))/σ_T) · σ(1,8 − 0,03 d − 0,8 Π(b) + a·(passing − 0,5)) · 1[onside(k)],
+ *   P = (1 − P_int) · logit⁻¹((min_j T_j(q) − T_k(q))/σ_T) · logit⁻¹((T_b(q) + δ_reach − T_k(q))/σ_T)
+ *       · σ(1,8 − 0,03 d − 0,8 Π(b) + a·(passing − 0,5)) · 1[onside(k)],
  * s_arr = physics.throughArrivalSpeed ; hors-jeu évalué à la position du receveur au lancement (§3.4).
+ * Le facteur « receveur au rendez-vous » (δ_reach = through.reachSlack) exprime que le receveur doit rejoindre le
+ * ballon avant qu'il ne le dépasse : un ballon lancé pour arriver à 9 m/s continue sa course au-delà de q, et un
+ * receveur trop en retard le manque (passe « manquée » du moteur), même sans défenseur.
  */
 export function throughBallProbability(state: MatchState, fields: FieldSet, passerId: number, receiverId: number, targetPoint: Vec2, params: SimParams): ProbabilityResult {
   const passer = getPlayer(state, passerId);
@@ -120,6 +126,8 @@ export function throughBallProbability(state: MatchState, fields: FieldSet, pass
   }
   const lead = tOpp === Infinity ? 10 : tOpp - tReceiver;
   const first = arrivalLogistic(lead / Math.max(1e-6, m.arrivalSigma));
+  const reachLead = interception.travelTime + (c.reachSlack ?? DEFAULT_THROUGH_REACH_SLACK) - tReceiver;
+  const reach = Number.isFinite(reachLead) ? arrivalLogistic(reachLead / Math.max(1e-6, m.arrivalSigma)) : 1;
   const offside = isOffsidePosition(state, receiver.pos, team);
   const piBall = pressureAt(state, from, team, params);
   const skill = passer.attrs.passing - 0.5;
@@ -129,11 +137,12 @@ export function throughBallProbability(state: MatchState, fields: FieldSet, pass
     feat('passerPressure', 'Pression sur le passeur', piBall, c.passerPressure),
     feat('skill', 'Qualité de passe du joueur', skill, attrInfluence(params)),
     logFactor('receiverFirst', 'Avance du receveur sur le défenseur', lead, first, 's'),
+    logFactor('receiverReach', 'Receveur au rendez-vous avec le ballon', reachLead, reach, 's'),
     logFactor('interception', 'Risque d’interception', interception.pIntercept, 1 - interception.pIntercept),
     logFactor('offside', 'Receveur hors-jeu', offside ? 1 : 0, offside ? 0 : 1),
   ];
   const logit = c.base + c.distance * d + c.passerPressure * piBall + attrInfluence(params) * skill;
-  const p = offside ? 0 : (1 - interception.pIntercept) * first * sigmoid(logit);
+  const p = offside ? 0 : (1 - interception.pIntercept) * first * reach * sigmoid(logit);
   void fields;
   return { p, features, interception };
 }
@@ -143,9 +152,12 @@ export function throughBallProbability(state: MatchState, fields: FieldSet, pass
 // ---------------------------------------------------------------------------
 /**
  * Dribble du porteur `playerId` vers `targetPoint` (d ≤ 8 m en pratique) :
- *   P = σ(1,5 − 1,2 Π̄_path − 0,15 d + 0,8 (PC_att(q) − 0,5) + 1,0 tanh(min_j T_j(q) − d/v_drib) + a·(dribbling − 0,5)),
+ *   P = σ(1,5 − 1,2 Π̄_path − 0,15 d + 0,8 (PC_att(q) − 0,5) + 1,0 tanh(min_j T_j(q) − T_drib(q)) + a·(dribbling − 0,5)),
  * Π̄_path = moyenne de la pression sur M points du trajet (grille), PC_att(q) lu sur fields.controlA,
- * v_drib = dribbleSpeedFactor · v_max du joueur. Ancrages : 4 m libre ≈ 0,9 ; 4 m contesté ≈ 0,32.
+ * T_drib(q) = temps de conduite du ballon avec la même cinématique que les adversaires (`dribbleTime` : accélération
+ * bornée depuis la vitesse courante, plafond v_drib = dribbleSpeedFactor · v_max) — et non d/v_drib, qui accordait
+ * au porteur un départ lancé instantané alors que les défenseurs payaient réaction et accélération.
+ * Ancrages : 4 m libre ≈ 0,9 ; 4 m contesté ≈ 0,32.
  */
 export function dribbleProbability(state: MatchState, fields: FieldSet, playerId: number, targetPoint: Vec2, params: SimParams): ProbabilityResult {
   const player = getPlayer(state, playerId);
@@ -161,9 +173,9 @@ export function dribbleProbability(state: MatchState, fields: FieldSet, playerId
   }
   const piPath = piSum / M;
   const control = controlFor(fields, targetPoint, team);
-  const vDrib = params.physics.dribbleSpeedFactor * player.maxSpeed;
+  const tDrib = dribbleTime(from, player.vel, targetPoint, player.maxSpeed, player.maxAccel, params.physics);
   const tOpp = minArrivalTime(state, targetPoint, params, team === 'A' ? 'B' : 'A');
-  const raceMargin = (tOpp === Infinity ? 10 : tOpp) - d / vDrib;
+  const raceMargin = (tOpp === Infinity ? 10 : tOpp) - tDrib;
   const race = Math.tanh(raceMargin);
   const raceCoef = c.race ?? 1.0;
   const skill = player.attrs.dribbling - 0.5;

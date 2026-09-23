@@ -8,7 +8,7 @@
  * Chaque baseline réutilise FULL_POLICY pour les autres rôles. Les candidats restent triés par le score de
  * l'évaluation COMPLÈTE, de sorte que le regret (meilleur score − score de l'action choisie) est mesurable.
  */
-import type { Candidate, Decision, SimParams, TacticConfig } from '../core/types';
+import type { Candidate, Decision, SimParams, TacticConfig, TeamId } from '../core/types';
 import { attackDir } from '../core/types';
 import type { Rng } from '../core/rng';
 import { BALANCED_PARAMS } from '../tactics/styles';
@@ -73,7 +73,15 @@ const withParams = (input: DecisionInput, patch: (p: SimParams) => SimParams): D
 const withDecision = (input: DecisionInput, patch: Partial<SimParams['decision']>): DecisionInput =>
   withParams(input, (p) => ({ ...p, decision: { ...p.decision, ...patch } }));
 const neutralTactic = (t: TacticConfig): TacticConfig => ({ ...t, params: { ...BALANCED_PARAMS } });
-const withNeutralTactic = (input: DecisionInput): DecisionInput => ({ ...input, tactic: neutralTactic(input.tactic) });
+/**
+ * Tactique neutralisée pour `team` : `input.tactic` ET `state.tactics[team]` (lus par slotPosition / isRunner : largeur,
+ * compacité, hauteur de ligne), sur une copie superficielle de l'état — l'ablation B7 porte ainsi sur toute la géométrie.
+ */
+const withNeutralTactic = (input: DecisionInput, team: TeamId): DecisionInput => {
+  const tactic = neutralTactic(input.tactic);
+  return { ...input, tactic, state: { ...input.state, tactics: { ...input.state.tactics, [team]: tactic } } };
+};
+const teamOf = (input: DecisionInput, playerId: number): TeamId => input.state.players.find((p) => p.id === playerId)?.team ?? 'A';
 
 /** Politique du porteur qui remplace le choix final par `pick` (les candidats restent ceux de l'évaluation complète). */
 function selectionPolicy(name: string, pick: (candidates: Candidate[], input: DecisionInput) => Candidate): PolicySet['onBall'] {
@@ -117,9 +125,9 @@ export const BASELINES: Record<string, PolicySet> = {
   },
   no_tactic: {
     name: 'no_tactic',
-    onBall: (input, id, prev) => FULL_POLICY.onBall(withNeutralTactic(input), id, prev),
-    offBall: (input, id, prev) => FULL_POLICY.offBall(withNeutralTactic(input), id, prev),
-    defence: (input, team, prev) => FULL_POLICY.defence(withNeutralTactic(input), team, prev),
+    onBall: (input, id, prev) => FULL_POLICY.onBall(withNeutralTactic(input, teamOf(input, id)), id, prev),
+    offBall: (input, id, prev) => FULL_POLICY.offBall(withNeutralTactic(input, teamOf(input, id)), id, prev),
+    defence: (input, team, prev) => FULL_POLICY.defence(withNeutralTactic(input, team), team, prev),
   },
   nearest_man: {
     ...FULL_POLICY,
