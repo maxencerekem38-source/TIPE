@@ -153,8 +153,8 @@ export function holdCandidate(reason: string, components: ScoreComponent[] = [])
   return { action: { type: 'hold' }, score: sumContributions(components), probability: 1, valueIfSuccess: 0, valueIfFailure: 0, components, reason };
 }
 
-/** Contexte de décision d'un joueur : phase, tactique, pression subie, coéquipiers disponibles, supériorité locale au ballon. */
-export function decisionContext(input: DecisionInput, player: Player): DecisionContext {
+/** Contexte de décision d'un joueur : phase, tactique, pression subie, coéquipiers disponibles, supériorité locale au ballon (`superiority` si déjà calculée). */
+export function decisionContext(input: DecisionInput, player: Player, superiority?: number): DecisionContext {
   const { state, fields, params, tactic } = input;
   const team = player.team;
   let available = 0;
@@ -168,7 +168,7 @@ export function decisionContext(input: DecisionInput, player: Player): DecisionC
     formation: tactic.formation,
     pressure: Math.min(1, PRESSURE_SCALE * pressureOn(fields, player.pos, team)),
     availableTeammates: available,
-    localSuperiority: localSuperiority(state, state.ball.pos, team, params),
+    localSuperiority: superiority ?? localSuperiority(state, state.ball.pos, team, params),
   };
 }
 
