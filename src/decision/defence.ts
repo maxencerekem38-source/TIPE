@@ -19,7 +19,7 @@ import { PITCH, ownGoalCentre } from '../core/pitch';
 import { hungarian } from '../core/hungarian';
 import type { Candidate, Decision, MatchState, MoveIntent, Player, ScoreComponent, SimParams, TeamId } from '../core/types';
 import { attackDir, otherTeam } from '../core/types';
-import { dangerFor, pressureAt, threatFor } from '../models/fields';
+import { pressureAt, threatFor } from '../models/fields';
 import { analyseInterception } from '../models/interception';
 import { timeToArrive } from '../models/motion';
 import { getPlayer } from '../models/probability';
@@ -71,6 +71,8 @@ const ZONE_CLEAR = 6;
 const ZONE_SPACING = 8;
 const ZONE_MAX_X = 10;
 const ZONE_PRIORITY = 0.7;
+/** Taille du vivier de cellules candidates aux zones (× maxZoneTasks) avant application de l'espacement. */
+const ZONE_POOL_FACTOR = 4;
 /** Tolérance (s) pour qu'un défenseur puisse encore intercepter au point d'échantillonnage. */
 const INTERCEPT_SLACK = 0.2;
 const MAX_INTERCEPT_TASKS = 2;
@@ -287,37 +289,46 @@ export function generateTasks(input: DecisionInput, team: TeamId, defenders: rea
   }
 
   // --- Zones : cellules de plus grand danger adverse, hors voisinage des attaquants marqués et du ballon ---
+  // Sélection bornée (liste des ZONE_POOL meilleures cellules maintenue par insertion : pas de tri global de la grille).
   if (dw.maxZoneTasks > 0) {
     const field = opp === 'A' ? fields.dangerA : fields.dangerB;
     const src = field ?? fields.controlA;
-    const cells: { x: number; y: number; d: number }[] = [];
+    const pool = Math.max(dw.maxZoneTasks, ZONE_POOL_FACTOR * dw.maxZoneTasks);
+    const bestX = new Float64Array(pool), bestY = new Float64Array(pool), bestD = new Float64Array(pool);
+    let nBest = 0;
     const clear2 = ZONE_CLEAR * ZONE_CLEAR;
+    const cs = src.cellSize;
+    const iLo = dir > 0 ? 0 : Math.max(0, Math.ceil((-ZONE_MAX_X + PITCH.halfLength) / cs));
+    const iHi = dir > 0 ? Math.min(src.cols - 1, Math.floor((ZONE_MAX_X + PITCH.halfLength) / cs)) : src.cols - 1;
     for (let j = 0; j < src.rows; j++) {
       const y = src.yOf(j);
       if (Math.abs(y) > PITCH.halfWidth - TARGET_MARGIN) continue;
-      for (let i = 0; i < src.cols; i++) {
+      for (let i = iLo; i <= iHi; i++) {
+        const idx = j * src.cols + i;
+        const d = field ? field.data[idx] : src.data[idx];
+        if (d <= 0 || (nBest === pool && d <= bestD[nBest - 1])) continue;
         const x = src.xOf(i);
-        if (dir * x > ZONE_MAX_X || Math.abs(x) > PITCH.halfLength - TARGET_MARGIN) continue;
-        const q = { x, y };
-        if (dist2(q, ball.pos) < clear2) continue;
+        if (Math.abs(x) > PITCH.halfLength - TARGET_MARGIN) continue;
+        const bdx = x - ball.pos.x, bdy = y - ball.pos.y;
+        if (bdx * bdx + bdy * bdy < clear2) continue;
         let near = false;
-        for (const mpos of marked) if (dist2(q, mpos) < clear2) { near = true; break; }
+        for (const mpos of marked) { const mx = x - mpos.x, my = y - mpos.y; if (mx * mx + my * my < clear2) { near = true; break; } }
         if (near) continue;
-        const d = field ? field.data[j * src.cols + i] : dangerFor(fields, q, opp);
-        if (d > 0) cells.push({ x, y, d });
+        let k = nBest < pool ? nBest : pool - 1;
+        while (k > 0 && bestD[k - 1] < d) { bestX[k] = bestX[k - 1]; bestY[k] = bestY[k - 1]; bestD[k] = bestD[k - 1]; k--; }
+        bestX[k] = x; bestY[k] = y; bestD[k] = d;
+        if (nBest < pool) nBest++;
       }
     }
-    cells.sort((a, b) => b.d - a.d);
-    const dMax = cells.length ? cells[0].d : 1;
+    const dMax = nBest ? bestD[0] : 1;
     const chosen: { x: number; y: number }[] = [];
-    for (const c of cells) {
-      if (chosen.length >= dw.maxZoneTasks) break;
+    for (let k = 0; k < nBest && chosen.length < dw.maxZoneTasks; k++) {
+      const c = { x: bestX[k], y: bestY[k] };
       let ok = true;
       for (const z of chosen) if (dist2(z, c) < ZONE_SPACING * ZONE_SPACING) { ok = false; break; }
       if (!ok) continue;
       chosen.push(c);
-      const q = { x: c.x, y: c.y };
-      tasks.push({ kind: 'zone', point: q, priority: ZONE_PRIORITY * (c.d / dMax), key: zoneKey(q), label: `couvrir la zone ${fmtPoint(q)}` });
+      tasks.push({ kind: 'zone', point: c, priority: ZONE_PRIORITY * (bestD[k] / dMax), key: zoneKey(c), label: `couvrir la zone ${fmtPoint(c)}` });
     }
   }
 
@@ -339,29 +350,42 @@ export function generateTasks(input: DecisionInput, team: TeamId, defenders: rea
 interface CostBreakdown { cost: number; arrival: number; priority: number; shape: number; nu: number; changed: number; role: number; counter: number; infeasible: number; muPrio: number }
 
 /** Coût C_jt (§8.3) d'un défenseur pour une tâche, avec sa décomposition (score du candidat = −coût). */
-export function taskCost(input: DecisionInput, team: TeamId, defender: Player, slot: Vec2, task: DefenceTask, prevKey: string | null, info: PressingInfo, nearestToBall: readonly number[]): CostBreakdown {
+/** Données par défenseur, calculées une fois par cycle (poste, poids de structure, clé de la tâche précédente, contre-pressing). */
+export interface DefenderInfo { slot: Vec2; nu: number; prevKey: string | null; counterEligible: boolean }
+
+/** Prépare `DefenderInfo` : ν_shape ×2 pour un milieu défensif (§9.1) et ×2 pour un joueur devant le ballon en repli (§8.5). */
+export function defenderInfo(input: DecisionInput, team: TeamId, defender: Player, previous: Map<number, Decision>, info: PressingInfo, nearestToBall: readonly number[]): DefenderInfo {
+  const { state, params, tactic } = input;
+  const dir = attackDir(team);
+  const formationSlot = FORMATIONS[tactic.formation].slots[defender.slotIndex];
+  const isDM = !!formationSlot && /DM$/.test(formationSlot.label);
+  const retreat = state.phase[team] === 'transition_defence' && dir * defender.pos.x > dir * state.ball.pos.x;
+  return {
+    slot: slotPosition(state, defender),
+    nu: params.defence.nuShape * (isDM ? 2 : 1) * (retreat ? 2 : 1),
+    prevKey: previousTaskKey(previous.get(defender.id), defender.id),
+    counterEligible: info.counterPress && nearestToBall.includes(defender.id),
+  };
+}
+
+export function taskCost(input: DecisionInput, team: TeamId, defender: Player, di: DefenderInfo, task: DefenceTask): CostBreakdown {
   const { state, params, tactic } = input;
   const dw = params.defence;
-  const tp = tactic.params;
   const dir = attackDir(team);
   const T = timeToArrive(defender.pos, defender.vel, task.point, defender.maxSpeed, defender.maxAccel, params.models);
   const infeasible = (task.kind === 'recover' && task.ownerId !== defender.id)
     || (task.kind !== 'recover' && T > dw.maxTaskTime)
     || (task.kind === 'intercept' && task.ballTime !== undefined && T > task.ballTime + INTERCEPT_SLACK) ? 1 : 0;
-  const muPrio = dw.muPriority * (MU_BASE + tp.pressIntensity);
-  const formationSlot = FORMATIONS[tactic.formation].slots[defender.slotIndex];
-  const isDM = !!formationSlot && /DM$/.test(formationSlot.label);
-  const retreat = state.phase[team] === 'transition_defence' && dir * defender.pos.x > dir * state.ball.pos.x;
-  const nu = dw.nuShape * (isDM ? 2 : 1) * (retreat ? 2 : 1);
-  const shape = dist(task.point, slot) / PITCH.length;
-  const changed = prevKey !== task.key ? 1 : 0;
+  const muPrio = dw.muPriority * (MU_BASE + tactic.params.pressIntensity);
+  const shape = dist(task.point, di.slot) / PITCH.length;
+  const changed = di.prevKey !== task.key ? 1 : 0;
   let role = 0;
   if (defender.role === 'DF' && (task.kind === 'press' || task.kind === 'contain') && dir * task.point.x > 0) role = DF_PRESS_ROLE;
   if (defender.role === 'FW' && task.kind === 'mark' && dir * task.point.x < DEEP_MARK_X) role = FW_MARK_ROLE;
-  const counter = info.counterPress && nearestToBall.includes(defender.id)
+  const counter = di.counterEligible
     && (task.kind === 'press' || task.kind === 'contain' || (task.kind === 'zone' && dist(task.point, state.ball.pos) < COUNTER_PRESS_RADIUS)) ? 1 : 0;
-  const cost = T - muPrio * task.priority + nu * shape + dw.xiHysteresis * changed + dw.muRole * role - muPrio * COUNTER_PRESS_BOOST * counter + INFEASIBLE_COST * infeasible;
-  return { cost, arrival: T, priority: task.priority, shape, nu, changed, role, counter, infeasible, muPrio };
+  const cost = T - muPrio * task.priority + di.nu * shape + dw.xiHysteresis * changed + dw.muRole * role - muPrio * COUNTER_PRESS_BOOST * counter + INFEASIBLE_COST * infeasible;
+  return { cost, arrival: T, priority: task.priority, shape, nu: di.nu, changed, role, counter, infeasible, muPrio };
 }
 
 /** Composantes nommées d'un coût (Σ contributions = −coût). */
@@ -426,9 +450,9 @@ export function decideDefence(input: DecisionInput, team: TeamId, previous: Map<
   if (defenders.length > 0) {
     const { tasks, info, nearestToBall } = generateTasks(input, team, defenders);
     const superiority = localSuperiority(state, state.ball.pos, team, params);
-    const slots = defenders.map((d) => slotPosition(state, d));
-    const prevKeys = defenders.map((d) => previousTaskKey(previous.get(d.id), d.id));
-    const breakdown: CostBreakdown[][] = defenders.map((d, j) => tasks.map((t) => taskCost(input, team, d, slots[j], t, prevKeys[j], info, nearestToBall)));
+    const infos = defenders.map((d) => defenderInfo(input, team, d, previous, info, nearestToBall));
+    const prevKeys = infos.map((di) => di.prevKey);
+    const breakdown: CostBreakdown[][] = defenders.map((d, j) => tasks.map((t) => taskCost(input, team, d, infos[j], t)));
     const cost = breakdown.map((row) => row.map((b) => b.cost));
 
     let assignment = options.greedy ? greedyAssignment(cost, tasks) : hungarian(cost).assignment;

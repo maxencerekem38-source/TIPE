@@ -56,7 +56,7 @@ function optimalBlock(d: Decision, numberOf: (id: number) => string): HTMLElemen
     el('div', { class: 'kv' }, el('span', { class: 'k' }, 'ACTION OPTIMALE :'), el('span', { class: 'v accent' }, actionLabel(c.action).toUpperCase())),
     el('div', { class: 'kv' }, el('span', { class: 'k' }, 'CIBLE :'), el('span', { class: 'v' }, actionTargetLabel(c.action, numberOf).toUpperCase())),
     el('div', { class: 'kv kv-2' },
-      el('span', {}, el('span', { class: 'k' }, 'SCORE : '), el('span', { class: 'v mono' }, fmtNumber(c.score, 2))),
+      el('span', {}, el('span', { class: 'k' }, 'SCORE : '), el('span', { class: 'v mono' }, fmtNumber(c.score, 3))),
       el('span', {}, el('span', { class: 'k' }, 'PROBABILITÉ : '), el('span', { class: 'v mono' }, fmtPercent(c.probability))),
     ),
     el('div', { class: 'kv' }, el('span', { class: 'k' }, 'RAISON :'), el('span', { class: 'v reason' }, c.reason)),
@@ -64,8 +64,8 @@ function optimalBlock(d: Decision, numberOf: (id: number) => string): HTMLElemen
   if (d.keptByHysteresis) rows.push(el('div', { class: 'tag tag-info' }, 'Intention conservée par hystérésis'));
   if (d.game) {
     const g = d.game;
-    rows.push(el('div', { class: 'tag tag-info', title: `Matrice : [[${g.matrix[0].map((x) => fmtNumber(x, 2)).join(' ; ')}] ; [${g.matrix[1].map((x) => fmtNumber(x, 2)).join(' ; ')}]]` },
-      `Jeu 2×2 résolu : ${g.pure ? 'stratégie pure' : `stratégie mixte (π₁ = ${fmtNumber(g.pi1, 2)})`}, valeur ${fmtNumber(g.value, 2)}`));
+    rows.push(el('div', { class: 'tag tag-info', title: `Matrice : [[${g.matrix[0].map((x) => fmtNumber(x, 3)).join(' ; ')}] ; [${g.matrix[1].map((x) => fmtNumber(x, 3)).join(' ; ')}]]` },
+      `Jeu 2×2 résolu : ${g.pure ? 'stratégie pure' : `stratégie mixte (π₁ = ${fmtNumber(g.pi1, 2)})`}, valeur ${fmtNumber(g.value, 3)}`));
   }
   return el('div', { class: 'optimal' }, ...rows);
 }
@@ -95,7 +95,7 @@ function comparison(d: Decision, app: AppState, numberOf: (id: number) => string
         el('span', { class: 'cand-target muted' }, actionTargetLabel(c.action, numberOf)),
       ),
       scoreBar(c.score, maxAbs),
-      el('span', { class: 'cand-score mono' }, fmtNumber(c.score, 2)),
+      el('span', { class: 'cand-score mono' }, fmtNumber(c.score, 3)),
       el('span', { class: 'cand-prob mono muted' }, fmtPercent(c.probability)),
       el('span', { class: 'cand-chevron' }, expanded ? '▾' : '▸'),
     );
@@ -133,7 +133,7 @@ function breakdown(c: Candidate): HTMLElement {
   const cost = P * Vp - (1 - P) * Vm - c.score;
   const extra: HTMLElement[] = [];
   if (c.duration !== undefined) extra.push(el('span', { class: 'tag' }, `durée ${fmtNumber(c.duration, 1)} s`));
-  if (c.response) extra.push(el('span', { class: 'tag' }, `réponse adverse : ${RESPONSE_LABELS[c.response.kind] ?? c.response.kind} (Δ ${fmtNumber(c.response.delta, 2, true)})`));
+  if (c.response) extra.push(el('span', { class: 'tag' }, `réponse adverse : ${RESPONSE_LABELS[c.response.kind] ?? c.response.kind} (Δ ${fmtNumber(c.response.delta, 3, true)})`));
   if (c.threats?.length) extra.push(el('span', { class: 'tag tag-warn' }, `${c.threats.length} menace${c.threats.length > 1 ? 's' : ''} d’interception`));
   return el('div', { class: 'breakdown' },
     el('div', { class: 'breakdown-title' }, 'Décomposition du score'),
@@ -143,11 +143,11 @@ function breakdown(c: Candidate): HTMLElement {
     ...rows,
     el('div', { class: 'formula mono' },
       el('div', {}, 'Score = P·V⁺ − (1−P)·V⁻ − C'),
-      el('div', { class: 'muted' }, `${fmtNumber(c.score, 3)} = ${fmtNumber(P, 2)} × ${fmtNumber(Vp, 2)} − ${fmtNumber(1 - P, 2)} × ${fmtNumber(Vm, 2)} − ${fmtNumber(Math.max(0, cost), 3)}`),
+      el('div', { class: 'muted' }, `${fmtNumber(c.score, 3)} = ${fmtNumber(P, 2)} × ${fmtNumber(Vp, 3)} − ${fmtNumber(1 - P, 2)} × ${fmtNumber(Vm, 3)} − ${fmtNumber(Math.max(0, cost), 3)}`),
     ),
     el('div', { class: 'kv-inline' },
-      el('span', {}, el('span', { class: 'muted' }, 'V⁺ (succès) '), el('span', { class: 'mono' }, fmtNumber(Vp, 2))),
-      el('span', {}, el('span', { class: 'muted' }, 'V⁻ (échec) '), el('span', { class: 'mono' }, fmtNumber(Vm, 2))),
+      el('span', {}, el('span', { class: 'muted' }, 'V⁺ (succès) '), el('span', { class: 'mono' }, fmtNumber(Vp, 3))),
+      el('span', {}, el('span', { class: 'muted' }, 'V⁻ (échec) '), el('span', { class: 'mono' }, fmtNumber(Vm, 3))),
     ),
     extra.length ? el('div', { class: 'tags' }, ...extra) : null,
     el('div', { class: 'small reason-line' }, c.reason),

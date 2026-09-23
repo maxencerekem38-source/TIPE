@@ -8,19 +8,13 @@ import { makeTactic } from '@/tactics/styles';
 import type { Vec2 } from '@/core/vec2';
 import type { Simulation } from '@/engine/loop';
 import { createSimulation } from '@/engine/loop';
-import { createMockSimulation } from './mock';
 
 /**
  * Fabrique de simulation : moteur réel, sinon simulation factice (mode démo).
  * POUR RETIRER LE MODE DÉMO : remplacer le corps par `return { sim: createSimulation(config), demo: false };`.
  */
 function createSimulationSafe(config: MatchConfig): { sim: Simulation; demo: boolean } {
-  try {
-    return { sim: createSimulation(config), demo: false };
-  } catch (err) {
-    console.warn('[UI] Moteur non chargé, bascule en mode démo :', (err as Error).message);
-    return { sim: createMockSimulation(config), demo: true };
-  }
+  return { sim: createSimulation(config), demo: false };
 }
 
 export const OVERLAY_IDS = ['control', 'threat', 'pressure', 'spaces', 'passLines', 'trajectories', 'moves', 'defence', 'labels'] as const;

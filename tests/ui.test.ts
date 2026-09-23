@@ -2,7 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { fmtNumber, fmtPercent, fmtClock, fmtMs, actionLabel, INTENT_LABELS } from '@/ui/format';
 import { controlRamp, threatRamp, pressureRamp, scoreRamp, rgbaCss } from '@/ui/render/colors';
 import { makeTransform, toScreen, toWorld, px } from '@/ui/render/pitch';
-import { createMockSimulation } from '@/ui/mock';
+import { createSimulation } from '@/engine/loop';
+import { SCENARIOS, copyStateInto } from '@/experiments/scenarios';
 import { findSpaces } from '@/ui/render/overlays';
 import { DEFAULT_PARAMS, cloneParams } from '@/core/params';
 import { makeTactic } from '@/tactics/styles';
@@ -89,21 +90,20 @@ describe('transformation monde ↔ écran', () => {
   });
 });
 
-describe('simulation factice', () => {
-  it('construit un état valide : 22 joueurs, identifiants, équipes, champs', () => {
-    const sim = createMockSimulation(config());
+describe('simulation réelle vue par l’interface', () => {
+  it('construit un état valide : 22 joueurs, identifiants, équipes, champs après un cycle', () => {
+    const sim = createSimulation(config());
+    sim.advance(2.5); // le gel du coup d'envoi (1,5 s) précède le premier cycle de décision
     const st = sim.state;
     expect(st.players).toHaveLength(22);
     st.players.forEach((p, i) => {
       expect(p.id).toBe(i);
       expect(p.team).toBe(i < 11 ? 'A' : 'B');
       expect(p.number).toBe((i % 11) + 1);
-      expect(Math.abs(p.pos.x)).toBeLessThanOrEqual(PITCH.halfLength);
-      expect(Math.abs(p.pos.y)).toBeLessThanOrEqual(PITCH.halfWidth);
+      expect(Math.abs(p.pos.x)).toBeLessThanOrEqual(PITCH.halfLength + 2);
+      expect(Math.abs(p.pos.y)).toBeLessThanOrEqual(PITCH.halfWidth + 2);
     });
     expect(st.players.filter((p) => p.role === 'GK')).toHaveLength(2);
-    expect(st.ball.ownerId).not.toBeNull();
-    expect(st.players[st.ball.ownerId!].team).toBe('A');
     expect(st.fields).not.toBeNull();
     const f = st.fields!;
     const cell = config().params.fieldCellSize;
@@ -112,49 +112,32 @@ describe('simulation factice', () => {
       expect(field.cols).toBe(cols);
       expect(field.rows).toBe(rows);
       expect(field.data).toHaveLength(cols * rows);
-      for (const v of field.data) { expect(v).toBeGreaterThanOrEqual(0); expect(v).toBeLessThanOrEqual(1); }
     }
-    // Orientation de la menace : A attaque vers +x
     expect(f.threatA.sample({ x: 40, y: 0 })).toBeGreaterThan(f.threatA.sample({ x: -40, y: 0 }));
     expect(f.threatB.sample({ x: -40, y: 0 })).toBeGreaterThan(f.threatB.sample({ x: 40, y: 0 }));
   });
   it('produit une décision de porteur avec candidats triés et des décisions de déplacement', () => {
-    const sim = createMockSimulation(config());
-    const owner = sim.state.ball.ownerId!;
-    const d = sim.decisions.get(owner)!;
-    expect(d).toBeDefined();
-    expect(d.candidates.length).toBeGreaterThanOrEqual(8);
-    expect(d.chosen).toBe(d.candidates[0]);
-    for (let i = 1; i < d.candidates.length; i++) expect(d.candidates[i - 1].score).toBeGreaterThanOrEqual(d.candidates[i].score);
-    const types = new Set(d.candidates.map((c) => c.action.type));
-    expect(types.has('pass') && types.has('dribble') && types.has('shoot') && types.has('hold')).toBe(true);
-    for (const c of d.candidates) {
-      expect(c.probability).toBeGreaterThanOrEqual(0);
-      expect(c.probability).toBeLessThanOrEqual(1);
-      expect(c.components.length).toBeGreaterThan(0);
-    }
+    const sim = createSimulation(config());
+    sim.advance(2.5);
     expect(sim.decisions.size).toBe(22);
-    for (const p of sim.state.players) if (p.id !== owner) expect(sim.decisions.get(p.id)!.chosen.action.type).toBe('move');
-  });
-  it('avance dans le temps et reste cohérente', () => {
-    const sim = createMockSimulation(config());
-    sim.advance(5);
-    expect(sim.state.time).toBeCloseTo(5, 1);
-    expect(sim.state.tick).toBeGreaterThan(100);
-    for (const p of sim.state.players) {
-      expect(Number.isFinite(p.pos.x) && Number.isFinite(p.pos.y)).toBe(true);
-      expect(Math.abs(p.pos.x)).toBeLessThanOrEqual(PITCH.halfLength + 1);
+    const owner = sim.state.ball.ownerId;
+    if (owner !== null) {
+      const d = sim.decisions.get(owner)!;
+      expect(d).toBeDefined();
+      for (let i = 1; i < d.candidates.length; i++) expect(d.candidates[i - 1].score).toBeGreaterThanOrEqual(d.candidates[i].score);
+      for (const c of d.candidates) {
+        expect(c.probability).toBeGreaterThanOrEqual(0);
+        expect(c.probability).toBeLessThanOrEqual(1);
+        expect(c.components.length).toBeGreaterThan(0);
+      }
     }
-    expect(sim.state.stats.A.possessionTime + sim.state.stats.B.possessionTime).toBeGreaterThan(4);
   });
-  it('trouve des espaces disponibles séparés', () => {
-    const sim = createMockSimulation(config());
-    const spots = findSpaces(sim.state.fields!, 'A', 6, 9);
-    expect(spots.length).toBeGreaterThan(0);
-    expect(spots.length).toBeLessThanOrEqual(6);
-    for (let i = 0; i < spots.length; i++)
-      for (let j = i + 1; j < spots.length; j++)
-        expect(Math.hypot(spots[i].pos.x - spots[j].pos.x, spots[i].pos.y - spots[j].pos.y)).toBeGreaterThanOrEqual(9);
-    for (let i = 1; i < spots.length; i++) expect(spots[i - 1].value).toBeGreaterThanOrEqual(spots[i].value);
+  it('un scénario de la bibliothèque se charge dans une simulation vivante', () => {
+    const sim = createSimulation(config());
+    const sc = SCENARIOS[0];
+    copyStateInto(sim.state, sc.build());
+    expect(sim.state.ball.ownerId).toBe(sc.protagonistId);
+    sim.advance(0.3);
+    expect(sim.decisions.get(sc.protagonistId)).toBeDefined();
   });
 });

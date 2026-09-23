@@ -371,19 +371,21 @@ export function decideOffBall(input: DecisionInput, playerId: number, previous: 
   evaluated.sort((a, b) => b.c.score - a.c.score);
   const stay = evaluated.find((e) => e.kind === 'stay')!;
   const best = evaluated[0];
-  const kept = !!prevTarget && best.c.components.some((c) => c.key === 'hysteresis');
+  const keptByHysteresis = !!prevTarget && best.c.components.some((c) => c.key === 'hysteresis');
   const intent = classifyIntent(best, stay, pos, ball, dir, slot);
   const speed = intent === 'run' ? player.maxSpeed : Math.max(MIN_SPEED, player.maxSpeed * (SPEED_BASE + SPEED_TEMPO * tp.tempo));
 
-  for (const e of evaluated) {
+  // Intentions, vitesses et raisons construites pour les seuls candidats conservés (coût maîtrisé, §7.1).
+  const kept = evaluated.slice(0, KEPT_CANDIDATES);
+  for (const e of kept) {
     const it = e === best ? intent : classifyIntent(e, stay, pos, ball, dir, slot);
     const sp = it === 'run' ? player.maxSpeed : speed;
     e.c.action = { type: 'move', target: e.c.action.type === 'move' ? e.c.action.target : e.q, intent: it, speed: sp };
     e.c.reason = candidateReason(e.c, it, e.q, pos, ball, e.pPass);
   }
-  const candidates = evaluated.slice(0, KEPT_CANDIDATES).map((e) => e.c);
-  const explanation = explain(best.c, evaluated[1]?.c, intent, pos, ball, kept, ballDistPos);
-  return makeDecision(playerId, state.time, best.c, candidates, decisionContext(input, player), explanation, t0, { keptByHysteresis: kept || undefined });
+  const candidates = kept.map((e) => e.c);
+  const explanation = explain(best.c, evaluated[1]?.c, intent, pos, ball, keptByHysteresis, ballDistPos);
+  return makeDecision(playerId, state.time, best.c, candidates, decisionContext(input, player), explanation, t0, { keptByHysteresis: keptByHysteresis || undefined });
 }
 
 /** Décision « réception » : le receveur désigné court vers le point de rencontre avec le ballon. */

@@ -19,7 +19,7 @@ export const BUILTIN_SCENARIOS: Scenario[] = [
 export function createScenariosPanel(app: AppState): HTMLElement {
   const list = el('div', { class: 'scenario-list' });
   const root = el('div', { class: 'panel scenarios-panel' },
-    el('p', { class: 'help' }, 'Situations de jeu prédéfinies pour illustrer les décisions (attaque placée, contre, bloc bas, coup de pied arrêté…). D’autres scénarios seront chargés depuis le banc d’expériences.'),
+    el('p', { class: 'help' }, 'Situations de jeu prédéfinies (bibliothèque du banc d’expériences) : chaque scénario place les 22 joueurs et le ballon, sélectionne le protagoniste et affiche sa décision. Lancez la lecture pour voir la suite.'),
     list,
   );
   let n = -1;
@@ -31,7 +31,7 @@ export function createScenariosPanel(app: AppState): HTMLElement {
         el('span', { class: 'scenario-name' }, s.name),
         el('span', { class: 'scenario-desc' }, s.description),
       ),
-    ), el('div', { class: 'placeholder' }, 'Emplacement réservé : la liste s’étendra automatiquement avec les scénarios enregistrés (registerScenario).'));
+    ));
   };
   app.on('ui', refresh);
   refresh();

@@ -497,7 +497,9 @@ describe.skipIf(!simReady)(`exécution avec le moteur de simulation ${skipSim}`,
     const r1 = runMatch(cfg, undefined, { decide: makeDummyDecide(), collectEvents: true });
     const r2 = runMatch(cfg, undefined, { decide: makeDummyDecide(), collectEvents: true });
     expect(r1.score).toEqual(r2.score);
-    expect(r1.stats).toEqual(r2.stats);
+    // decisionMs est un temps de calcul (non déterministe par construction) : on l'exclut de la comparaison.
+    const strip = (st: typeof r1.stats) => ({ A: { ...st.A, decisionMs: 0 }, B: { ...st.B, decisionMs: 0 } });
+    expect(strip(r1.stats)).toEqual(strip(r2.stats));
     expect(r1.events).toBe(r2.events);
     expect(r1.eventLog!.map((e) => [e.time, e.kind, e.team])).toEqual(r2.eventLog!.map((e) => [e.time, e.kind, e.team]));
     expect(r1.durationSec).toBe(20);
@@ -554,7 +556,9 @@ describe.skipIf(!engineReady)(`exécution avec l’algorithme de décision compl
     const cfg = makeConfig({ seed: 11, durationSec: 30 });
     const r1 = runMatch(cfg), r2 = runMatch(cfg);
     expect(r1.score).toEqual(r2.score);
-    expect(r1.stats).toEqual(r2.stats);
+    // decisionMs est un temps de calcul (non déterministe par construction) : on l'exclut de la comparaison.
+    const strip = (st: typeof r1.stats) => ({ A: { ...st.A, decisionMs: 0 }, B: { ...st.B, decisionMs: 0 } });
+    expect(strip(r1.stats)).toEqual(strip(r2.stats));
     expect(r1.stats.A.decisions).toBeGreaterThan(0);
     expect(r1.latency!.p99).toBeGreaterThan(0);
   }, 60000);

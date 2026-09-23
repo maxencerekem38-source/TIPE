@@ -13,6 +13,8 @@ import { createParamsPanel } from './panels/params';
 import { createStatsPanel } from './panels/stats';
 import { createLogPanel } from './panels/log';
 import { BUILTIN_SCENARIOS, createScenariosPanel } from './panels/scenarios';
+import { SCENARIOS, SCENARIO_CATEGORIES, copyStateInto } from '@/experiments/scenarios';
+import { emptyStats } from '@/core/state-builder';
 
 const TABS = [
   { id: 'decision', label: 'Décision' },
@@ -29,6 +31,25 @@ function boot(): void {
   if (!rootEl) throw new Error('Élément #app introuvable');
   const app = new AppState();
   for (const s of BUILTIN_SCENARIOS) app.registerScenario(s);
+  // Bibliothèque de scénarios du banc d'expériences (src/experiments/scenarios.ts), groupée par catégorie.
+  for (const s of SCENARIOS) {
+    app.registerScenario({
+      id: s.id,
+      name: `${SCENARIO_CATEGORIES[s.category]} — ${s.name}`,
+      description: s.description,
+      apply: (a) => {
+        a.pause();
+        const live = a.sim.state;
+        copyStateInto(live, s.build());
+        live.stats = emptyStats();
+        live.score = { A: 0, B: 0 };
+        live.events.length = 0;
+        a.sim.decisions.clear();
+        a.selectPlayer(s.protagonistId);
+        a.step();
+      },
+    });
+  }
 
   const stage = el('main', { class: 'stage' });
   const sidebar = el('aside', { class: 'sidebar' });
