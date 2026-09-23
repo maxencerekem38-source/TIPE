@@ -264,6 +264,7 @@ export class AppState {
   /**
    * À appeler à chaque image avec le temps réel écoulé (s). Fait avancer la simulation de
    * dt·vitesse par seconde réelle, par pas fixes, avec un rattrapage borné à 0,25 s.
+   * Retourne vrai si la simulation a avancé (l'appelant émet alors « sim » à cadence limitée).
    */
   update(realDt: number): boolean {
     this.trackFps(realDt);
@@ -277,10 +278,7 @@ export class AppState {
       advanced = true;
       this.recordTrail();
     }
-    if (advanced) {
-      this.afterAdvance();
-      this.emit('sim');
-    }
+    if (advanced) this.afterAdvance();
     return advanced;
   }
 

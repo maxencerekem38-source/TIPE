@@ -7,9 +7,11 @@ import { el } from '../dom';
 import { fmtClock, fmtMs, PHASE_LABELS } from '../format';
 
 export function createTopbar(app: AppState, onToggleSidebar: () => void): HTMLElement {
-  const playBtn = el('button', { class: 'btn btn-primary', title: 'Lecture / pause (Espace)', onClick: () => app.toggle() }, '▶ Lecture');
-  const stepBtn = el('button', { class: 'btn', title: 'Avancer d’un cycle de décision (N)', onClick: () => app.step() }, '⏭ Pas');
-  const resetBtn = el('button', { class: 'btn', title: 'Réinitialiser (R)', onClick: () => app.reset() }, '↺ Réinitialiser');
+  const playIcon = el('span', { class: 'btn-icon-glyph', text: '▶' });
+  const playLabel = el('span', { class: 'btn-label', text: 'Lecture' });
+  const playBtn = el('button', { class: 'btn btn-primary', title: 'Lecture / pause (Espace)', onClick: () => app.toggle() }, playIcon, playLabel);
+  const stepBtn = el('button', { class: 'btn', title: 'Avancer d’un cycle de décision (N)', onClick: () => app.step() }, el('span', { class: 'btn-icon-glyph', text: '⏭' }), el('span', { class: 'btn-label', text: 'Pas' }));
+  const resetBtn = el('button', { class: 'btn', title: 'Réinitialiser (R)', onClick: () => app.reset() }, el('span', { class: 'btn-icon-glyph', text: '↺' }), el('span', { class: 'btn-label', text: 'Réinitialiser' }));
   const speedBtns = SPEEDS.map((s) =>
     el('button', { class: 'seg-btn', 'data-speed': s, title: `Vitesse ×${s}`, onClick: () => app.setSpeed(s) }, `×${String(s).replace('.', ',')}`),
   );
@@ -21,12 +23,13 @@ export function createTopbar(app: AppState, onToggleSidebar: () => void): HTMLEl
   const phaseA = el('span', { class: 'phase-badge team-a', text: '' });
   const phaseB = el('span', { class: 'phase-badge team-b', text: '' });
   const perf = el('span', { class: 'perf', title: 'Images par seconde · latence moyenne de décision' }, '— fps');
-  const demo = el('span', { class: 'demo-badge', text: 'MODE DÉMO (moteur non chargé)', style: 'display:none' });
+  const demo = el('span', { class: 'demo-badge', title: 'Mode démo : le moteur de simulation n’est pas chargé, une simulation factice anime l’interface.', style: 'display:none' },
+    'MODE DÉMO', el('span', { class: 'demo-long', text: ' (moteur non chargé)' }));
   const toggleBtn = el('button', { class: 'btn btn-icon', title: 'Afficher / masquer le panneau latéral', onClick: onToggleSidebar }, '☰');
 
   const root = el('header', { class: 'topbar' },
     el('div', { class: 'topbar-left' },
-      el('h1', { class: 'title' }, el('span', { class: 'title-icon', 'aria-hidden': 'true' }, '⚽'), 'Décision tactique — Simulation football'),
+      el('h1', { class: 'title', title: 'Décision tactique — Simulation football' }, el('span', { class: 'title-icon', 'aria-hidden': 'true' }, '⚽'), 'Décision tactique', el('span', { class: 'title-sub' }, ' — Simulation football')),
       demo,
     ),
     el('div', { class: 'topbar-center' },
@@ -44,7 +47,8 @@ export function createTopbar(app: AppState, onToggleSidebar: () => void): HTMLEl
 
   const refresh = (): void => {
     const st = app.state;
-    playBtn.textContent = app.running ? '⏸ Pause' : '▶ Lecture';
+    playIcon.textContent = app.running ? '⏸' : '▶';
+    playLabel.textContent = app.running ? 'Pause' : 'Lecture';
     playBtn.classList.toggle('active', app.running);
     for (const b of speedBtns) b.classList.toggle('active', Number(b.dataset.speed) === app.speed);
     clock.textContent = fmtClock(st.time);

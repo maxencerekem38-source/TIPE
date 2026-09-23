@@ -138,6 +138,12 @@ export interface Player {
   lastDecisionTime: number;
   /** Instant de la dernière touche de balle (contrôle du rythme des actions). */
   lastKickTime: number;
+  /** (moteur) Instant de début du dernier dribble — « dribble réussi » si le ballon est conservé 1,5 s après. */
+  lastDribbleStart?: number;
+  /** (moteur) Défenseur « passé » : immobile et sans nouveau duel jusqu'à cet instant. */
+  beatenUntil?: number;
+  /** (moteur) Instant du dernier duel engagé par ce joueur (au plus un duel par `physics.duelCooldown`). */
+  lastDuelTime?: number;
 }
 
 export type BallFlightKind = 'pass' | 'through' | 'lob' | 'shot' | 'clearance' | 'loose';
@@ -152,6 +158,14 @@ export interface BallFlight {
   origin: Vec2;
   startTime: number;
   initialSpeed: number;
+  /** (moteur) Issue d'un tir tirée au moment de la frappe (§3.3 : la physique rend l'animation cohérente). */
+  outcome?: 'goal' | 'save' | 'miss';
+  /** (moteur) Tir cadré : la trajectoire passe entre les poteaux, sous la barre. */
+  onTarget?: boolean;
+  /** (moteur) Receveur en position de hors-jeu au lancement de la passe (sifflé à la réception). */
+  receiverOffside?: boolean;
+  /** (moteur) Probabilité de réussite estimée par la couche décision (calibration §11.6). */
+  expectedP?: number;
 }
 
 export interface Ball {
@@ -294,6 +308,17 @@ export interface FieldSet {
   /** Pression exercée par l'équipe A (resp. B) en chaque point (0..1). */
   pressureByA: ScalarField;
   pressureByB: ScalarField;
+  // --- Champs optionnels ajoutés par src/models/fields.ts (append-only) ---
+  /** Temps d'arrivée T_i(q) de chaque joueur (s), indexé comme `state.players`. */
+  arrivalTime?: ScalarField[];
+  /** Identifiant du joueur au plus petit temps d'arrivée en chaque cellule (−1 si aucun) — « espace disponible » §4.5. */
+  argminPlayer?: Int16Array;
+  /** Danger D = xT · PC_att pour A (attaque vers +x) et pour B (attaque vers −x). */
+  dangerA?: ScalarField;
+  dangerB?: ScalarField;
+  /** Exposition E = Σ D Δ² / (L·W) : danger créé par A (subi par la défense de B) et réciproquement. */
+  exposureA?: number;
+  exposureB?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -307,11 +332,14 @@ export interface Restart {
   pos: Vec2;
   /** Instant de reprise (le jeu est gelé jusque-là). */
   resumeAt: number;
+  /** (moteur) Coup d'envoi après un but : les joueurs rejoignent leurs postes pendant le gel, puis sont replacés exactement à la reprise. */
+  resetOnResume?: boolean;
 }
 
 export type MatchEventKind =
   | 'goal' | 'shot' | 'pass' | 'pass_complete' | 'pass_intercepted' | 'pass_failed'
-  | 'dribble' | 'dribble_failed' | 'tackle' | 'turnover' | 'out' | 'restart' | 'save' | 'possession_change';
+  | 'dribble' | 'dribble_failed' | 'tackle' | 'turnover' | 'out' | 'restart' | 'save' | 'possession_change'
+  | 'offside';
 
 export interface MatchEvent {
   time: number;
@@ -396,12 +424,41 @@ export interface PhysicsParams {
   kickCooldown: number; // s, délai minimal entre deux touches de balle
   executionNoiseDeg: number; // °, écart-type angulaire de l'erreur d'exécution (sans pression)
   executionNoisePressure: number; // °, supplément par unité de pression
+  // --- Moteur (cinématique, prises de balle, duels, remises en jeu) ---
+  speedNoise: number; // écart-type relatif du bruit sur la vitesse d'une frappe (0,05 = ±5 %)
+  slowDownDistance: number; // m, distance de freinage à l'approche de la cible
+  playerSeparation: number; // m, distance minimale entre deux joueurs (séparation douce)
+  controlSlowBonus: number; // m, rayon de prise de balle supplémentaire sur un ballon lent
+  controlSlowSpeed: number; // m/s, vitesse en dessous de laquelle le ballon est « lent »
+  controlMaxHeight: number; // m, hauteur maximale d'un ballon contrôlable
+  controlMaxRelSpeed: number; // m/s, vitesse relative ballon–joueur maximale pour une prise de balle
+  kickerImmunity: number; // s, délai avant que le frappeur puisse reprendre son propre ballon
+  duelCooldown: number; // s, délai minimal entre deux duels pour un même défenseur
+  beatenFreeze: number; // s, immobilité d'un défenseur « passé »
+  duelBase: number; // logit de base de la victoire du défenseur
+  duelGoalSide: number; // bonus logit si le défenseur est côté but (de face)
+  duelPressure: number; // logit par unité de pression sur le porteur
+  duelSkill: number; // logit par unité d'écart (defending − dribbling)
+  duelMinProb: number; // borne inférieure de P_win^def
+  duelMaxProb: number; // borne supérieure de P_win^def
+  tackleKeepProb: number; // probabilité que le tacleur conserve le ballon (sinon ballon libre)
+  tackleLooseDistance: number; // m, distance à laquelle le ballon devient libre après un tacle
+  restartFreeze: number; // s, gel après une remise en jeu (touche, six mètres, corner, hors-jeu)
+  kickoffFreeze: number; // s, gel au coup d'envoi initial
+  goalFreeze: number; // s, gel après un but (retour aux postes)
+  saveProb: number; // probabilité d'arrêt du gardien sachant que le tir n'est pas but
+  saveCornerProb: number; // probabilité qu'un arrêt soit dévié en corner
+  keeperSaveRadius: number; // m, distance ballon–gardien à laquelle l'arrêt est constaté
+  blockRadius: number; // m, rayon de contre d'un tir par un défenseur de champ
+  blockWindow: number; // fraction initiale du vol pendant laquelle un tir peut être contré
+  dribbleWonDelay: number; // s, conservation du ballon nécessaire pour compter un dribble réussi
+  defaultShotXG: number; // xG utilisé si ni la décision ni le modèle ne le fournissent
 }
 
 /** Coefficients d'un modèle logistique P = σ(base + Σ coef·feature). */
 export interface PassModel { base: number; distance: number; longDistance: number; passerPressure: number; receiverPressure: number }
 export interface ThroughModel { base: number; distance: number; passerPressure: number }
-export interface DribbleModel { base: number; pathPressure: number; distance: number; control: number }
+export interface DribbleModel { base: number; pathPressure: number; distance: number; control: number; /** coefficient du terme tanh(min_j T_j(q) − d/v_drib) (§5.3), défaut 1,0 */ race?: number }
 export interface ShotModel { base: number; angle: number; distance: number; keeperCoverage: number; blockers: number; pressure: number }
 export interface HoldModel { base: number; pressure: number; closeOpponents: number }
 
@@ -430,6 +487,20 @@ export interface ModelParams {
   /** Rayon de couverture du gardien (m) : base + gain·temps de vol. */
   keeperReachBase: number;
   keeperReachPerSecond: number;
+  // --- Paramètres optionnels ajoutés par src/models (append-only, défauts dans params.ts) ---
+  /** α_v : pondération de la vitesse de fermeture dans la pression (§4.4), défaut 0,5. */
+  pressureClosing?: number;
+  /** Couverture nominale du gardien utilisée par le substitut analytique de xT (§4.3 : −1,96 = base − 1,5·0,57), défaut 0,57. */
+  threatKeeperCoverage?: number;
+  /** Rayon d'action maximal du gardien (m), défaut 1,2 ; largeur du corps (m), défaut 1,8 (§5.4). */
+  keeperReachMax?: number;
+  keeperBodyWidth?: number;
+  /** Influence des attributs individuels sur les logits : coef·(attribut − 0,5), défaut 0,6. */
+  attributeInfluence?: number;
+  /** t★ : horizon de la supériorité numérique locale (s), défaut 2,5 (§4.7). */
+  superiorityHorizon?: number;
+  /** R_s : rayon de l'espace disponible (m), défaut 8 (§4.5). */
+  spaceRadius?: number;
 }
 
 /** Poids de la fonction d'évaluation du porteur (modulés ensuite par les paramètres tactiques). */

@@ -15,11 +15,12 @@
     "experiments": "tsx scripts/experiments.ts",
     "scenarios": "tsx scripts/scenarios.ts",
     "optimize": "tsx scripts/optimize.ts",
-    "bench": "tsx scripts/bench.ts"
+    "bench": "tsx scripts/bench.ts",
+    "screenshot": "tsx scripts/screenshot.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
-    "playwright": "^1.63.0",
+    "playwright": "^1.56.1",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
     "vite": "^6.0.0",

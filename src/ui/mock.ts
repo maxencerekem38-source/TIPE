@@ -406,7 +406,7 @@ export function createMockSimulation(config: MatchConfig): Simulation {
           flightEnd = state.time + dur;
           state.stats[o.team].passes++;
           if (cand.action.kind === 'through') state.stats[o.team].throughBalls++;
-          pushEvent({ time: state.time, kind: 'pass', team: o.team, playerId: o.id, targetId: tgt.id, pos: { ...o.pos }, value: cand.probability, label: `Passe n°${o.number} → n°${tgt.number} (P = ${cand.probability.toFixed(2)})` });
+          pushEvent({ time: state.time, kind: 'pass', team: o.team, playerId: o.id, targetId: tgt.id, pos: { ...o.pos }, value: cand.probability, label: `Passe n°${o.number} → n°${tgt.number} (P = ${cand.probability.toFixed(2).replace('.', ',')})` });
         }
         nextPassAt = state.time + rng.uniform(3.5, 6);
       }
@@ -435,7 +435,7 @@ export function createMockSimulation(config: MatchConfig): Simulation {
           state.stats[team].shots++;
           state.stats[team].xG += shotP;
           if (rng.bernoulli(0.5)) state.stats[team].shotsOnTarget++;
-          pushEvent({ time: state.time, kind: 'shot', team, playerId: receiver.id, value: shotP, label: `Tir du n°${receiver.number} (xG ${shotP.toFixed(2)})` });
+          pushEvent({ time: state.time, kind: 'shot', team, playerId: receiver.id, value: shotP, label: `Tir du n°${receiver.number} (xG ${shotP.toFixed(2).replace('.', ',')})` });
           // Le gardien adverse relance : changement de possession
           const gk = state.players.find((p) => p.team !== team && p.role === 'GK')!;
           state.ball.ownerId = gk.id;

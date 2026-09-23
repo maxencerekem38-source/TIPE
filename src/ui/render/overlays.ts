@@ -91,7 +91,9 @@ export function findSpaces(f: FieldSet, team: TeamId, n = 6, minSep = 9): SpaceS
     }
   spots.sort((a, b) => b.value - a.value);
   const out: SpaceSpot[] = [];
+  const floor = (spots[0]?.value ?? 0) * 0.2; // ignore les maxima négligeables
   for (const s of spots) {
+    if (s.value < floor) break;
     if (out.every((o) => Math.hypot(o.pos.x - s.pos.x, o.pos.y - s.pos.y) >= minSep)) out.push(s);
     if (out.length >= n) break;
   }

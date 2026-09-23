@@ -38,6 +38,7 @@ export function fmtValue(value: number, unit?: string): string {
   if (unit === 'm') return fmtNumber(value, 1) + ' m';
   if (unit === 's') return fmtNumber(value, 2) + ' s';
   if (unit === 'm/s') return fmtNumber(value, 1) + ' m/s';
+  if (unit === 'joueurs') return `${fmtNumber(value, 0)} ${value < 2 ? 'joueur' : 'joueurs'}`;
   const s = fmtNumber(value, Math.abs(value) >= 10 ? 1 : 2);
   return unit ? `${s} ${unit}` : s;
 }

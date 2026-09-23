@@ -90,8 +90,10 @@ function comparison(d: Decision, app: AppState, numberOf: (id: number) => string
     },
       el('span', { class: 'cand-rank' }, String(i + 1)),
       el('span', { class: 'cand-dot', style: `background:${rgbaCss(scoreRamp(norm(c.score)))}` }),
-      el('span', { class: 'cand-label' }, actionLabel(c.action)),
-      el('span', { class: 'cand-target muted' }, actionTargetLabel(c.action, numberOf)),
+      el('span', { class: 'cand-main' },
+        el('span', { class: 'cand-label' }, actionLabel(c.action)),
+        el('span', { class: 'cand-target muted' }, actionTargetLabel(c.action, numberOf)),
+      ),
       scoreBar(c.score, maxAbs),
       el('span', { class: 'cand-score mono' }, fmtNumber(c.score, 2)),
       el('span', { class: 'cand-prob mono muted' }, fmtPercent(c.probability)),
@@ -102,7 +104,7 @@ function comparison(d: Decision, app: AppState, numberOf: (id: number) => string
     list.append(row);
   });
   return el('section', { class: 'section' },
-    el('h3', { class: 'section-title' }, 'Comparaison des actions ', el('span', { class: 'muted small' }, `(${cands.length} candidats évalués)`)),
+    el('h3', { class: 'section-title' }, 'Comparaison des actions ', el('span', { class: 'muted small' }, `· ${cands.length} candidats évalués`)),
     list,
   );
 }
