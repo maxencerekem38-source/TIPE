@@ -4,31 +4,45 @@
  * (evaluate.ts), anticipation à deux coups (expectimax profondeur 2 sur les K meilleurs candidats avec une
  * réponse adverse pessimiste), hystérésis, sélection (argmax, départage ε, réponse quantale) et explication.
  *
- * Score final d'un candidat développé (§6.3) :
- *   Q(a) = P_a · [V⁺(a) − δ_a + γ · G(a)] − (1 − P_a) · λ · L(q_a⁻) − C(a)
- *        = EV₁(a) − P_a · δ_a + P_a · γ · G(a)          (composantes « response » et « lookahead »)
- *   δ_a  = Θ(q⁺) − Θ_press(q⁺) ≥ 0 : dégradation de la menace par la réponse adverse « press » ;
- *   G(a) = max(0, max_{a'} EV₁(a' | s⁺_a) − Θ_press(q⁺)) : gain incrémental de la meilleure suite, au-delà de la
- *          menace déjà comptée en q⁺ (la conservation garantit G ≳ 0 : aucun double comptage, et un candidat non
- *          développé — Q = EV₁ ≤ Q développé — ne peut pas dépasser un candidat développé par simple omission).
- *          Une suite « tir » est comparée aussi au tir immédiat, sinon « dribbler puis tirer » serait crédité de tout xG'.
- * s⁺_a est l'état anticipé après succès : joueurs avancés de T_a, ballon au point d'arrivée, receveur porteur,
- * et les deux adversaires les plus proches du receveur courant vers lui (modèle de mouvement §4.1 : réaction puis
- * accélération bornée) — réponse « press », pessimiste et bornée physiquement.
+ * Score final d'un candidat développé (§6.3, minimax sur l'ensemble de réponses R = {hold, press, cover, drop}) :
+ *   Q(a) = EV₁(a) + P_a · min_{r ∈ R} [Θ_r(q⁺) + γ · G(a, r)] − P_a · Θ_hold(q⁺)
+ *        = EV₁(a) − P_a · δ_a + P_a · γ · G(a, r*)          (composantes « response » et « lookahead »)
+ *   r*   = argmin_r [Θ_r(q⁺) + γ · G(a, r)], mémorisé dans candidate.response = { kind: r*, delta: δ_a } ;
+ *   δ_a  = Θ_hold(q⁺) − Θ_r*(q⁺) : dégradation de la menace par la réponse adverse (≥ 0 pour hold et press ;
+ *          cover et drop peuvent éloigner un défenseur de q⁺ et dégrader la suite plutôt que la menace) ;
+ *   G(a, r) = max(0, max_{a'} EV₁(a' | s⁺_{a,r}) − Θ_r(q⁺)) : gain incrémental de la meilleure suite sur l'état ajusté
+ *          par r (jeu réduit), au-delà de la menace déjà comptée en q⁺ (la conservation garantit G ≳ 0 : aucun double
+ *          comptage, et un candidat non développé — Q = EV₁ — ne peut dépasser un candidat développé que si la
+ *          meilleure réponse dégrade réellement ce dernier). Une suite « tir » est comparée aussi au tir immédiat,
+ *          sinon « dribbler puis tirer » serait crédité de tout xG'.
+ * s⁺_{a,r} est l'état anticipé après succès (responses.ts) : joueurs avancés de T_a, ballon au point d'arrivée, receveur
+ * porteur, puis 2–3 défenseurs re-ciblés selon r avec le modèle de mouvement §4.1 (réaction puis accélération bornée).
+ * Le nombre de réponses évaluées est params.decision.responseCount (4 ; minimum 2 = hold + press).
  *
+ * Jeu 2×2 (§6.4, game2x2.ts) : lorsque les deux meilleurs candidats après profondeur 2 sont de classes différentes
+ * parmi {tir, passe, dribble} et à moins de ε_game l'un de l'autre, M[k][l] = Q(a_k | r_l) avec r ∈ {press, cover}
+ * (un tir, exécuté avant tout re-ciblage, garde sa valeur sous les deux réponses) ; point-selle ⇒ action pure, sinon
+ * stratégie mixte tirée au RNG à graine et engagée pour sa durée (Decision.game, committedUntil).
+ *
+ * Hystérésis (§6.5) : l'intention courante (passe, dribble, tir, dégagement — pas la conservation) reçoit +h et est
+ * conservée SANS nouveau tirage tant qu'aucun candidat ne la bat de plus de h ; sinon sélection (argmax, départage ε par
+ * P puis T, ou réponse quantale). Un re-tirage à chaque cycle parmi les candidats à ε du meilleur produisait des
+ * dribbles en zigzag (0,6–0,7 changement d'intention par seconde).
  * Engagement (§6.5) : un dribble ou une conservation choisis portent `committedUntil` (durée de l'action) ; le
  * moteur (loop.ts) ne re-décide pas un dribble engagé tant que le porteur garde le ballon et n'a pas atteint sa cible.
  *
  * Aucune allocation profonde : l'état anticipé est une copie superficielle des joueurs (positions dupliquées).
  */
 import type { Vec2 } from '../core/vec2';
-import type { Action, Candidate, Decision, DecisionContext, MatchState, Player, SimParams } from '../core/types';
+import type { Action, Candidate, Decision, DecisionContext, DefensiveResponse, Game2x2, MatchState, Player, SimParams } from '../core/types';
 import type { DecisionInput } from './policy';
-import { proposeClear, proposeDribbles, proposeHold, proposeLob, proposePass, proposeShot, proposeThroughBalls, type Proposal } from './candidates';
-import { buildReason, createEvalContext, evaluateProposal, modulatedWeights, shallowPlayers, LANE_BLOCK_PHI, LOB_MIN_DISTANCE, type EvalContext, type Evaluation, type OnBallWeights } from './evaluate';
-import { explainDecision } from './explain';
+import { actionOrigin, proposeClear, proposeDribbles, proposeHold, proposeLob, proposePass, proposeShot, proposeThroughBalls, rollsIntoOwnGoal, type Proposal } from './candidates';
+import { buildReason, createEvalContext, evaluateProposal, modulatedWeights, LANE_BLOCK_PHI, LOB_MIN_DISTANCE, type EvalContext, type Evaluation, type OnBallWeights } from './evaluate';
+import { explainDecision, shortLabel } from './explain';
+import { drawAction, gameClass, solve2x2, type GameMatrix } from './game2x2';
+import { applyResponse, bestOnwardLane, MIN_RESPONSES, nextOwnerId, predictHoldState, RESPONSES, RESPONSE_LABELS, responseThreat, type OnwardLane } from './responses';
 import { localSuperiority } from '../models/structure';
-import { pitchControlAt, pressureAt, threatAt } from '../models/fields';
+import { pressureAt } from '../models/fields';
 
 // ---------------------------------------------------------------------------
 // Constantes
@@ -37,12 +51,17 @@ import { pitchControlAt, pressureAt, threatAt } from '../models/fields';
 const MAX_THROUGH = 8;
 /** Nombre d'échantillons d'interception du jeu réduit (profondeur 2, §6.3). */
 const REDUCED_SAMPLES = 6;
-/** Nombre d'adversaires qui courent vers le receveur dans la réponse pessimiste (§6.3, « press »). */
-const PRESS_DEFENDERS = 2;
-/** Distance (m) à laquelle les presseurs s'arrêtent du receveur (rayon de duel). */
-const PRESS_STANDOFF = 1.2;
 /** Seuil de contribution en deçà duquel une composante de lookahead n'est pas listée. */
 const EPS = 1e-12;
+/** Réponses du jeu 2×2 (§6.4) : tir/passe et passe/dribble ⇒ {press, cover}. */
+const GAME_RESPONSES: [DefensiveResponse, DefensiveResponse] = ['press', 'cover'];
+/** Replis des paramètres optionnels (append-only dans SimParams). */
+const DEFAULT_RESPONSE_COUNT = 4;
+const DEFAULT_RESPONSE_REEVALUATE = 4;
+const DEFAULT_GAME_COMMIT_MIN = 1.0;
+
+/** Valeur Q(a | r) d'un candidat développé sous chaque réponse évaluée (matrice du jeu 2×2). */
+type ResponseValues = Partial<Record<DefensiveResponse, number>>;
 
 export interface EvaluateOptions {
   /** Jeu réduit (profondeur 2) : passes à une seule vitesse, pas de profondeur ni de dégagement, dribbles courts. */
@@ -84,10 +103,16 @@ export function evaluateCandidates(input: DecisionInput, playerId: number, optio
   // --- Passes au pied (une par coéquipier) ---
   const defaultSpeed = params.physics.passArrivalSpeed;
   const speeds: number[] = reduced ? [defaultSpeed] : [defaultSpeed, ...params.decision.passArrivalSpeeds.filter((s) => s !== defaultSpeed)];
+  // Une passe dont la course résiduelle franchirait sa propre ligne de but n'est pas proposée (rollsIntoOwnGoal).
+  const safePass = (r: Player, speed: number): Proposal | null => {
+    const prop = proposePass(state, me, r, speed, params);
+    return rollsIntoOwnGoal(actionOrigin(state, me), prop.successPoint, speed, me.team, params) ? null : prop;
+  };
   for (const r of state.players) {
     if (r.team !== me.team || r.id === me.id) continue;
     if (isReceiverOffside(ctx, r)) continue;
-    const first = evaluateProposal(ctx, proposePass(state, me, r, speeds[0], params));
+    const firstProp = safePass(r, speeds[0]);
+    const first = firstProp ? evaluateProposal(ctx, firstProp) : null;
     if (!first) continue;
     let best: Evaluation = first;
     if (first.blocked) {
@@ -97,7 +122,8 @@ export function evaluateCandidates(input: DecisionInput, playerId: number, optio
       }
     } else {
       for (let i = 1; i < speeds.length; i++) {
-        const e = evaluateProposal(ctx, proposePass(state, me, r, speeds[i], params));
+        const prop = safePass(r, speeds[i]);
+        const e = prop ? evaluateProposal(ctx, prop) : null;
         if (e && e.candidate.score > best.candidate.score) best = e;
       }
     }
@@ -151,102 +177,164 @@ function proposalOf(e: Evaluation, speed: number): Proposal {
 }
 
 // ---------------------------------------------------------------------------
-// Profondeur 2 : état anticipé après succès + réponse pessimiste + meilleure suite
+// Profondeur 2 : état anticipé après succès + ensemble de réponses (minimax) + meilleure suite
 // ---------------------------------------------------------------------------
-/** Distance parcourue en `t` s par un joueur parti de l'arrêt après réaction τ (§4.1). */
-function runDistance(t: number, vmax: number, amax: number, tau: number): number {
-  const s = Math.max(0, t - tau);
-  const tAcc = vmax / amax;
-  return s <= tAcc ? 0.5 * amax * s * s : (vmax * vmax) / (2 * amax) + vmax * (s - tAcc);
-}
-
-/** Identifiant du porteur après succès : le receveur pour une passe, le porteur lui-même sinon (null : pas de suite). */
-function nextOwnerId(c: Candidate, playerId: number): number | null {
-  const a = c.action;
-  if (a.type === 'pass') return a.targetId;
-  if (a.type === 'dribble' || a.type === 'hold') return playerId;
-  return null;
-}
-
 /**
- * Construit l'état anticipé s⁺ après le succès du candidat : joueurs avancés de T_a, receveur au point d'arrivée
- * (porteur du ballon), et les PRESS_DEFENDERS adversaires les plus proches courant vers lui (réponse « press »).
- * Retourne aussi la menace sous press Θ_press(q⁺) et la dégradation δ = Θ(q⁺) − Θ_press(q⁺) due à la réponse.
+ * Développe un candidat en profondeur 2 (§6.3) sur les `responses` évaluées (hold en tête) :
+ *  1. état de base s⁺_hold (responses.ts) et Θ_hold(q⁺) ; pour chaque réponse r : état ajusté s⁺_{a,r}, menace
+ *     Θ_r(q⁺) (contrôle exact au point d'arrivée), meilleure suite du nouveau porteur (jeu réduit, 6 échantillons) et
+ *     gain incrémental G(a, r) = max(0, max EV₁' − Θ_r(q⁺)) (une suite « tir » est aussi comparée au tir immédiat
+ *     `shotNowEV`) ; la ligne de passe de `cover` est la meilleure passe de la suite sous `hold` ;
+ *  2. r* = argmin_r [Θ_r + γ·G(a, r)] ; composantes « response » = −P·δ (δ = Θ_hold − Θ_r*) et « lookahead » = P·γ·G(a, r*) ;
+ *     Q = EV₁ − P·δ + P·γ·G(a, r*), V⁺ ← V⁺ − δ + γ·G(a, r*).
+ * Retourne Q(a | r) pour chaque réponse évaluée (matrice du jeu 2×2), null si le candidat n'a pas de suite.
  */
-export function predictSuccessState(state: MatchState, c: Candidate, playerId: number, ownerId: number, params: SimParams): { next: MatchState; delta: number; thetaPress: number } {
-  const T = c.duration ?? 0;
-  const q = c.successPoint!;
-  const players = shallowPlayers(state.players);
+function expandLookahead(input: DecisionInput, c: Candidate, playerId: number, reducedParams: SimParams, weights: OnBallWeights, shotNowEV: number, responses: readonly DefensiveResponse[]): ResponseValues | null {
+  const ownerId = nextOwnerId(c, playerId);
+  if (ownerId === null || !c.successPoint) return null;
+  const gamma = weights.gamma;
+  if (gamma <= 0) return null;
+  const { state, params } = input;
   const me = playerById(state, playerId)!;
   const team = me.team;
-  for (const p of players) {
-    p.pos.x = Math.max(-52.5, Math.min(52.5, p.pos.x + p.vel.x * T));
-    p.pos.y = Math.max(-34, Math.min(34, p.pos.y + p.vel.y * T));
-    if (p.id === ownerId) {
-      p.pos.x = q.x; p.pos.y = q.y;
-      if (c.action.type === 'dribble') {
-        const v = params.physics.dribbleSpeedFactor * p.maxSpeed;
-        p.vel.x = c.action.direction.x * v; p.vel.y = c.action.direction.y * v;
-      }
+  const q = c.successPoint;
+  const T = c.duration ?? 0;
+  const P = c.probability;
+  const ev1 = c.score;
+  const base = predictHoldState(state, c, playerId, ownerId, params);
+  const thetaHold = responseThreat(base, q, team, params);
+  const values: ResponseValues = {};
+  const m = Math.max(0, Math.floor(params.decision.responseReevaluate ?? DEFAULT_RESPONSE_REEVALUATE));
+  let lane: OnwardLane | null = null;
+  let holdTop: Candidate[] = [];
+  let best: { kind: DefensiveResponse; value: number; theta: number; gain: number } | null = null;
+  for (const r of responses) {
+    let next: MatchState;
+    let theta: number;
+    if (r === 'hold') { next = base; theta = thetaHold; }
+    else {
+      const adjusted = applyResponse(r, base, q, team, T, params, lane);
+      if (!adjusted) { values[r] = values.hold; continue; } // réponse sans effet ⇒ identique à hold
+      next = adjusted;
+      theta = responseThreat(next, q, team, params);
     }
+    let top: { score: number; shot: boolean } | null;
+    if (r === 'hold' || m === 0) {
+      const continuation = evaluateCandidates({ ...input, state: next, params: reducedParams }, ownerId, { reduced: true, weights });
+      if (r === 'hold') { lane = bestOnwardLane(continuation, q); holdTop = continuation.slice(0, m); }
+      top = continuation.length > 0 ? { score: continuation[0].score, shot: continuation[0].action.type === 'shoot' } : null;
+    } else {
+      top = reevaluateContinuation(input, next, ownerId, holdTop, reducedParams, weights);
+    }
+    const maxEV = top ? top.score : 0;
+    const baseline = top && top.shot ? Math.max(theta, shotNowEV) : theta;
+    const gain = Math.max(0, maxEV - baseline);
+    const value = theta + gamma * gain;
+    values[r] = ev1 + P * (value - thetaHold);
+    if (!best || value < best.value - EPS) best = { kind: r, value, theta, gain };
   }
-  const next: MatchState = {
-    ...state,
-    players,
-    ball: { ...state.ball, pos: { x: q.x, y: q.y }, vel: { x: 0, y: 0 }, z: 0, vz: 0, ownerId, lastTouchId: ownerId, flight: null },
-    possession: team,
-  };
-  const xT = threatAt(q, team, params);
-  const before = xT * pitchControlAt(next, q, team, params);
-  // Réponse pessimiste : les deux adversaires les plus proches de q⁺ courent vers lui pendant T.
-  const opp = players.filter((p) => p.team !== team).sort((a, b) => (a.pos.x - q.x) ** 2 + (a.pos.y - q.y) ** 2 - ((b.pos.x - q.x) ** 2 + (b.pos.y - q.y) ** 2));
-  const tau = params.models.reactionTime;
-  for (let i = 0; i < Math.min(PRESS_DEFENDERS, opp.length); i++) {
-    const d = opp[i];
-    const dx = q.x - d.pos.x, dy = q.y - d.pos.y;
-    const dist = Math.hypot(dx, dy);
-    if (dist < 1e-6) continue;
-    const covered = runDistance(T, d.maxSpeed, d.maxAccel, tau);
-    const remaining = Math.max(PRESS_STANDOFF, dist - covered);
-    const ux = dx / dist, uy = dy / dist;
-    d.pos.x = q.x - ux * remaining; d.pos.y = q.y - uy * remaining;
-    const speed = Math.min(d.maxSpeed, d.maxAccel * Math.max(0, T - tau));
-    d.vel.x = ux * speed; d.vel.y = uy * speed;
+  if (!best) return null;
+  const delta = thetaHold - best.theta;
+  if (Math.abs(delta) > EPS) {
+    c.components.push({ key: 'response', label: `Réponse adverse (${RESPONSE_LABELS[best.kind]})`, value: -delta, unit: 'but', weight: P, contribution: -P * delta });
+    c.score -= P * delta;
+    c.valueIfSuccess -= delta;
   }
-  const after = xT * pitchControlAt(next, q, team, params);
-  return { next, delta: before - after, thetaPress: after };
+  c.response = { kind: best.kind, delta };
+  const contribution = P * gamma * best.gain;
+  c.components.push({ key: 'lookahead', label: 'Meilleure suite (profondeur 2)', value: best.gain, unit: 'but', weight: P * gamma, contribution });
+  c.score += contribution;
+  c.valueIfSuccess += gamma * best.gain;
+  return values;
 }
 
 /**
- * Développe un candidat en profondeur 2 (§6.3) :
- *  1. réponse pessimiste « press » : le premier terme devient Θ_press(q⁺) = Θ(q⁺) − δ, chargé avec le poids P
- *     (composante « response », affichée telle quelle par l'explication) ;
- *  2. meilleure suite du nouveau porteur sur s⁺ (jeu réduit, 6 échantillons) et gain incrémental
- *     G = max(0, max EV₁' − Θ_press(q⁺)) (une suite « tir » est aussi comparée au tir immédiat `shotNowEV`) ;
- *     Q = EV₁ − P·δ + P·γ·G, V⁺ ← V⁺ − δ + γ·G.
+ * Meilleure suite sous une réponse r ≠ hold, par ré-évaluation des `holdTop` meilleures suites trouvées sous `hold` sur
+ * l'état ajusté `next` (les attaquants n'y bougent pas ; seuls 1–4 défenseurs sont re-ciblés, donc la meilleure suite
+ * sous r est, à de rares exceptions près, parmi les meilleures sous hold — une suite hors de cette liste qui
+ * s'améliorerait grâce au re-ciblage est ignorée : G(a, r) est alors sous-estimé, dans le sens pessimiste du minimax).
+ * Coût : m évaluations au lieu des ≈ 20 du jeu réduit complet (mesure : scripts/bench.ts, voir params.ts).
  */
-function expandLookahead(input: DecisionInput, c: Candidate, playerId: number, reducedParams: SimParams, weights: OnBallWeights, shotNowEV: number): void {
-  const ownerId = nextOwnerId(c, playerId);
-  if (ownerId === null || !c.successPoint) return;
-  const gamma = weights.gamma;
-  if (gamma <= 0) return;
-  const { next, delta, thetaPress } = predictSuccessState(input.state, c, playerId, ownerId, input.params);
-  const pressed = Math.max(0, delta);
-  if (pressed > EPS) {
-    c.components.push({ key: 'response', label: 'Réponse adverse (press du receveur)', value: -pressed, unit: 'but', weight: c.probability, contribution: -c.probability * pressed });
-    c.score -= c.probability * pressed;
-    c.valueIfSuccess -= pressed;
+function reevaluateContinuation(input: DecisionInput, next: MatchState, ownerId: number, holdTop: readonly Candidate[], reducedParams: SimParams, weights: OnBallWeights): { score: number; shot: boolean } | null {
+  const owner = playerById(next, ownerId);
+  if (!owner || holdTop.length === 0) return null;
+  const ctx = createEvalContext(next, input.fields, reducedParams, weights, owner, false, false);
+  let best: { score: number; shot: boolean } | null = null;
+  for (const c of holdTop) {
+    let prop: Proposal | null = null;
+    const a = c.action;
+    switch (a.type) {
+      case 'pass': {
+        const receiver = playerById(next, a.targetId);
+        if (!receiver) break;
+        const ground = proposePass(next, owner, receiver, a.speed, reducedParams);
+        prop = a.kind === 'lob' ? proposeLob(ground) : ground;
+        break;
+      }
+      case 'dribble':
+        prop = c.successPoint ? { kind: 'dribble', action: a, receiverId: -1, successPoint: c.successPoint } : null;
+        break;
+      case 'shoot':
+        prop = proposeShot(next, owner, reducedParams);
+        break;
+      case 'hold':
+        prop = proposeHold(next, owner);
+        break;
+      default:
+        break;
+    }
+    if (!prop) continue;
+    const e = evaluateProposal(ctx, prop);
+    if (!e) continue;
+    if (prop.kind === 'shot' && e.candidate.probability < weights.shotMinXg) continue;
+    if (!best || e.candidate.score > best.score) best = { score: e.candidate.score, shot: prop.kind === 'shot' };
   }
-  c.response = { kind: 'press', delta: pressed };
-  const continuation = evaluateCandidates({ ...input, state: next, params: reducedParams }, ownerId, { reduced: true, weights });
-  const best = continuation.length > 0 ? continuation[0] : null;
-  const maxEV = best ? best.score : 0;
-  const baseline = best && best.action.type === 'shoot' ? Math.max(thetaPress, shotNowEV) : thetaPress;
-  const gain = Math.max(0, maxEV - baseline);
-  const contribution = c.probability * gamma * gain;
-  c.components.push({ key: 'lookahead', label: 'Meilleure suite (profondeur 2)', value: gain, unit: 'but', weight: c.probability * gamma, contribution });
-  c.score += contribution;
-  c.valueIfSuccess += gamma * gain;
+  return best;
+}
+
+/** Réponses évaluées : les `responseCount` premières de R (hold, press, cover, drop), au moins hold + press. */
+function activeResponses(params: SimParams): readonly DefensiveResponse[] {
+  const n = Math.floor(params.decision.responseCount ?? DEFAULT_RESPONSE_COUNT);
+  return RESPONSES.slice(0, Math.max(MIN_RESPONSES, Math.min(RESPONSES.length, n)));
+}
+
+// ---------------------------------------------------------------------------
+// Jeu 2×2 (§6.4)
+// ---------------------------------------------------------------------------
+/**
+ * Dilemme entre les deux meilleurs candidats (`a1`, `a2` triés) : classes différentes parmi {tir, passe, dribble} et
+ * |Q₁ − Q₂| < ε_game. Matrice M[k][l] = Q(a_k | r_l), r ∈ {press, cover} : valeurs de la profondeur 2 pour une passe ou un
+ * dribble ; un tir garde Q sous les deux réponses (il est exécuté avant tout re-ciblage). Retourne l'action tirée et le
+ * jeu résolu, ou null si le dilemme ne se présente pas (ou si une valeur manque : candidat non développé).
+ */
+function playGame(a1: Candidate, a2: Candidate, values: Map<Candidate, ResponseValues>, input: DecisionInput, playerId: number): { chosen: Candidate; game: Game2x2 } | null {
+  const k1 = gameClass(a1.action), k2 = gameClass(a2.action);
+  if (!k1 || !k2 || k1 === k2) return null;
+  if (Math.abs(a1.score - a2.score) >= input.params.decision.epsilonGame) return null;
+  const row = (c: Candidate): [number, number] | null => {
+    if (c.action.type === 'shoot') return [c.score, c.score];
+    const v = values.get(c);
+    if (!v) return null;
+    // Une réponse non évaluée (responseCount < 4) vaut « hold » : la défense n'y re-cible personne.
+    const m0 = v[GAME_RESPONSES[0]] ?? v.hold, m1 = v[GAME_RESPONSES[1]] ?? v.hold;
+    if (m0 === undefined || m1 === undefined) return null;
+    return [m0, m1];
+  };
+  const r1 = row(a1), r2 = row(a2);
+  if (!r1 || !r2) return null;
+  const matrix: GameMatrix = [r1, r2];
+  const sol = solve2x2(matrix);
+  const pick = drawAction(sol, input.rng);
+  const state = input.state;
+  const game: Game2x2 = {
+    actions: [shortLabel(a1, state, playerId), shortLabel(a2, state, playerId)],
+    responses: [GAME_RESPONSES[0], GAME_RESPONSES[1]],
+    matrix,
+    pure: sol.pure,
+    pi1: sol.pi1,
+    value: sol.value,
+  };
+  return { chosen: pick === 0 ? a1 : a2, game };
 }
 
 // ---------------------------------------------------------------------------
@@ -318,24 +406,31 @@ export function decideOnBall(input: DecisionInput, playerId: number, previous: D
   // Conservation de secours : la liste ne peut pas être vide (le porteur peut toujours garder le ballon).
   if (cands.length === 0) cands.push(fallbackHold(origin));
 
-  // --- Profondeur 2 sur les K meilleurs ---
+  // --- Profondeur 2 sur les K meilleurs : minimax sur les réponses évaluées (§6.3) ---
   const K = Math.max(0, Math.floor(params.decision.topK));
+  const responseValues = new Map<Candidate, ResponseValues>();
   if (K > 0 && weights.gamma > 0) {
     const reducedParams: SimParams = { ...params, models: { ...params.models, interceptSamples: Math.min(REDUCED_SAMPLES, params.models.interceptSamples) } };
     const shotNowEV = cands.find((c) => c.action.type === 'shoot')?.score ?? -Infinity;
+    const responses = activeResponses(params);
     const expanded = cands.slice(0, Math.min(K, cands.length));
-    for (const c of expanded) expandLookahead(input, c, playerId, reducedParams, weights, shotNowEV);
+    for (const c of expanded) {
+      const v = expandLookahead(input, c, playerId, reducedParams, weights, shotNowEV, responses);
+      if (v) responseValues.set(c, v);
+    }
   }
 
-  // --- Hystérésis ---
+  // --- Hystérésis (§6.5) : l'intention courante a_cur reçoit +h ; elle est conservée sauf si Q(a_new) > Q(a_cur) + h ---
+  // (le meilleur candidat de même intention est retenu : la liste n'est plus triée après la profondeur 2).
+  // Une conservation n'est pas une intention à protéger (attente de T_hold puis nouvelle décision) : sans cette
+  // exclusion, un porteur sans option pourrait conserver indéfiniment, rien ne battant la conservation de plus de h.
   let kept: Candidate | null = null;
-  if (previous && previous.playerId === playerId && weights.hysteresis > 0) {
+  if (previous && previous.playerId === playerId && weights.hysteresis > 0 && previous.chosen.action.type !== 'hold') {
     const prevAction = previous.chosen.action;
-    const match = cands.find((c) => sameAction(c.action, prevAction));
-    if (match) {
-      match.components.push({ key: 'hysteresis', label: 'Hystérésis (intention courante)', value: 1, weight: weights.hysteresis, contribution: weights.hysteresis });
-      match.score += weights.hysteresis;
-      kept = match;
+    for (const c of cands) if (sameAction(c.action, prevAction) && (!kept || c.score > kept.score)) kept = c;
+    if (kept) {
+      kept.components.push({ key: 'hysteresis', label: 'Hystérésis (intention courante)', value: 1, weight: weights.hysteresis, contribution: weights.hysteresis });
+      kept.score += weights.hysteresis;
     }
   }
 
@@ -344,10 +439,15 @@ export function decideOnBall(input: DecisionInput, playerId: number, previous: D
   for (const c of cands) if (c.components.some((k) => k.key === 'lookahead' || k.key === 'response' || k.key === 'hysteresis')) c.reason = buildReason(c, state, pressureBall);
 
   cands.sort(compareCandidates);
-  const chosen = selectCandidate(cands, params.decision.epsilonTie, params.decision.softmaxTemperature, rng);
+  // Sélection : une intention courante non battue (à h près) est conservée sans nouveau tirage — sinon la réponse
+  // quantale re-tirerait chaque cycle parmi les candidats à ε du meilleur (zigzag de dribbles, §6.4 « pas de re-tirage »).
+  // Sinon, dilemme (§6.4) entre les deux meilleurs candidats ⇒ jeu 2×2 ; à défaut, sélection §6.5.
+  const useKept = kept !== null && kept.score >= cands[0].score - EPS;
+  const played = !useKept && cands.length >= 2 ? playGame(cands[0], cands[1], responseValues, input, playerId) : null;
+  const chosen = played ? played.chosen : useKept ? kept! : selectCandidate(cands, params.decision.epsilonTie, params.decision.softmaxTemperature, rng);
 
   let keptByHysteresis = false;
-  if (kept && chosen === kept) {
+  if (kept && chosen === kept && useKept) {
     for (const c of cands) if (c !== kept && c.score > kept.score - weights.hysteresis + EPS) { keptByHysteresis = true; break; }
   }
 
@@ -363,11 +463,15 @@ export function decideOnBall(input: DecisionInput, playerId: number, previous: D
     computeMs,
   };
   if (keptByHysteresis) decision.keptByHysteresis = true;
+  if (played) decision.game = played.game;
   // Engagement (§6.5) : seules les actions qui gardent le ballon (dribble, conservation) durent ; une passe, un tir
-  // ou un dégagement sont exécutés immédiatement et libèrent le ballon.
+  // ou un dégagement sont exécutés immédiatement et libèrent le ballon. Une action tirée au jeu 2×2 (§6.4) est engagée
+  // pour toute sa durée (au moins gameCommitMin s pour un dribble ou une conservation) : pas de re-tirage à chaque cycle.
   const a = chosen.action;
-  if ((a.type === 'dribble' || a.type === 'hold') && chosen.duration !== undefined && chosen.duration > 0) {
-    decision.committedUntil = state.time + chosen.duration;
+  const keepsBall = a.type === 'dribble' || a.type === 'hold';
+  if (chosen.duration !== undefined && chosen.duration > 0) {
+    if (played) decision.committedUntil = state.time + (keepsBall ? Math.max(chosen.duration, params.decision.gameCommitMin ?? DEFAULT_GAME_COMMIT_MIN) : chosen.duration);
+    else if (keepsBall) decision.committedUntil = state.time + chosen.duration;
   }
   decision.explanation = explainDecision(decision, state);
   decision.computeMs = performance.now() - t0;

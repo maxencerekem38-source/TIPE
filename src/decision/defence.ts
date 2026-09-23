@@ -9,10 +9,13 @@
  *     hystérésis globale (nouvelle affectation adoptée seulement si le coût total baisse de ΔC_min) ;
  *  4. conversion en actions `move` (press / mark / cover / zone / recover / intercept / chase), candidats = 3 meilleures
  *     tâches du défenseur, explication en français ; gardien via decideKeeper.
- * Vitesses de consigne (réalisme) : press / intercept / chase au sprint, contain 0,8 v_max, marquage 0,6 + 0,4·priorité,
- * zone 0,5, repli 0,35 + 0,35·recoverPriority (`defence.taskSpeed`) ; une zone ou un repli à moins de `standDistance` m
- * est tenu sur place. « Contain » se fait à containOffset + containSlack·(1 − pressIntensity) m (un bloc bas contient de
+ * Vitesses de consigne (réalisme) : press / intercept / chase au sprint, contain 0,7 v_max, marquage 0,45 + 0,3·priorité,
+ * zone 0,3, repli 0,25 + 0,3·recoverPriority (`defence.taskSpeed`), zone et repli accélérant vers le sprint entre 6 et
+ * 20 m de leur point ; une zone ou un repli à moins de `standDistance` m est tenu sur place. « Contain » se fait à containOffset + containSlack·(1 − pressIntensity) m (un bloc bas contient de
  * plus loin, un pressing haut colle au porteur).
+ * Tenue de la ligne (§8.4) : les points de marquage et de zone ne descendent pas à plus de `lineHoldSlack` m derrière la
+ * ligne du bloc (poste le plus bas des joueurs de champ, §9.2 : x_line suit `defensiveLine` et le ballon) — un attaquant
+ * plus profond que la ligne est laissé au hors-jeu, la hauteur du bloc suit ainsi la tactique.
  * Contre-pressing : en `transition_defence` pendant counterPressWindow s, les 3 défenseurs les plus proches du ballon
  * reçoivent des tâches press/cover à priorité renforcée (règle des 5 secondes).
  * Repère : coordonnées terrain, direction d'attaque `dir` explicite (symétrie miroir A/B).
@@ -89,11 +92,16 @@ const COUNTER_PRESS_PLAYERS = 3;
 const COUNTER_PRESS_BOOST = 0.5;
 const COUNTER_PRESS_RADIUS = 15;
 /** Vitesses de consigne (fractions de v_max) par défaut (`defence.taskSpeed`), distance de maintien sur place (m), marge de contain (m). */
-const DEFAULT_TASK_SPEED: NonNullable<SimParams['defence']['taskSpeed']> = { contain: 0.8, zone: 0.5, markBase: 0.6, markGain: 0.4, recoverBase: 0.35, recoverGain: 0.35 };
-const DEFAULT_STAND_DISTANCE = 2;
-const DEFAULT_CONTAIN_SLACK = 2;
+const DEFAULT_TASK_SPEED: NonNullable<SimParams['defence']['taskSpeed']> = { contain: 0.7, zone: 0.3, markBase: 0.45, markGain: 0.3, recoverBase: 0.25, recoverGain: 0.3 };
+const DEFAULT_STAND_DISTANCE = 3;
+const DEFAULT_CONTAIN_SLACK = 6;
+/** Tenue de la ligne : marge (m) derrière la ligne du bloc tolérée pour les points de marquage et de zone (défaut). */
+const DEFAULT_LINE_HOLD_SLACK = 1;
 /** Nombre de candidats (tâches) conservés par défenseur. */
 const KEPT_CANDIDATES = 3;
+/** Repli / zone : au-delà de RAMP_START m la vitesse croît linéairement jusqu'au sprint à RAMP_FULL m. */
+const RAMP_START = 6;
+const RAMP_FULL = 20;
 /** Granularité (m) des clés de zone (hystérésis). */
 const ZONE_KEY_CELL = 4;
 
@@ -146,7 +154,8 @@ export function previousTaskKey(previous: Decision | undefined, playerId: number
     case 'press': return 'press';
     case 'cover': return 'contain';
     case 'mark': return a.markId !== undefined ? `mark:${a.markId}` : null;
-    case 'zone': return zoneKey(a.target);
+    // Zone : clé du point de la tâche (`successPoint`), la cible d'action pouvant être la position tenue sur place.
+    case 'zone': return zoneKey(previous.chosen.successPoint ?? a.target);
     case 'recover': return `recover:${playerId}`;
     case 'intercept': return 'intercept';
     case 'chase': return 'chase';
@@ -213,6 +222,17 @@ export function generateTasks(input: DecisionInput, team: TeamId, defenders: rea
   const ownGoal = ownGoalCentre(dir);
   const tasks: DefenceTask[] = [];
 
+  // Postes instanciés des défenseurs (une fois) et ligne du bloc (repère équipe) : plancher des points de marquage et de zone.
+  const slots = new Map<number, Vec2>();
+  let lineX = Infinity;
+  for (const d of defenders) {
+    const s = teamSlot(state, d);
+    slots.set(d.id, s);
+    if (dir * s.x < lineX) lineX = dir * s.x;
+  }
+  const holdFloor = lineX - (dw.lineHoldSlack ?? DEFAULT_LINE_HOLD_SLACK);
+  const holdLine = (point: Vec2): Vec2 => (dir * point.x < holdFloor ? { x: dir * holdFloor, y: point.y } : point);
+
   // Passeur adverse : porteur, sinon adversaire de champ le plus proche du ballon.
   let passer: Player | null = ball.ownerId !== null ? getPlayer(state, ball.ownerId) : null;
   if (passer && passer.team !== opp) passer = null;
@@ -249,6 +269,8 @@ export function generateTasks(input: DecisionInput, team: TeamId, defenders: rea
       const toBall = normalize(sub(ball.pos, ahead));
       point = { x: point.x + ZONAL_BALL_SHIFT * toBall.x, y: point.y + ZONAL_BALL_SHIFT * toBall.y };
     }
+    // Tenue de la ligne : un attaquant plus profond que le bloc est marqué sur la ligne (il est hors-jeu derrière elle).
+    point = holdLine(point);
     marked.push(p.pos);
     tasks.push({ kind: 'mark', point, priority: d.danger / dangerMax, markId: p.id, key: `mark:${p.id}`, label: `marquer ${p.name}` });
   }
@@ -311,7 +333,8 @@ export function generateTasks(input: DecisionInput, team: TeamId, defenders: rea
         const idx = j * src.cols + i;
         const d = field ? field.data[idx] : src.data[idx];
         if (d <= 0 || (nBest === pool && d <= bestD[nBest - 1])) continue;
-        const x = src.xOf(i);
+        // Tenue de la ligne : une cellule plus profonde que le bloc est couverte depuis la ligne (même y).
+        const x = dir * src.xOf(i) < holdFloor ? dir * holdFloor : src.xOf(i);
         if (Math.abs(x) > PITCH.halfLength - TARGET_MARGIN) continue;
         const bdx = x - ball.pos.x, bdy = y - ball.pos.y;
         if (bdx * bdx + bdy * bdy < clear2) continue;
@@ -338,7 +361,7 @@ export function generateTasks(input: DecisionInput, team: TeamId, defenders: rea
 
   // --- Repli : un poste par défenseur ---
   for (const d of defenders) {
-    tasks.push({ kind: 'recover', point: teamSlot(state, d), priority: 0, ownerId: d.id, key: `recover:${d.id}`, label: 'se replier à son poste' });
+    tasks.push({ kind: 'recover', point: slots.get(d.id)!, priority: 0, ownerId: d.id, key: `recover:${d.id}`, label: 'se replier à son poste' });
   }
 
   // Défenseurs les plus proches du ballon (contre-pressing).
@@ -515,15 +538,23 @@ export function containDistance(dw: SimParams['defence'], pressIntensity: number
   return dw.containOffset + (dw.containSlack ?? DEFAULT_CONTAIN_SLACK) * Math.max(0, 1 - pressIntensity);
 }
 
-/** Vitesse de consigne (m/s) d'une tâche défensive (`defence.taskSpeed`). */
+/**
+ * Vitesse de consigne (m/s) d'une tâche défensive (`defence.taskSpeed`). Le repli et la zone sont calmes près de leur
+ * point (replacement) et tendent linéairement vers le sprint entre RAMP_START et RAMP_FULL m (la ligne remonte vite après
+ * un dégagement, le bloc coulisse sans traîner).
+ */
 export function taskSpeed(task: DefenceTask, d: Player, recoverPriority: number, dw: SimParams['defence']): number {
   const ts = dw.taskSpeed ?? DEFAULT_TASK_SPEED;
+  const ramp = (base: number): number => {
+    const far = Math.max(0, Math.min(1, (dist(task.point, d.pos) - RAMP_START) / (RAMP_FULL - RAMP_START)));
+    return d.maxSpeed * Math.min(1, base + (1 - base) * far);
+  };
   switch (task.kind) {
     case 'press': case 'intercept': case 'chase': return d.maxSpeed;
     case 'contain': return d.maxSpeed * ts.contain;
     case 'mark': return d.maxSpeed * Math.min(1, ts.markBase + ts.markGain * task.priority);
-    case 'zone': return d.maxSpeed * ts.zone;
-    default: return d.maxSpeed * Math.min(1, ts.recoverBase + ts.recoverGain * recoverPriority);
+    case 'zone': return ramp(ts.zone);
+    default: return ramp(Math.min(1, ts.recoverBase + ts.recoverGain * recoverPriority));
   }
 }
 

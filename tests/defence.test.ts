@@ -2,7 +2,7 @@
  * Tests de la défense coordonnée et du gardien (src/decision/defence.ts, keeper.ts ; docs/CONCEPTION.md §8) :
  * affectation hongroise sans doublon, pressing dépendant de la tactique (pressing haut / bloc bas), marquage côté but,
  * contre-pressing, optimalité vs affectation gloutonne, hystérésis, interception, symétrie miroir A/B,
- * bissectrice du gardien, sortie sur ballon libre, relance.
+ * bissectrice du gardien, sortie sur ballon libre, relance, tenue de ligne, vitesses de tâche, bloc tactique (simulation).
  */
 import { describe, it, expect } from 'vitest';
 import { DEFAULT_PARAMS } from '@/core/params';
@@ -17,7 +17,9 @@ import { FORMATIONS } from '@/tactics/formations';
 import { makeTactic } from '@/tactics/styles';
 import { computeFields } from '@/models/fields';
 import { createMatch, giveBall } from '@/engine/match';
-import { decideDefence, generateTasks, pressingTrigger, taskCost, defenderInfo, outfieldDefenders, containDistance, INFEASIBLE_COST } from '@/decision/defence';
+import { decideDefence, generateTasks, pressingTrigger, taskCost, defenderInfo, outfieldDefenders, containDistance, previousTaskKey, taskSpeed, INFEASIBLE_COST } from '@/decision/defence';
+import { teamSlot } from '@/decision/loose';
+import { createSimulation } from '@/engine/loop';
 import { decideKeeper, bisectorPosition } from '@/decision/keeper';
 import type { DecisionInput } from '@/decision/policy';
 
@@ -100,7 +102,9 @@ describe('defence — affectation', () => {
         for (const d of defenders) {
           const a = move(m.get(d.id)!)!;
           const di = defenderInfo(input, 'B', d, new Map(), info, nearestToBall);
-          const t = tasks.find((x) => dist(x.point, a.target) < 1e-6 && (x.kind !== 'mark' || x.markId === a.markId))!;
+          // La tâche est identifiée par son point (`successPoint`, la cible d'action pouvant être la position tenue sur place).
+          const point = m.get(d.id)!.chosen.successPoint!;
+          const t = tasks.find((x) => dist(x.point, point) < 1e-6 && (x.kind !== 'mark' || x.markId === a.markId))!;
           expect(t).toBeDefined();
           s += taskCost(input, 'B', d, di, t).cost;
         }
@@ -210,7 +214,8 @@ describe('defence — pressing et marquage tactiques', () => {
   it('marquage : les cibles sont côté but de l’attaquant marqué, n_mark = 2 + ⌊4·markingTightness⌋ borné', () => {
     for (const style of ['high_press', 'possession'] as const) {
       const state = matchState(5, 6, v(15, 0), { A: makeTactic('4-3-3', 'balanced'), B: makeTactic('4-4-2', style) });
-      const input = inputFor(state, 'B');
+      // Géométrie pure du marquage : tenue de ligne désactivée (testée séparément).
+      const input = { ...inputFor(state, 'B'), params: { ...P, defence: { ...P.defence, lineHoldSlack: 100 } } };
       const out = decideDefence(input, 'B', new Map());
       const ownGoal = ownGoalCentre(attackDir('B'));
       const marks = state.players.filter((p) => p.team === 'B' && move(out.get(p.id)!)?.intent === 'mark');
@@ -351,5 +356,97 @@ describe('keeper — placement, sortie, relance', () => {
     expect(d.candidates.filter((c) => (c.action as { kind?: string }).kind === 'lob')).toHaveLength(1);
     expect(d.explanation).toMatch(/^Relance/);
     expect(d.explanation).toMatch(/ne quitte jamais sa surface/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe('defence — tenue de ligne, vitesses de tâche, bloc tactique', () => {
+  /** Ligne du bloc de `team` (repère équipe) : poste instancié le plus bas des joueurs de champ. */
+  const blockLine = (state: MatchState, team: TeamId): number => {
+    const dir = attackDir(team);
+    return Math.min(...outfieldDefenders(state, team).map((d) => dir * teamSlot(state, d).x));
+  };
+
+  it('tenue de ligne (§8.4) : les points de marquage et de zone ne descendent pas sous la ligne du bloc − lineHoldSlack ; sans tenue, le marqueur suit l’attaquant', () => {
+    const state = matchState(21, 6, v(0, 0));
+    // Deux attaquants A très profonds, derrière la ligne du bloc B (ils sont hors-jeu : on les laisse à la ligne).
+    state.players[9].pos = { x: 34, y: -6 };
+    state.players[10].pos = { x: 34, y: 6 };
+    const dir = attackDir('B');
+    const line = blockLine(state, 'B');
+    expect(dir * 34).toBeLessThan(line - 5); // les attaquants sont bien derrière la ligne (repère B : plus petit = plus proche du but B)
+    const held = generateTasks(inputFor(state, 'B'), 'B', outfieldDefenders(state, 'B')).tasks;
+    const floor = line - P.defence.lineHoldSlack!;
+    for (const t of held) if (t.kind === 'mark' || t.kind === 'zone') expect(dir * t.point.x).toBeGreaterThanOrEqual(floor - 1e-9);
+    const deepMarks = held.filter((t) => t.kind === 'mark' && (t.markId === 9 || t.markId === 10));
+    expect(deepMarks.length).toBeGreaterThanOrEqual(1);
+    for (const t of deepMarks) {
+      expect(dir * t.point.x).toBeCloseTo(floor, 6); // marqué sur la ligne, à sa hauteur
+      expect(Math.abs(t.point.y - state.players[t.markId!].pos.y)).toBeLessThan(3);
+    }
+    // Sans tenue de ligne (lineHoldSlack ≥ 100) : le point de marquage est côté but de l'attaquant, donc plus profond que la ligne.
+    const free = generateTasks({ ...inputFor(state, 'B'), params: { ...P, defence: { ...P.defence, lineHoldSlack: 100 } } }, 'B', outfieldDefenders(state, 'B')).tasks;
+    const freeMarks = free.filter((t) => t.kind === 'mark' && (t.markId === 9 || t.markId === 10));
+    expect(freeMarks.length).toBeGreaterThanOrEqual(1);
+    for (const t of freeMarks) expect(dir * t.point.x).toBeLessThan(floor - 5);
+  });
+
+  it('vitesses de tâche : zone et repli calmes près de leur point et au sprint au-delà de 20 m ; marquage 0,45 + 0,3·priorité ; contain 0,7', () => {
+    const state = matchState(22, 6, v(0, 0));
+    const d = outfieldDefenders(state, 'B')[0];
+    const ts = P.defence.taskSpeed!;
+    const near = (kind: 'recover' | 'zone') => ({ kind, point: { x: d.pos.x + 2, y: d.pos.y }, priority: 0, key: 'k', label: '' } as const);
+    const far = (kind: 'recover' | 'zone') => ({ kind, point: { x: d.pos.x + 30, y: d.pos.y }, priority: 0, key: 'k', label: '' } as const);
+    const rp = 0.5;
+    expect(taskSpeed(near('recover'), d, rp, P.defence)).toBeCloseTo(d.maxSpeed * (ts.recoverBase + ts.recoverGain * rp), 9);
+    expect(taskSpeed(far('recover'), d, rp, P.defence)).toBeCloseTo(d.maxSpeed, 9);
+    expect(taskSpeed(near('zone'), d, rp, P.defence)).toBeCloseTo(d.maxSpeed * ts.zone, 9);
+    expect(taskSpeed(far('zone'), d, rp, P.defence)).toBeCloseTo(d.maxSpeed, 9);
+    const mid = { kind: 'recover' as const, point: { x: d.pos.x + 13, y: d.pos.y }, priority: 0, key: 'k', label: '' };
+    const base = ts.recoverBase + ts.recoverGain * rp;
+    expect(taskSpeed(mid, d, rp, P.defence)).toBeCloseTo(d.maxSpeed * (base + (1 - base) * 0.5), 6);
+    expect(taskSpeed({ kind: 'mark', point: far('zone').point, priority: 1, key: 'k', label: '' }, d, rp, P.defence)).toBeCloseTo(d.maxSpeed * Math.min(1, ts.markBase + ts.markGain), 9);
+    expect(taskSpeed({ kind: 'contain', point: far('zone').point, priority: 0.5, key: 'k', label: '' }, d, rp, P.defence)).toBeCloseTo(d.maxSpeed * ts.contain, 9);
+    expect(taskSpeed({ kind: 'press', point: far('zone').point, priority: 1, key: 'k', label: '' }, d, rp, P.defence)).toBeCloseTo(d.maxSpeed, 9);
+  });
+
+  it('zone tenue sur place : la clé de tâche précédente vient du point de la tâche (successPoint), pas de la position tenue', () => {
+    const base: Decision = { playerId: 15, time: 0, chosen: { action: { type: 'move', target: { x: 10, y: 4 }, intent: 'zone', speed: 3 }, score: 0, probability: 1, valueIfSuccess: 0, valueIfFailure: 0, components: [], reason: '', successPoint: { x: 30, y: -20 } }, candidates: [], context: { phase: 'defence', style: 'balanced', formation: '4-4-2', pressure: 0, availableTeammates: 0, localSuperiority: 0 }, explanation: '', computeMs: 0 };
+    const atPoint: Decision = { ...base, chosen: { ...base.chosen, action: { type: 'move', target: { x: 30, y: -20 }, intent: 'zone', speed: 3 }, successPoint: undefined } };
+    expect(previousTaskKey(base, 15)).toBe(previousTaskKey(atPoint, 15));
+    expect(previousTaskKey(base, 15)).toMatch(/^zone:/);
+  });
+
+  it('bloc tactique (simulation 3 × 120 s) : la ligne défensive d’un pressing haut est nettement plus haute que celle d’un bloc bas, et proche de son poste', () => {
+    // Trois graines : sur 120 s, la hauteur mesurée dépend surtout de la position du ballon pendant les rares phases
+    // défensives du pressing haut (une graine isolée peut donner un écart de 3 m comme de 25 m) ; la moyenne sur
+    // trois matchs courts mesure l’effet tactique et non la trajectoire.
+    const line: Record<TeamId, number[]> = { A: [], B: [] };
+    const lag: Record<TeamId, number[]> = { A: [], B: [] };
+    for (const seed of [21, 22, 23]) {
+      const cfg = { seed, tactics: { A: makeTactic('4-3-3', 'high_press'), B: makeTactic('4-4-2', 'low_block') }, params: P, durationSec: 120 };
+      const sim = createSimulation(cfg);
+      sim.advance(120, {
+        onDecisions: (_d, s) => {
+          for (const team of ['A', 'B'] as TeamId[]) {
+            if (!s.possession || s.possession === team) continue;
+            const dir = attackDir(team);
+            const dfs = s.players.filter((p) => p.team === team && p.role === 'DF');
+            const h = dfs.reduce((acc, p) => acc + dir * p.pos.x, 0) / dfs.length;
+            const slot = dfs.reduce((acc, p) => acc + dir * teamSlot(s, p).x, 0) / dfs.length;
+            line[team].push(h);
+            lag[team].push(slot - h);
+          }
+        },
+      });
+    }
+    const mean = (xs: number[]): number => xs.reduce((a, b) => a + b, 0) / xs.length;
+    expect(line.A.length).toBeGreaterThan(150);
+    expect(line.B.length).toBeGreaterThan(150);
+    console.log(`ligne défensive (repère équipe) : pressing haut ${mean(line.A).toFixed(1)} m (retard sur le poste ${mean(lag.A).toFixed(1)} m), bloc bas ${mean(line.B).toFixed(1)} m (retard ${mean(lag.B).toFixed(1)} m)`);
+    expect(mean(line.A)).toBeGreaterThan(mean(line.B) + 4);
+    // Les défenseurs suivent leur ligne (tenue de ligne + repli accéléré) ; le retard restant est transitoire (remontée après un dégagement).
+    expect(mean(lag.A)).toBeLessThan(15);
+    expect(mean(lag.B)).toBeLessThan(8);
   });
 });

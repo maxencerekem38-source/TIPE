@@ -3,12 +3,14 @@
  *  1. champs spatiaux : computeFields → state.fields (seule écriture dans l'état) ;
  *  2. équipe attaquante = équipe du porteur, sinon équipe en possession ;
  *  3. porteur de champ → onBall ; gardien → decideKeeper (relance §8.6 s'il est porteur, sinon placement) ;
- *     coéquipiers → offBall ; équipe adverse → defence (gardien inclus) ;
+ *     coéquipiers → offBall, puis règle collective « un seul coureur par bande latérale » (§7.2, allocateRuns) ;
+ *     équipe adverse → defence (gardien inclus) ;
  *  4. ballon libre : receveur désigné d'une passe → « receive » (l'équipe du passeur n'a alors pas d'autre coureur) ;
  *     sortie du gardien (decideKeeper, ballon libre dans sa surface et gardien premier dessus) = chasseur de son équipe ;
  *     sinon, par équipe, le joueur au plus petit temps d'interception du ballon → « chase » / « intercept » (jusqu'à 2 par
  *     équipe si le ballon est disputé) ; le frappeur sous immunité (physics.kickerImmunity) ne court pas après sa passe ;
- *     les autres gardent leur comportement de phase ; les points de rencontre sont stables (conservés à < 3 m) ;
+ *     les autres gardent leur comportement de phase ; les points de rencontre sont stables (conservés à < 3 m ou tant
+ *     qu'ils restent atteignables avant le ballon, loose.stableMeetingPoint) ;
  *  5. gel de remise en jeu : tous les joueurs rejoignent leur poste (« hold_shape »), le remetteur conserve le ballon.
  * Écritures dans l'état : `state.fields` (champs) et `state.slotBallRef` (référence de ballon lissée des postes, §7.2).
  * Retourne une décision pour CHAQUE joueur.
@@ -16,11 +18,12 @@
 import type { Decision, MatchState, Player, SimParams, TeamId } from '../core/types';
 import { attackDir, otherTeam, TEAMS } from '../core/types';
 import type { Rng } from '../core/rng';
+import { PITCH } from '../core/pitch';
 import { computeFields } from '../models/fields';
 import { fmtFr, fmtPoint } from './explain';
 import { decideDefence } from './defence';
 import { decideKeeper } from './keeper';
-import { rankChasers, receiveTarget, simpleHoldDecision, simpleMoveDecision, stableMeetingPoint, teamSlot, updateSlotBallRef } from './loose';
+import { rankChasers, receiveMeeting, simpleHoldDecision, simpleMoveDecision, stableMeetingPoint, teamSlot, updateSlotBallRef } from './loose';
 import { decideOffBall } from './offball';
 import { decideOnBall } from './onball';
 import type { DecisionInput, PolicySet } from './policy';
@@ -29,6 +32,8 @@ import type { DecisionInput, PolicySet } from './policy';
 const CONTESTED_MARGIN = 0.5;
 /** Vitesse (fraction de v_max) du retour au poste pendant un gel. */
 const FREEZE_SPEED = 0.6;
+/** Largeur de bande latérale (m) par défaut si `offBall.runBandWidth` est absent (0 = règle désactivée). */
+const DEFAULT_RUN_BAND_WIDTH = 15;
 
 /** La politique complète (algorithme principal). */
 export const FULL_POLICY: PolicySet = {
@@ -46,6 +51,48 @@ const inputFor = (state: MatchState, params: SimParams, rng: Rng, team: TeamId):
 function freezeDecision(input: DecisionInput, p: Player): Decision {
   const target = teamSlot(input.state, p);
   return simpleMoveDecision(input, p, target, 'hold_shape', p.maxSpeed * FREEZE_SPEED, `Remise en jeu : retour au poste ${fmtPoint(target)} pendant le gel.`);
+}
+
+/** Bande latérale (indice entier) d'un point : bandes de `width` m sur y, comptées depuis la ligne de touche y = −W/2. */
+export const runBand = (y: number, width: number): number => Math.floor((y + PITCH.halfWidth) / width);
+
+/**
+ * Un seul coureur par bande latérale (§7.2) : parmi les joueurs de `team` dont l'action choisie est un appel en
+ * profondeur (intention « run »), les appels sont attribués gloutonnement par utilité décroissante avec au plus un
+ * appel par bande de `offBall.runBandWidth` m (bandes sur y, repère terrain, cible de l'appel). Les perdants gardent
+ * leur meilleur candidat non-appel (le premier de leur liste triée qui n'est pas un appel), sinon le retour au poste.
+ * Les décisions rétrogradées sont réécrites dans `out` ; retourne les identifiants des joueurs rétrogradés.
+ */
+export function allocateRuns(state: MatchState, params: SimParams, out: Map<number, Decision>, team: TeamId, input: DecisionInput): number[] {
+  const w = params.offBall.runBandWidth ?? DEFAULT_RUN_BAND_WIDTH;
+  if (!(w > 0)) return []; // 0 = règle désactivée (comparaisons avant / après)
+  const width = w;
+  const runners: { p: Player; d: Decision; band: number }[] = [];
+  for (const p of state.players) {
+    if (p.team !== team) continue;
+    const d = out.get(p.id);
+    const a = d?.chosen.action;
+    if (!d || !a || a.type !== 'move' || a.intent !== 'run') continue;
+    runners.push({ p, d, band: runBand(a.target.y, width) });
+  }
+  if (runners.length < 2) return [];
+  runners.sort((a, b) => b.d.chosen.score - a.d.chosen.score || a.p.id - b.p.id);
+  const taken = new Map<number, { p: Player; score: number }>();
+  const demoted: number[] = [];
+  for (const r of runners) {
+    const winner = taken.get(r.band);
+    if (!winner) { taken.set(r.band, { p: r.p, score: r.d.chosen.score }); continue; }
+    const alt = r.d.candidates.find((c) => c.action.type === 'move' && c.action.intent !== 'run');
+    const note = `Appel en profondeur cédé à ${winner.p.name} (même bande latérale de ${fmtFr(width, 0)} m, utilité ${fmtFr(winner.score, 3)} ≥ ${fmtFr(r.d.chosen.score, 3)})`;
+    if (alt) out.set(r.p.id, { ...r.d, chosen: alt, keptByHysteresis: undefined, explanation: `${r.d.explanation}\n${note} : repli sur ${alt.reason}` });
+    else {
+      const slot = teamSlot(state, r.p);
+      const d = simpleMoveDecision(input, r.p, slot, 'hold_shape', r.p.maxSpeed * FREEZE_SPEED, `${note} : retour au poste ${fmtPoint(slot)}.`);
+      out.set(r.p.id, { ...d, explanation: `${r.d.explanation}\n${d.explanation}` });
+    }
+    demoted.push(r.p.id);
+  }
+  return demoted;
 }
 
 export function decideAll(state: MatchState, params: SimParams, policies: Record<TeamId, PolicySet>, previous: Map<number, Decision>, rng: Rng): Map<number, Decision> {
@@ -79,6 +126,9 @@ export function decideAll(state: MatchState, params: SimParams, policies: Record
     else if (owner && p.id === owner.id) out.set(p.id, policies[attacking].onBall(att, p.id, prev));
     else out.set(p.id, policies[attacking].offBall(att, p.id, prev));
   }
+  // Règle collective §7.2 : au plus un appel en profondeur par bande latérale (les perdants gardent leur meilleur
+  // candidat non-appel).
+  allocateRuns(state, params, out, attacking, att);
 
   // --- Équipe défendante (gardien inclus par decideDefence ; sinon ajouté) ---
   const def = inputs[defending];
@@ -100,7 +150,8 @@ export function decideAll(state: MatchState, params: SimParams, policies: Record
       const r = state.players.find((p) => p.id === flight!.targetId);
       if (r) {
         receiverId = r.id;
-        const target = stableMeetingPoint(previous.get(r.id), 'receive', receiveTarget(state, params, r));
+        const meet = receiveMeeting(state, params, r);
+        const target = stableMeetingPoint(previous.get(r.id), 'receive', meet.point, { player: r, ball, params, time: meet.time });
         out.set(r.id, simpleMoveDecision(inputs[r.team], r, target, 'receive', r.maxSpeed, `Passe en cours vers ${r.name} : course au point de rencontre ${fmtPoint(target)}.`));
       }
     }
@@ -131,7 +182,7 @@ export function decideAll(state: MatchState, params: SimParams, policies: Record
         const intent = intercepting ? 'intercept' : 'chase';
         const other = team === 'A' ? bestB : bestA;
         const reason = `${intent === 'intercept' ? 'Interception' : 'Course au ballon libre'} : ${p.name} rejoint le ballon en ${fmtFr(c.time, 1)} s (adversaire le plus rapide : ${Number.isFinite(other) ? fmtFr(other, 1) + ' s' : 'aucun'})${contested ? ', ballon disputé' : ''}.`;
-        const target = stableMeetingPoint(previous.get(p.id), intent, c.point);
+        const target = stableMeetingPoint(previous.get(p.id), intent, c.point, { player: p, ball, params, time: c.time });
         out.set(p.id, simpleMoveDecision(inputs[team], p, target, intent, p.maxSpeed, reason));
         chasers.add(p.id);
       }

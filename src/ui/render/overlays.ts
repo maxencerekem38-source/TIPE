@@ -180,6 +180,9 @@ export interface PassLineOptions {
   labelSize: number;
 }
 
+/** Probabilité en deçà de laquelle une ligne de passe non choisie ni survolée n'affiche pas d'étiquette. */
+const PILL_MIN_PROBABILITY = 0.05;
+
 export function drawPassLines(ctx: CanvasRenderingContext2D, t: Transform, state: MatchState, decision: Decision, opt: PassLineOptions): void {
   const owner = state.players[decision.playerId];
   if (!owner) return;
@@ -223,10 +226,13 @@ export function drawPassLines(ctx: CanvasRenderingContext2D, t: Transform, state
       ctx.setLineDash([]);
       if (chosen) arrowHead(ctx, s, { x: f.x + (dx / l) * r * 0.5, y: f.y + (dy / l) * r * 0.5 }, Math.max(8, px(t, 1.8)));
       ctx.shadowBlur = 0;
-      // Étiquette de probabilité au bout de la ligne, décalée perpendiculairement
-      const lx = e.x - (dx / l) * px(t, 3.2) - (dy / l) * px(t, 1.8);
-      const ly = e.y - (dy / l) * px(t, 3.2) + (dx / l) * px(t, 1.8);
-      pill(ctx, lx, ly, fmtNumber(c.probability, 2), hovered ? '#ffffff' : color, hovered ? '#111827' : '#ffffff', opt.labelSize);
+      // Étiquette de probabilité au bout de la ligne, décalée perpendiculairement (les passes quasi impossibles
+      // non choisies ni survolées n'en ont pas : leurs étiquettes « 0,00 » s'empilaient autour du porteur)
+      if (chosen || hovered || c.probability >= PILL_MIN_PROBABILITY) {
+        const lx = e.x - (dx / l) * px(t, 3.2) - (dy / l) * px(t, 1.8);
+        const ly = e.y - (dy / l) * px(t, 3.2) + (dx / l) * px(t, 1.8);
+        pill(ctx, lx, ly, fmtNumber(c.probability, 2), hovered ? '#ffffff' : color, hovered ? '#111827' : '#ffffff', opt.labelSize);
+      }
     } else if (a.type === 'dribble') {
       const e = toScreen(t, { x: owner.pos.x + a.direction.x * a.distance, y: owner.pos.y + a.direction.y * a.distance });
       const dx = e.x - o.x, dy = e.y - o.y, l = Math.hypot(dx, dy) || 1;

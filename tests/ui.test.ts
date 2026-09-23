@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { fmtNumber, fmtPercent, fmtClock, fmtMs, actionLabel, INTENT_LABELS } from '@/ui/format';
+import { fmtNumber, fmtPercent, fmtClock, fmtMs, fmtPoint, actionLabel, intentTitle, moveTargetLabel, INTENT_LABELS } from '@/ui/format';
+import { DEFAULT_CATEGORY, groupScenarios } from '@/ui/panels/scenarios';
+import type { Scenario } from '@/ui/app';
 import { controlRamp, threatRamp, pressureRamp, scoreRamp, rgbaCss } from '@/ui/render/colors';
 import { makeTransform, toScreen, toWorld, px } from '@/ui/render/pitch';
 import { createSimulation } from '@/engine/loop';
@@ -35,6 +37,29 @@ describe('format', () => {
     expect(actionLabel({ type: 'hold' })).toBe('Conserver');
     expect(INTENT_LABELS.press).toBe('pressing');
     expect(Object.keys(INTENT_LABELS)).toHaveLength(15);
+  });
+  it('libelle les déplacements sans ballon : intention en titre, cible « (x ; y) · d m · v m/s », « tenir sa place » à ≤ 0,5 m', () => {
+    expect(fmtPoint({ x: 12.34, y: -4 })).toBe('(12,3 ; −4,0)');
+    expect(intentTitle('run')).toBe('Appel');
+    expect(intentTitle('exploit_space')).toBe('Exploiter espace');
+    const run = { type: 'move' as const, target: { x: 30, y: -4 }, intent: 'run' as const, speed: 8 };
+    expect(moveTargetLabel(run, { x: 18, y: -4 })).toBe('(30,0 ; −4,0) · 12 m · 8,0 m/s');
+    expect(moveTargetLabel(run)).toBe('(30,0 ; −4,0) · 8,0 m/s');
+    expect(moveTargetLabel(run, { x: 18, y: -4 }, true)).toBe('(30,0 ; −4,0) · 12 m');
+    expect(moveTargetLabel({ ...run, intent: 'hold_shape', target: { x: 18.2, y: -4 } }, { x: 18, y: -4 })).toBe('tenir sa place (18,2 ; −4,0)');
+    expect(moveTargetLabel({ ...run, intent: 'hold_shape', target: { x: 18.2, y: -4 } }, { x: 18, y: -4 }, true)).toBe('tenir sa place');
+  });
+});
+
+describe('panneau « Scénarios » : regroupement par catégorie', () => {
+  it('groupe dans l’ordre de première apparition, conserve l’ordre interne, catégorie « Général » par défaut', () => {
+    const mk = (id: string, category?: string): Scenario => ({ id, name: id, description: '', category, apply: () => undefined });
+    const groups = groupScenarios([mk('kickoff'), mk('a', 'Transitions'), mk('b', 'Finition'), mk('c', 'Transitions'), mk('d')]);
+    expect(groups.map((g) => g.category)).toEqual([DEFAULT_CATEGORY, 'Transitions', 'Finition']);
+    expect(groups[0].items.map((s) => s.id)).toEqual(['kickoff', 'd']);
+    expect(groups[1].items.map((s) => s.id)).toEqual(['a', 'c']);
+    expect(groups[2].items.map((s) => s.id)).toEqual(['b']);
+    expect(groupScenarios([])).toEqual([]);
   });
 });
 

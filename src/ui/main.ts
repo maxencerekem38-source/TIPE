@@ -35,7 +35,8 @@ function boot(): void {
   for (const s of SCENARIOS) {
     app.registerScenario({
       id: s.id,
-      name: `${SCENARIO_CATEGORIES[s.category]} — ${s.name}`,
+      name: s.name,
+      category: SCENARIO_CATEGORIES[s.category],
       description: s.description,
       apply: (a) => {
         a.pause();
@@ -83,6 +84,8 @@ function boot(): void {
   showTab('decision');
   (window as any).__app = app; // pratique pour le débogage et les captures d'écran
   (window as any).__showTab = showTab;
+  // Mode présentation : classe sur la racine (CSS : aide masquée, panneau resserré, terrain agrandi).
+  app.on('ui', () => rootEl.classList.toggle('presentation', app.presentation));
 
   // Vue terrain
   const view = new PitchView(stage, app);
@@ -90,7 +93,7 @@ function boot(): void {
   // Aide clavier discrète
   stage.append(el('div', { class: 'hint-bar' },
     el('kbd', {}, 'Espace'), ' lecture/pause · ', el('kbd', {}, 'N'), ' pas · ', el('kbd', {}, 'R'), ' réinitialiser · ',
-    el('kbd', {}, '1'), '–', el('kbd', {}, '9'), ' calques · ', el('kbd', {}, '+'), '/', el('kbd', {}, '−'), ' vitesse · clic : sélectionner un joueur',
+    el('kbd', {}, '1'), '–', el('kbd', {}, '9'), ' calques · ', el('kbd', {}, '+'), '/', el('kbd', {}, '−'), ' vitesse · ', el('kbd', {}, 'P'), ' présentation · clic : sélectionner un joueur',
   ));
 
   // Clavier
@@ -101,6 +104,7 @@ function boot(): void {
       case ' ': ev.preventDefault(); app.toggle(); break;
       case 'n': case 'N': app.step(); break;
       case 'r': case 'R': app.reset(); break;
+      case 'p': case 'P': app.togglePresentation(); break;
       case '+': case '=': app.speedUp(); break;
       case '-': case '_': app.speedDown(); break;
       case 'Escape': app.selectPlayer(null); break;

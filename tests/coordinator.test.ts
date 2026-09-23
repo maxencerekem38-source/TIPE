@@ -1,25 +1,25 @@
 /**
  * Tests du coordonnateur, du ballon libre et des baselines (src/decision/coordinator.ts, loose.ts, baselines.ts) :
  * 22 décisions valides, receveur / chasseurs, gel de remise en jeu, déterminisme, budget de performance,
- * simulation complète, candidats triés et regret ≥ 0 pour les baselines.
+ * simulation complète, candidats triés et regret ≥ 0 pour les baselines, point de rencontre physiquement stable.
  */
 import { describe, it, expect } from 'vitest';
 import { DEFAULT_PARAMS } from '@/core/params';
 import { Rng } from '@/core/rng';
 import { isInsidePitch } from '@/core/pitch';
-import type { Candidate, Decision, MatchState, TeamId } from '@/core/types';
+import type { Candidate, Decision, MatchState, MoveIntent, TeamId } from '@/core/types';
 import type { Vec2 } from '@/core/vec2';
 import { dist } from '@/core/vec2';
 import { makeTactic } from '@/tactics/styles';
 import { createMatch, giveBall, slotPosition } from '@/engine/match';
 import { createSimulation } from '@/engine/loop';
 import { computeFields } from '@/models/fields';
-import { decideAll, FULL_POLICY, attackingTeam } from '@/decision/coordinator';
-import { ballPositionAt, ballStopPoint, timeToBall, rankChasers, stableMeetingPoint, updateSlotBallRef } from '@/decision/loose';
-import { timeToArrive } from '@/models/motion';
+import { allocateRuns, decideAll, FULL_POLICY, attackingTeam, runBand } from '@/decision/coordinator';
+import { ballPositionAt, ballStopPoint, ballTimeAt, engagedArrivalTime, meetingStillValid, timeToBall, rankChasers, stableMeetingPoint, teamSlot, updateSlotBallRef } from '@/decision/loose';
+import { runTime, timeToArrive } from '@/models/motion';
 import { decideKeeper } from '@/decision/keeper';
 import { BASELINES, pickGreedyProgress, pickGreedySafe, pickRandom, withChosen, candidateEndPoint } from '@/decision/baselines';
-import type { PolicySet } from '@/decision/policy';
+import type { DecisionInput, PolicySet } from '@/decision/policy';
 
 const P = DEFAULT_PARAMS;
 const v = (x: number, y: number): Vec2 => ({ x, y });
@@ -374,5 +374,193 @@ describe('baselines', () => {
       if (name === 'greedy_safe') expect(d.chosen.probability).toBeCloseTo(Math.max(...d.candidates.map((c) => c.probability)), 9);
       if (name === 'no_lookahead') expect(d.candidates.every((c) => !c.components.some((x) => x.key === 'lookahead'))).toBe(true);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe('coordinator — point de rencontre physiquement stable (loose.ballTimeAt, meetingStillValid)', () => {
+  const rolling = (state: MatchState, speed: number): MatchState['ball'] => {
+    const ball = state.ball;
+    ball.ownerId = null;
+    ball.pos = { x: 0, y: 0 };
+    ball.vel = { x: speed, y: 0 };
+    ball.flight = null;
+    return ball;
+  };
+
+  it('ballTimeAt : instant de passage du ballon roulant (s·t − μt²/2 = d), ∞ hors trajectoire, derrière le ballon ou au-delà du point d’arrêt', () => {
+    const state = matchState(31, 6, v(0, 0));
+    const ball = rolling(state, 9);
+    const mu = P.physics.ballFriction;
+    const t10 = ballTimeAt(ball, { x: 10, y: 0 }, P.physics);
+    expect(t10).toBeCloseTo((9 - Math.sqrt(81 - 2 * mu * 10)) / mu, 9);
+    expect(dist(ballPositionAt(ball, t10, P.physics), { x: 10, y: 0 })).toBeLessThan(1e-6);
+    const stop = ballStopPoint(ball, P.physics);
+    expect(ballTimeAt(ball, stop.point, P.physics)).toBeCloseTo(stop.time, 6);
+    expect(ballTimeAt(ball, { x: 10, y: 3 }, P.physics)).toBe(Infinity); // hors de la ligne
+    expect(ballTimeAt(ball, { x: -5, y: 0 }, P.physics)).toBe(Infinity); // déjà dépassé
+    expect(ballTimeAt(ball, { x: stop.point.x + 5, y: 0 }, P.physics)).toBe(Infinity); // au-delà de l'arrêt
+    ball.vel = { x: 0, y: 0 };
+    expect(ballTimeAt(ball, { x: 0.5, y: 0 }, P.physics)).toBe(0);
+    expect(ballTimeAt(ball, { x: 5, y: 0 }, P.physics)).toBe(Infinity);
+  });
+
+  it('meetingStillValid / stableMeetingPoint : l’ancien point est gardé s’il reste atteignable avant le ballon (à meetingKeepGain s près), remplacé sinon', () => {
+    const state = matchState(32, 6, v(0, 0));
+    const ball = rolling(state, 12);
+    const receiver = state.players[9];
+    receiver.pos = { x: 30, y: 0 };
+    receiver.vel = { x: 0, y: 0 };
+    const fresh = timeToBall(receiver, ball, P);
+    const mk = (target: Vec2): Decision => ({ playerId: receiver.id, time: 0, chosen: { action: { type: 'move', target, intent: 'receive', speed: 8 }, score: 0, probability: 1, valueIfSuccess: 0, valueIfFailure: 0, components: [], reason: '' }, candidates: [], context: { phase: 'attack', style: 'balanced', formation: '4-3-3', pressure: 0, availableTeammates: 0, localSuperiority: 0 }, explanation: '', computeMs: 0 });
+    const ctx = { player: receiver, ball, params: P, time: fresh.time };
+    // Ancien point un peu plus loin sur la trajectoire (le ballon y passe 0,4 s après le point de rencontre le plus tôt) : gardé même à > 3 m.
+    const later = ballPositionAt(ball, fresh.time + 0.4, P.physics);
+    expect(dist(later, fresh.point)).toBeGreaterThan(3);
+    expect(meetingStillValid(later, ctx)).toBe(true);
+    expect(stableMeetingPoint(mk(later), 'receive', fresh.point, ctx)).toEqual(later);
+    // Trop tard par rapport au nouveau point (> meetingKeepGain) : remplacé.
+    const tooLate = ballPositionAt(ball, fresh.time + P.offBall.meetingKeepGain! + 0.3, P.physics);
+    expect(meetingStillValid(tooLate, ctx)).toBe(false);
+    expect(stableMeetingPoint(mk(tooLate), 'receive', fresh.point, ctx)).toEqual(fresh.point);
+    // Point déjà dépassé par le ballon, ou hors trajectoire : remplacé.
+    expect(meetingStillValid({ x: -3, y: 0 }, ctx)).toBe(false);
+    expect(meetingStillValid({ x: 12, y: 4 }, ctx)).toBe(false);
+    // Point sur la trajectoire que le joueur ne peut plus atteindre avant le ballon : remplacé.
+    const early = ballPositionAt(ball, 0.15, P.physics);
+    expect(meetingStillValid(early, ctx)).toBe(false);
+    expect(stableMeetingPoint(mk(early), 'receive', fresh.point, ctx)).toEqual(fresh.point);
+    // Sans contexte : règle des 3 m seule.
+    expect(stableMeetingPoint(mk(later), 'receive', fresh.point)).toEqual(fresh.point);
+  });
+
+  it('simulation : pendant une passe au sol, la cible du receveur désigné ne recule pas le long de la trajectoire (≤ 2 cibles distinctes par passe)', () => {
+    const sim = createSimulation({ seed: 33, tactics: { A: makeTactic('4-3-3', 'balanced'), B: makeTactic('4-4-2', 'balanced') }, params: P, durationSec: 90 }, { policies: POLICIES });
+    const perFlight = new Map<string, Vec2[]>();
+    sim.advance(90, {
+      onDecisions: (decisions, state) => {
+        const f = state.ball.flight;
+        if (!f || state.ball.ownerId !== null || f.targetId === null || f.kind === 'lob' || f.kind === 'clearance') return;
+        const d = decisions.get(f.targetId);
+        const a = d?.chosen.action;
+        if (!a || a.type !== 'move' || a.intent !== 'receive') return;
+        const key = `${f.kickerId}:${f.startTime.toFixed(3)}`;
+        const list = perFlight.get(key) ?? [];
+        if (!list.some((q) => dist(q, a.target) < 0.5)) list.push({ x: a.target.x, y: a.target.y });
+        perFlight.set(key, list);
+      },
+    });
+    const flights = [...perFlight.values()].filter((l) => l.length > 0);
+    expect(flights.length).toBeGreaterThanOrEqual(8);
+    const unstable = flights.filter((l) => l.length > 2).length;
+    console.log(`passes suivies : ${flights.length}, cibles de réception distinctes par passe : ${(flights.reduce((s, l) => s + l.length, 0) / flights.length).toFixed(2)} (instables > 2 : ${unstable})`);
+    expect(flights.reduce((s, l) => s + l.length, 0) / flights.length).toBeLessThan(2.2);
+    expect(unstable / flights.length).toBeLessThanOrEqual(0.25);
+  });
+
+  it('engagedArrivalTime : à l’arrêt = runTime (sans temps de réaction) ; lancé vers la cible, d/v_max ; s’en éloignant, comme à l’arrêt ; toujours < timeToArrive', () => {
+    const state = matchState(37, 6, v(0, 0));
+    const p = state.players[9];
+    p.pos = { x: 0, y: 0 };
+    p.vel = { x: 0, y: 0 };
+    const q = { x: 20, y: 0 };
+    expect(engagedArrivalTime(p, q)).toBeCloseTo(runTime(20, p.maxSpeed, p.maxAccel), 9);
+    expect(engagedArrivalTime(p, q)).toBeLessThan(timeToArrive(p.pos, p.vel, q, p.maxSpeed, p.maxAccel, P.models));
+    p.vel = { x: p.maxSpeed, y: 0 };
+    expect(engagedArrivalTime(p, q)).toBeCloseTo(20 / p.maxSpeed, 9);
+    expect(engagedArrivalTime(p, q)).toBeLessThan(timeToArrive(p.pos, p.vel, q, p.maxSpeed, p.maxAccel, P.models));
+    p.vel = { x: -p.maxSpeed, y: 0 };
+    expect(engagedArrivalTime(p, q)).toBeCloseTo(runTime(20, p.maxSpeed, p.maxAccel), 9);
+    p.vel = { x: 0, y: p.maxSpeed }; // vitesse orthogonale : aucune composante utile
+    expect(engagedArrivalTime(p, q)).toBeCloseTo(runTime(20, p.maxSpeed, p.maxAccel), 9);
+    expect(engagedArrivalTime(p, p.pos)).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe('coordinator — un seul coureur par bande latérale (§7.2, allocateRuns)', () => {
+  const mkMove = (target: Vec2, intent: MoveIntent, score: number, reason: string): Candidate => ({
+    action: { type: 'move', target, intent, speed: 8 }, score, probability: 1, valueIfSuccess: 0, valueIfFailure: 0, components: [], reason,
+  });
+  const mkDecision = (state: MatchState, id: number, candidates: Candidate[]): Decision => ({
+    playerId: id, time: state.time, chosen: candidates[0], candidates, explanation: 'Intention : appel.', computeMs: 0, committedUntil: state.time + 2,
+    context: { phase: 'attack', style: 'balanced', formation: '4-3-3', pressure: 0, availableTeammates: 0, localSuperiority: 0 },
+  });
+
+  it('runBand : bandes de largeur w sur y, comptées depuis la ligne de touche y = −34', () => {
+    expect(runBand(-34, 15)).toBe(0);
+    expect(runBand(-19.5, 15)).toBe(0);
+    expect(runBand(-19, 15)).toBe(1);
+    expect(runBand(0, 15)).toBe(2);
+    expect(runBand(33, 15)).toBe(4);
+    expect(runBand(0, 10)).toBe(3);
+  });
+
+  it('allocation gloutonne par utilité : deux appels dans la même bande ⇒ le meilleur garde le sien, l’autre reprend son meilleur candidat non-appel (explication annotée, engagement conservé) ; bandes différentes ⇒ tous gardés ; sans repli ⇒ retour au poste ; largeur 0 ⇒ désactivé', () => {
+    const state = matchState(35, 6, v(0, 0));
+    const input: DecisionInput = { state, fields: await0(state), params: P, tactic: state.tactics.A, rng: new Rng(1) };
+    const build = (): Map<number, Decision> => {
+      const out = new Map<number, Decision>();
+      out.set(8, mkDecision(state, 8, [mkMove(v(30, -20), 'run', 0.9, 'appel bande 0'), mkMove(v(10, -20), 'support', 0.5, 'soutien 8')]));
+      out.set(9, mkDecision(state, 9, [mkMove(v(30, 2), 'run', 0.8, 'appel bande 2'), mkMove(v(12, 0), 'support', 0.6, 'soutien 9')]));
+      out.set(10, mkDecision(state, 10, [mkMove(v(28, 5), 'run', 0.7, 'appel bande 2 aussi'), mkMove(v(5, 12), 'width', 0.4, 'largeur 10')]));
+      return out;
+    };
+    expect(runBand(2, P.offBall.runBandWidth)).toBe(runBand(5, P.offBall.runBandWidth));
+    expect(runBand(-20, P.offBall.runBandWidth)).not.toBe(runBand(2, P.offBall.runBandWidth));
+    const out = build();
+    expect(allocateRuns(state, P, out, 'A', input)).toEqual([10]);
+    expect(move(out.get(8)!)!.intent).toBe('run');
+    expect(move(out.get(9)!)!.intent).toBe('run');
+    const d10 = out.get(10)!;
+    expect(move(d10)!.intent).toBe('width');
+    expect(d10.chosen).toBe(d10.candidates[1]);
+    expect(d10.candidates).toHaveLength(2); // la liste des candidats n'est pas modifiée
+    expect(d10.explanation).toContain('cédé à');
+    expect(d10.explanation).toContain(state.players[9].name);
+    expect(d10.explanation).toContain('largeur 10');
+    expect(d10.committedUntil).toBe(state.time + 2);
+    // Ordre d'utilité, pas d'identifiant : si 10 a la meilleure utilité, c'est 9 qui cède.
+    const out2 = build();
+    out2.get(10)!.chosen.score = 0.95;
+    expect(allocateRuns(state, P, out2, 'A', input)).toEqual([9]);
+    expect(move(out2.get(9)!)!.intent).toBe('support');
+    expect(move(out2.get(10)!)!.intent).toBe('run');
+    // Sans candidat non-appel : retour au poste (hold_shape vers le poste instancié).
+    const out3 = build();
+    out3.get(10)!.candidates.length = 1;
+    expect(allocateRuns(state, P, out3, 'A', input)).toEqual([10]);
+    const a3 = move(out3.get(10)!)!;
+    expect(a3.intent).toBe('hold_shape');
+    expect(dist(a3.target, teamSlot(state, state.players[10]))).toBeLessThan(1e-6);
+    expect(out3.get(10)!.explanation).toContain('retour au poste');
+    // Largeur nulle : règle désactivée ; l'équipe qui défend n'est pas concernée (aucune décision d'appel).
+    const out4 = build();
+    expect(allocateRuns(state, { ...P, offBall: { ...P.offBall, runBandWidth: 0 } }, out4, 'A', input)).toEqual([]);
+    expect(move(out4.get(10)!)!.intent).toBe('run');
+    expect(allocateRuns(state, P, build(), 'B', input)).toEqual([]);
+  });
+
+  it('simulation 60 s (decideAll) : jamais deux appels de l’équipe attaquante dans la même bande latérale, et des cycles avec plusieurs appels existent', () => {
+    const sim = createSimulation({ seed: 36, tactics: { A: makeTactic('4-3-3', 'balanced'), B: makeTactic('4-4-2', 'balanced') }, params: P, durationSec: 60 }, { policies: POLICIES });
+    let runCycles = 0, multi = 0, demotedNotes = 0;
+    sim.advance(60, {
+      onDecisions: (decisions, state) => {
+        const att = attackingTeam(state);
+        const bands = new Map<number, number>();
+        for (const [id, d] of decisions) {
+          if (state.players[id].team === att && d.explanation.includes('Appel en profondeur cédé')) demotedNotes++;
+          const a = d.chosen.action;
+          if (a.type !== 'move' || a.intent !== 'run' || state.players[id].team !== att) continue;
+          const b = runBand(a.target.y, P.offBall.runBandWidth);
+          expect(bands.has(b)).toBe(false);
+          bands.set(b, id);
+        }
+        if (bands.size) runCycles++;
+        if (bands.size >= 2) multi++;
+      },
+    });
+    console.log(`appels : ${runCycles} cycles avec appel, ${multi} avec plusieurs bandes, ${demotedNotes} appels cédés`);
+    expect(runCycles).toBeGreaterThan(0);
   });
 });

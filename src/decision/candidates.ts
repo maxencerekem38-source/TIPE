@@ -12,7 +12,7 @@ import { dist, normalize } from '../core/vec2';
 import { PITCH, clampToPitch, distToGoal, isInsidePitch } from '../core/pitch';
 import type { Action, FieldSet, MatchState, Player, SimParams, TeamId } from '../core/types';
 import { attackDir, otherTeam } from '../core/types';
-import { launchSpeed, ballTravelTime, timeToArrive } from '../models/motion';
+import { launchSpeed, ballTravelTime, ballRange, timeToArrive } from '../models/motion';
 import { pressureAt } from '../models/fields';
 import { isOffsidePosition } from '../models/structure';
 import { isAimCovered } from '../models/probability';
@@ -246,4 +246,23 @@ export function proposeClear(state: MatchState, carrier: Player, params: SimPara
   }
   if (!best) return null;
   return { kind: 'clear', action: { type: 'clear', targetPoint: best }, receiverId: -1, successPoint: best };
+}
+
+/**
+ * Une passe au sol de `origin` vers `target` (vitesse d'arrivée `arrivalSpeed`) court encore s₀²/2μ − d au-delà de la
+ * cible si le receveur la manque : vrai si cette course résiduelle franchit la propre ligne de but de `team` entre les
+ * poteaux (± `decision.ownGoalMargin`). Un tel candidat (but contre son camp en cas d'échec) n'est jamais proposé.
+ */
+export function rollsIntoOwnGoal(origin: Vec2, target: Vec2, arrivalSpeed: number, team: TeamId, params: SimParams): boolean {
+  const d = dist(origin, target);
+  if (d < 1e-6) return false;
+  const range = ballRange(launchSpeed(d, arrivalSpeed, params.physics), params.physics);
+  if (!Number.isFinite(range)) return true;
+  const ux = (target.x - origin.x) / d, uy = (target.y - origin.y) / d;
+  const goalX = -attackDir(team) * PITCH.halfLength;
+  if (Math.abs(ux) < 1e-9) return false;
+  const t = (goalX - origin.x) / ux; // distance de course jusqu'à la ligne de but
+  if (t < 0 || t > range) return false;
+  const yCross = origin.y + uy * t;
+  return Math.abs(yCross) <= PITCH.goalHalfWidth + (params.decision.ownGoalMargin ?? 0);
 }

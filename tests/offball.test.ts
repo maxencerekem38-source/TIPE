@@ -21,6 +21,7 @@ import { createMatch, giveBall, slotPosition } from '@/engine/match';
 import { decideOffBall, decideReceive, deepRunPoints, isRestDefender, offBallSpeed, quickPassProbability } from '@/decision/offball';
 import { createSimulation } from '@/engine/loop';
 import { decideAll, FULL_POLICY } from '@/decision/coordinator';
+import { stepPhysics } from '@/engine/physics';
 import type { DecisionInput, PolicySet } from '@/decision/policy';
 
 const P = DEFAULT_PARAMS;
@@ -385,5 +386,128 @@ describe('offball — hystérésis, réception, symétrie, probabilité rapide',
     expect(dist(target(d), slot)).toBeLessThan(dist(p.pos, slot));
     expect(['hold_shape', 'width', 'support', 'exploit_space', 'create_space']).toContain(intent(d));
     expect(Math.abs(target(d).x)).toBeLessThanOrEqual(PITCH.halfLength);
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe('offball — coût de déplacement, hystérésis de transition', () => {
+  it('coût de déplacement : composante « move » = −w_move·‖q − p‖ sur chaque candidat (0 sur place) ; avec un coût énorme, tout le monde tient sa place', () => {
+    const state = matchState(41, 6, v(0, 0));
+    const input = inputFor(state, 'A');
+    const wMove = P.offBall.wMove!;
+    expect(wMove).toBeGreaterThan(0);
+    for (const p of state.players.filter((q) => q.team === 'A' && q.role !== 'GK' && q.id !== 6)) {
+      const d = decideOffBall(input, p.id, null);
+      for (const c of d.candidates) {
+        const m = c.components.find((x) => x.key === 'move')!;
+        expect(m).toBeDefined();
+        const q = c.successPoint!;
+        expect(m.contribution).toBeCloseTo(-wMove * dist(q, p.pos), 9);
+      }
+      const stay = d.candidates.find((c) => dist(c.successPoint!, p.pos) < 1e-9);
+      if (stay) expect(stay.components.find((x) => x.key === 'move')!.contribution).toBeCloseTo(0, 12);
+    }
+    const heavy = { ...input, params: { ...P, offBall: { ...P.offBall, wMove: 10 } } };
+    for (const p of state.players.filter((q) => q.team === 'A' && q.role !== 'GK' && q.id !== 6)) {
+      const d = decideOffBall(heavy, p.id, null);
+      expect(intent(d)).toBe('hold_shape');
+      expect(dist(target(d), p.pos)).toBeLessThan(1e-9);
+    }
+  });
+
+  it('récupération du ballon : la cible de la tâche défensive précédente garde une fraction transitionHysteresis du bonus pendant reexamineEvery s, puis l’engagement suit le cycle normal', () => {
+    const state = matchState(42, 6, v(0, 0));
+    const player = state.players.find((p) => p.team === 'A' && p.role === 'MF' && p.id !== 6)!;
+    const old: Vec2 = { x: player.pos.x - 8, y: player.pos.y + 3 };
+    const prevTime = state.time - P.decisionPeriod;
+    const previous: Decision = { playerId: player.id, time: prevTime, chosen: { action: { type: 'move', target: old, intent: 'recover', speed: 3 }, score: 0, probability: 1, valueIfSuccess: 0, valueIfFailure: 0, components: [], reason: '' }, candidates: [], context: { phase: 'defence', style: 'balanced', formation: '4-3-3', pressure: 0, availableTeammates: 0, localSuperiority: 0 }, explanation: '', computeMs: 0 };
+    // Bonus rendu décisif (hystérésis 1) : la cible défensive est terminée, avec le bonus réduit et l'échéance previous.time + reexamineEvery.
+    const strong = { ...inputFor(state, 'A'), params: { ...P, offBall: { ...P.offBall, hysteresis: 1 } } };
+    const d = decideOffBall(strong, player.id, previous);
+    expect(dist(target(d), old)).toBeLessThan(1e-6);
+    expect(d.keptByHysteresis).toBe(true);
+    expect(d.chosen.components.find((c) => c.key === 'hysteresis')!.contribution).toBeCloseTo(1 * P.offBall.transitionHysteresis!, 9);
+    expect(d.committedUntil).toBeCloseTo(prevTime + P.offBall.reexamineEvery, 9);
+    // Désactivée (transitionHysteresis 0) : aucune composante d'hystérésis.
+    const off = { ...strong, params: { ...P, offBall: { ...P.offBall, hysteresis: 1, transitionHysteresis: 0 } } };
+    const e = decideOffBall(off, player.id, previous);
+    expect(e.chosen.components.some((c) => c.key === 'hysteresis')).toBe(false);
+    // Une décision défensive trop ancienne (≥ reexamineEvery) n'est pas reprise.
+    const stale = { ...previous, time: state.time - P.offBall.reexamineEvery - 0.1 };
+    const f = decideOffBall(strong, player.id, stale);
+    expect(f.chosen.components.some((c) => c.key === 'hysteresis')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe('§7.2 — lissage de direction τ_steer (retard du premier ordre sur la vitesse désirée, moteur)', () => {
+  /** Un joueur de champ seul, lancé 2 s vers +x (ballon loin : il n'est pas porteur). */
+  const launched = (tau: number) => {
+    const state = buildState({ players: [{ team: 'A', pos: v(0, 0), role: 'MF', number: 8 }] });
+    state.ball.pos = { x: -40, y: -30 };
+    const params = { ...P, physics: { ...P.physics, steeringTau: tau } };
+    const p = state.players[0];
+    const rng = new Rng(1);
+    const dt = P.physics.dt;
+    const step = (): void => { stepPhysics(state, params, rng, dt); state.time += dt; };
+    p.target = { x: 40, y: 0 };
+    p.targetSpeed = 10;
+    for (let i = 0; i < 60; i++) step();
+    return { p, step, dt };
+  };
+
+  it('τ = 0,3 s : après un virage à 90°, la consigne lissée tourne de k = dt/τ par pas (≈ 62° après τ, ≈ 88° après 3τ) ; τ = 0 ⇒ pas de filtre (consigne instantanée)', () => {
+    const { p, step, dt } = launched(0.3);
+    expect(Math.hypot(p.vel.x, p.vel.y)).toBeGreaterThan(0.9 * p.maxSpeed);
+    expect(p.steerVel).toBeDefined();
+    expect(p.steerVel!.x).toBeCloseTo(p.maxSpeed, 1); // (1 − k)⁶⁰ ≈ 10⁻³ de la consigne restant à converger
+    expect(Math.abs(p.steerVel!.y)).toBeLessThan(1e-9);
+    p.target = { x: p.pos.x, y: 400 }; // virage à 90° (cible très loin : consigne ≈ v_max vers +y)
+    const k = dt / 0.3;
+    // Réplique du filtre : v̄ ← v̄ + (v^des − v̄)·k, v^des = v_max·(cible − position)/‖·‖ (position en début de pas).
+    const expected = { x: p.steerVel!.x, y: p.steerVel!.y };
+    const stepAndCheck = (): void => {
+      const dx = p.target!.x - p.pos.x, dy = p.target!.y - p.pos.y, d = Math.hypot(dx, dy);
+      const des = { x: (dx / d) * p.maxSpeed, y: (dy / d) * p.maxSpeed };
+      expected.x += (des.x - expected.x) * k;
+      expected.y += (des.y - expected.y) * k;
+      step();
+      expect(p.steerVel!.x).toBeCloseTo(expected.x, 9);
+      expect(p.steerVel!.y).toBeCloseTo(expected.y, 9);
+    };
+    stepAndCheck();
+    const angle = (): number => (Math.atan2(p.steerVel!.y, p.steerVel!.x) * 180) / Math.PI;
+    expect(angle()).toBeCloseTo((Math.atan2(k, 1 - k) * 180) / Math.PI, 0); // ≈ 7° après un pas
+    for (let i = 1; i < 9; i++) stepAndCheck(); // 9 pas = 0,3 s = τ : 1 − (1 − k)⁹ ≈ 65 % du virage
+    expect(angle()).toBeGreaterThan(60);
+    expect(angle()).toBeLessThan(65);
+    for (let i = 9; i < 27; i++) stepAndCheck(); // 3τ : ≈ 96 %
+    expect(angle()).toBeGreaterThan(87);
+    expect(Math.hypot(p.steerVel!.x, p.steerVel!.y)).toBeLessThanOrEqual(p.maxSpeed + 1e-9);
+    // La vitesse réelle reste bornée par l'accélération et la vitesse maximales.
+    expect(Math.hypot(p.vel.x, p.vel.y)).toBeLessThanOrEqual(p.maxSpeed + 1e-9);
+    // Sans lissage : aucun état de filtre, la consigne est instantanée.
+    const raw = launched(0);
+    expect(raw.p.steerVel).toBeUndefined();
+    raw.p.target = { x: raw.p.pos.x, y: 40 };
+    raw.step();
+    expect(raw.p.steerVel).toBeUndefined();
+  });
+
+  it('la norme de la consigne lissée est bornée par le profil de freinage / d’approche : une cible soudain proche ne fait pas dépasser', () => {
+    const { p, step } = launched(0.3);
+    const speed = Math.hypot(p.vel.x, p.vel.y);
+    expect(speed).toBeGreaterThan(7);
+    const d = 1; // cible à 1 m devant : v ≤ min(√(2·0,9·a·d), v_max·d/slowDownDistance)
+    p.target = { x: p.pos.x + d, y: 0 };
+    step();
+    const bound = Math.min(Math.sqrt(2 * 0.9 * p.maxAccel * d), p.maxSpeed * Math.min(1, d / P.physics.slowDownDistance));
+    expect(Math.hypot(p.steerVel!.x, p.steerVel!.y)).toBeLessThanOrEqual(bound + 1e-9);
+    // Lancé à ~8 m/s il dépasse (freinage ≈ 6,4 m), fait demi-tour, revient ; arrivé (≤ 0,3 m) la consigne est nulle,
+    // le filtre décroît vers 0 et le joueur s'arrête sur la cible.
+    for (let i = 0; i < 240; i++) step();
+    expect(Math.hypot(p.steerVel!.x, p.steerVel!.y)).toBeLessThan(0.1);
+    expect(Math.hypot(p.vel.x, p.vel.y)).toBeLessThan(0.5);
+    expect(dist(p.pos, p.target!)).toBeLessThan(0.5);
   });
 });

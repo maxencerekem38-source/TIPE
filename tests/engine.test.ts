@@ -921,7 +921,9 @@ describe('simulation', () => {
     // Le match a vécu : passes, changements de possession, remises en jeu
     const s = sim.state.stats;
     expect(s.A.passes + s.B.passes).toBeGreaterThan(100);
-    expect(sim.state.events.some((e) => e.kind === 'restart' || e.kind === 'possession_change')).toBe(true);
+    // Comptabilité cumulée (le journal `events` est borné à MAX_EVENTS : la politique factice « passe au plus proche »
+    // finit par boucler entre deux joueurs et ses 200 derniers événements peuvent n'être que des passes).
+    expect(s.A.turnovers + s.B.turnovers).toBeGreaterThan(0);
     const teams: TeamId[] = ['A', 'B'];
     for (const t of teams) expect(s[t].possessionTime).toBeGreaterThan(0);
   });

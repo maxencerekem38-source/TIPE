@@ -2,7 +2,8 @@
  * Création et réinitialisation d'un match : joueurs, formations, coup d'envoi, postes instanciés (§9.2),
  * copie profonde de l'état, attribution du ballon.
  */
-import type { Formation, MatchConfig, MatchState, TeamId, Player, PlayerAttributes, Role } from '../core/types';
+import type { Formation, MatchConfig, MatchState, TeamId, Player, PlayerAttributes, Role, SimParams } from '../core/types';
+import { DEFAULT_PARAMS } from '../core/params';
 import { TEAMS, attackDir, otherTeam } from '../core/types';
 import type { Vec2 } from '../core/vec2';
 import { clamp } from '../core/vec2';
@@ -187,7 +188,7 @@ export function setupKickoff(state: MatchState, team: TeamId, config: MatchConfi
  * x = x_line + x_norm·Λ (x_norm = rang du poste dans l'étendue x de la formation), y contracté vers le ballon
  * d'un facteur 1 − 0,5·compacité. La ligne basse (défenseurs, x_norm = 0) est donc tenue à x_line (hors-jeu).
  */
-export function slotPosition(state: MatchState, player: Player, ballPos?: Vec2): Vec2 {
+export function slotPosition(state: MatchState, player: Player, ballPos?: Vec2, params?: SimParams): Vec2 {
   const team = player.team;
   const dir = attackDir(team);
   const tactic = state.tactics[team].params;
@@ -205,6 +206,11 @@ export function slotPosition(state: MatchState, player: Player, ballPos?: Vec2):
     const xNorm = clamp((slot.x - range.min) / (range.max - range.min), 0, 1);
     x = line + xNorm * lambda;
     y = b.y + (y - b.y) * (1 - Y_COMPACTNESS_GAIN * tactic.compactness);
+  } else if (slot.role !== 'GK') {
+    // Possession : plancher des postes de champ (`offBall.slotFloorX`) — sans lui, followX ≈ 0,5 posait les défenseurs
+    // sur leur ligne de but dès que le gardien avait le ballon (relances de 2 m, buts contre son camp).
+    const floor = (params ?? DEFAULT_PARAMS).offBall.slotFloorX;
+    if (floor !== undefined && x < floor) x = floor;
   }
   x = clamp(x, -PITCH.halfLength + SLOT_MARGIN, PITCH.halfLength - SLOT_MARGIN);
   y = clamp(y, -PITCH.halfWidth + SLOT_MARGIN, PITCH.halfWidth - SLOT_MARGIN);

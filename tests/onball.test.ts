@@ -16,7 +16,7 @@ import { isOffsidePosition } from '@/models/structure';
 import { makeTactic } from '@/tactics/styles';
 import type { DecisionInput } from '@/decision/policy';
 import { decideOnBall, evaluateCandidates, selectCandidate, sameAction } from '@/decision/onball';
-import { modulatedWeights } from '@/decision/evaluate';
+import { buildReason, modulatedWeights } from '@/decision/evaluate';
 import { proposeThroughBalls } from '@/decision/candidates';
 import { actionLabel, explainDecision, whyNot, directionLabel, shortLabel } from '@/decision/explain';
 
@@ -370,8 +370,10 @@ describe('profondeur 2, contexte, symétrie, performance', () => {
     expect(expanded.length).toBeGreaterThan(0);
     expect(expanded.length).toBeLessThanOrEqual(P.decision.topK);
     for (const c of expanded) {
-      expect(c.response?.kind).toBe('press');
-      expect(c.response!.delta).toBeGreaterThanOrEqual(0); // presser ne peut qu'abaisser le contrôle
+      // §6.3 : la réponse mémorisée est l'argmin sur R = {hold, press, cover, drop} ; tenir ou presser ne peut
+      // qu'abaisser le contrôle en q⁺ (δ ≥ 0) ; couvrir ou reculer peuvent l'augmenter en dégradant la suite.
+      expect(['hold', 'press', 'cover', 'drop']).toContain(c.response?.kind);
+      if (c.response!.kind === 'hold' || c.response!.kind === 'press') expect(c.response!.delta).toBeGreaterThanOrEqual(-1e-12);
       const la = c.components.find((k) => k.key === 'lookahead')!;
       expect(Math.abs(la.contribution - c.probability * P.decision.gamma * la.value)).toBeLessThan(1e-9);
       // §6.3 : gain incrémental G ≥ 0 (la conservation garantit qu'une suite ne dégrade pas la valeur déjà comptée en q⁺).
@@ -532,6 +534,154 @@ describe('régressions de l’évaluation (revue) : hors-jeu, longueur de passe,
     const cand: Candidate = { action: { type: 'dribble', direction: v(1, 0), distance: 4 }, score: 0, probability: 0.5, valueIfSuccess: 0, valueIfFailure: 0, components: [], reason: '' };
     expect(actionLabel(cand, state)).toBe('DRIBBLER (vers l’avant)');
     expect(shortLabel(cand, state)).toMatch(/^Dribble → 4 m$/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe('régressions (réalisme du porteur) : coût de possession, hystérésis déterministe, durée des dribbles', () => {
+  it('coût d’opportunité de la possession : composante « possession » = −(1 − P)·w_poss·(1,6 − 1,2·riskTolerance)·Θ(b) sur passes, dribbles, conservation ; absente si w = 0', () => {
+    const mk = (style: StyleId): MatchState => simple([
+      { team: 'A', pos: v(10, 0) }, { team: 'A', pos: v(22, 6) }, { team: 'A', pos: v(4, -8) },
+      { team: 'B', pos: v(52, 0), role: 'GK' }, { team: 'B', pos: v(30, 10) }, { team: 'B', pos: v(30, -10) }, { team: 'B', pos: v(16, 2) },
+    ], 0, style);
+    const check = (style: StyleId): number => {
+      const state = mk(style);
+      const input = mkInput(state);
+      const t = state.tactics.A.params;
+      const w = modulatedWeights(P, t, 'attack');
+      const wExpected = (P.decision.wPossession ?? 0) * Math.max(0, 1.6 - 1.2 * t.riskTolerance);
+      expect(w.wPossession).toBeCloseTo(wExpected, 12);
+      const cands = evaluateCandidates(input, 0);
+      let thetaBall = -1;
+      for (const c of cands) {
+        if (c.action.type === 'clear') continue;
+        const poss = c.components.find((k) => k.key === 'possession')!;
+        expect(poss, `possession absente : ${JSON.stringify(c.action)}`).toBeDefined();
+        // Même Θ(b) pour tous les candidats d'une décision ; contribution = −(1 − P)·w·Θ(b).
+        if (thetaBall < 0) thetaBall = poss.value; else expect(poss.value).toBeCloseTo(thetaBall, 12);
+        expect(poss.contribution).toBeCloseTo(-(1 - c.probability) * wExpected * thetaBall, 9);
+        expect(poss.contribution).toBeLessThanOrEqual(0);
+        expect(Math.abs(sumContrib(c) - c.score)).toBeLessThan(1e-9);
+        expect(c.valueIfFailure).toBeCloseTo(-(w.lambda * c.components.find((k) => k.key === 'risk')!.value + wExpected * thetaBall), 9);
+      }
+      expect(thetaBall).toBeGreaterThan(0);
+      return wExpected;
+    };
+    // La possession (riskTolerance 0,3) paie l'échec plus cher que la contre-attaque (0,6).
+    expect(check('possession')).toBeGreaterThan(check('counter'));
+    // w = 0 : aucune composante « possession » hors tir (formule §6.2 d'origine).
+    const off = cloneParams(P0);
+    off.decision.wPossession = 0;
+    for (const c of evaluateCandidates(mkInput(mk('balanced'), 1, off), 0)) {
+      if (c.action.type !== 'shoot') expect(c.components.some((k) => k.key === 'possession')).toBe(false);
+    }
+    // Une passe risquée à 50 % vers l'avant est davantage pénalisée qu'une passe sûre : la différence de composante
+    // « possession » est exactement (P_sûre − P_risquée)·w·Θ(b).
+    const cands = evaluateCandidates(mkInput(mk('balanced')), 0);
+    const safe = cands.find((c) => isPass(c, 'ground', 2))!, risky = cands.find((c) => isPass(c, 'ground', 1))!;
+    expect(safe.probability).toBeGreaterThan(risky.probability);
+    const pc = (c: Candidate): number => c.components.find((k) => k.key === 'possession')!.contribution;
+    expect(pc(safe)).toBeGreaterThan(pc(risky));
+  });
+
+  it('hystérésis déterministe (§6.5) : l’intention courante non battue de plus de h est conservée sans re-tirage quantal, pour toute graine', () => {
+    const state = simple([
+      { team: 'A', pos: v(0, 0) }, { team: 'A', pos: v(12, 8) }, { team: 'A', pos: v(12, -8) },
+      { team: 'B', pos: v(52, 0), role: 'GK' }, { team: 'B', pos: v(30, 12) }, { team: 'B', pos: v(30, -12) }, { team: 'B', pos: v(-6, 0) },
+    ]);
+    const hot = cloneParams(P);
+    hot.decision.softmaxTemperature = 0.05;
+    hot.decision.epsilonTie = 0.02; // fenêtre large : sans mémoire, la réponse quantale varie d'une graine à l'autre
+    // Intention précédente = argmax déterministe (à h près du meilleur par construction).
+    const first = decideOnBall(mkInput(state, 1, P0e), 0, null);
+    const picks = new Set<string>();
+    for (let seed = 1; seed <= 20; seed++) picks.add(JSON.stringify(decideOnBall(mkInput(state, seed, hot), 0, null).chosen.action));
+    expect(picks.size).toBeGreaterThan(1);
+    // Avec l'intention précédente (à h près du meilleur), toutes les graines la conservent.
+    for (let seed = 1; seed <= 20; seed++) {
+      const d = decideOnBall(mkInput(state, seed, hot), 0, first);
+      expect(sameAction(d.chosen.action, first.chosen.action)).toBe(true);
+      expect(d.chosen.components.some((k) => k.key === 'hysteresis')).toBe(true);
+    }
+  });
+
+  it('hystérésis : le bonus s’attache au meilleur candidat de même intention (deux passes en profondeur vers le même receveur)', () => {
+    const state = simple([
+      { team: 'A', pos: v(0, 0) }, { team: 'A', pos: v(18, 4), vel: v(5, 0) }, { team: 'A', pos: v(-8, -10) },
+      { team: 'B', pos: v(52, 0), role: 'GK' }, { team: 'B', pos: v(34, 10) }, { team: 'B', pos: v(34, -10) }, { team: 'B', pos: v(-6, 0) },
+    ]);
+    const d1 = decideOnBall(mkInput(state), 0, null);
+    const through = d1.candidates.filter((c) => isPass(c, 'through', 1));
+    expect(through.length).toBeGreaterThan(1);
+    const prev: Decision = { ...d1, chosen: through[through.length - 1] }; // intention : profondeur vers 1 (variante la moins bonne)
+    const d2 = decideOnBall(mkInput(state), 0, prev);
+    const bonused = d2.candidates.filter((c) => c.components.some((k) => k.key === 'hysteresis'));
+    expect(bonused).toHaveLength(1);
+    const same = d2.candidates.filter((c) => isPass(c, 'through', 1));
+    const best = Math.max(...same.map((c) => c.score - (c.components.find((k) => k.key === 'hysteresis')?.contribution ?? 0)));
+    expect(bonused[0].score - P.decision.hysteresis).toBeCloseTo(best, 9);
+  });
+
+  it('une conservation précédente ne reçoit pas d’hystérésis (elle n’est pas une intention engagée)', () => {
+    const state = simple([
+      { team: 'A', pos: v(-30, 0) }, { team: 'A', pos: v(-20, 20) },
+      { team: 'B', pos: v(52, 0), role: 'GK' }, { team: 'B', pos: v(-22, 18) }, { team: 'B', pos: v(-24, 3) },
+    ]);
+    const d1 = decideOnBall(mkInput(state), 0, null);
+    const holdPrev: Decision = { ...d1, chosen: d1.candidates.find((c) => c.action.type === 'hold')! };
+    const d2 = decideOnBall(mkInput(state), 0, holdPrev);
+    expect(d2.candidates.some((c) => c.components.some((k) => k.key === 'hysteresis'))).toBe(false);
+    expect(d2.keptByHysteresis).toBeFalsy();
+  });
+
+  it('durée d’un dribble = temps de conduite depuis la vitesse courante (§5.3) : plus long depuis l’arrêt ou à contre-sens', () => {
+    const still = simple([{ team: 'A', pos: v(0, 0) }, { team: 'A', pos: v(15, 10) }, ...B_LINE]);
+    const running = simple([{ team: 'A', pos: v(0, 0), vel: v(5, 0) }, { team: 'A', pos: v(15, 10) }, ...B_LINE]);
+    const forward = (cands: Candidate[]): Candidate => cands.find((c) => c.action.type === 'dribble' && c.action.direction.x > 0.99 && c.action.distance === 4)!;
+    const backward = (cands: Candidate[]): Candidate => cands.find((c) => c.action.type === 'dribble' && c.action.direction.x < -0.99 && c.action.distance === 4)!;
+    const cs = evaluateCandidates(mkInput(still), 0), cr = evaluateCandidates(mkInput(running), 0);
+    const me = still.players[0];
+    const vDrib = P.physics.dribbleSpeedFactor * me.maxSpeed;
+    // Depuis l'arrêt : accélération bornée, T = √(2d/a) si la vitesse de conduite n'est pas atteinte, > d/v_drib.
+    const tStill = forward(cs).duration!;
+    expect(tStill).toBeGreaterThan(4 / vDrib);
+    const dAcc = (vDrib * vDrib) / (2 * me.maxAccel);
+    expect(tStill).toBeCloseTo(4 <= dAcc ? Math.sqrt((2 * 4) / me.maxAccel) : vDrib / me.maxAccel + (4 - dAcc) / vDrib, 6);
+    // En course : le dribble dans le sens de la course est plus court que depuis l'arrêt, et qu'à contre-sens.
+    expect(forward(cr).duration!).toBeLessThan(tStill);
+    expect(backward(cr).duration!).toBeGreaterThan(forward(cr).duration!);
+    const d = decideOnBall(mkInput(running), 0, null);
+    if (d.chosen.action.type === 'dribble') expect(d.committedUntil).toBeCloseTo(running.time + d.chosen.duration!, 9);
+  });
+
+  it('phrase d’explication : risque + possession abandonnée forment une seule famille « échec » (l’intercepteur reste nommé)', () => {
+    const blocked = simple([{ team: 'A', pos: v(0, 0) }, { team: 'A', pos: v(15, 0) }, { team: 'B', pos: v(7, 0.8) }, ...B_LINE]);
+    const pb = evaluateCandidates(mkInput(blocked), 0).find((c) => isPass(c, 'ground', 1))!;
+    const poss = pb.components.find((k) => k.key === 'possession')!, risk = pb.components.find((k) => k.key === 'risk')!;
+    expect(poss.contribution + risk.contribution).toBeLessThan(0);
+    expect(pb.reason).toMatch(/risque d’interception élevé \(n°\d+\)/); // le terme négatif n'est pas tronqué à 140 caractères
+    expect(pb.reason.length).toBeLessThanOrEqual(140);
+    // Un tir garde ses deux termes distincts : « abandon d'une possession dangereuse » peut être nommé.
+    const near = simple([{ team: 'A', pos: v(30, 0) }, { team: 'A', pos: v(36, 2) }, ...B_LINE]);
+    const shot = evaluateCandidates(mkInput(near), 0).find((c) => c.action.type === 'shoot');
+    if (shot) expect(shot.components.filter((k) => k.key === 'possession' || k.key === 'risk')).toHaveLength(2);
+  });
+
+  it('phrase d’explication : le terme « réponse adverse » nomme la réponse argmin (§6.3 : press, cover, drop)', () => {
+    const state = simple([{ team: 'A', pos: v(0, 0) }, { team: 'A', pos: v(15, 0) }, ...B_LINE]);
+    const base: Candidate = {
+      action: { type: 'pass', targetId: 1, targetPoint: v(15, 0), kind: 'ground', speed: 6 }, score: 0, probability: 0.9, valueIfSuccess: 0, valueIfFailure: 0, reason: '',
+      components: [
+        { key: 'threat', label: 'Menace', value: 0.1, weight: 0.45, contribution: 0.045 },
+        { key: 'response', label: 'Réponse adverse', value: -0.02, weight: 0.9, contribution: -0.018 },
+      ],
+    };
+    const phrases: Record<string, RegExp> = { press: /press du receveur/, cover: /couverture de la ligne/, drop: /recul de la ligne/, hold: /forme tenue/ };
+    for (const kind of ['press', 'cover', 'drop', 'hold'] as const) {
+      const c: Candidate = { ...base, response: { kind, delta: 0.02 } };
+      expect(buildReason(c, state)).toMatch(phrases[kind]);
+      expect(buildReason(c, state)).toMatch(/−0,020/);
+    }
   });
 });
 

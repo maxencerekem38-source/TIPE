@@ -241,6 +241,8 @@ export function whyNot(chosen: Candidate, alt: Candidate): string {
 // ---------------------------------------------------------------------------
 /** Nombre maximal d'alternatives listées. */
 const MAX_ALTERNATIVES = 3;
+/** Libellés français des réponses défensives (§6.3) — ligne « RÉPONSE ADVERSE ». */
+const RESPONSE_NAMES: Record<string, string> = { hold: 'tenir la forme', press: 'presser le receveur', cover: 'couvrir la ligne de passe', drop: 'reculer la ligne' };
 
 /**
  * Explication multi-lignes (≤ 12 lignes) d'une décision :
@@ -258,11 +260,19 @@ export function explainDecision(decision: Decision, state: MatchState): string {
   lines.push(`SCORE : ${fmtFr(c.score, 2)} — PROBABILITÉ : ${fmtPct(c.probability)}`);
   let reason = c.reason && c.reason.length > 0 ? c.reason : 'aucune justification disponible';
   if (decision.keptByHysteresis) reason += ' (intention conservée par hystérésis)';
+  else if (decision.game) reason += decision.game.pure ? ' (jeu 2×2 : stratégie pure)' : ' (jeu 2×2 : tirage à l’équilibre mixte)';
   else if (decision.candidates.length > 0 && c !== decision.candidates[0]) reason += ' (départage quantal)';
   lines.push(`RAISON : ${reason}`);
-  if (c.response && c.response.delta > 1e-4) {
-    const kind = { hold: 'tenir la forme', press: 'presser le receveur', cover: 'couvrir la ligne', drop: 'reculer' }[c.response.kind];
-    lines.push(`RÉPONSE ADVERSE : ${kind} (dégrade la menace de ${fmtFr(c.response.delta, 3)})`);
+  if (c.response && (c.response.kind !== 'hold' || Math.abs(c.response.delta) > 1e-4)) {
+    const kind = RESPONSE_NAMES[c.response.kind] ?? c.response.kind;
+    const effect = c.response.delta >= -1e-4 ? `dégrade de ${fmtFr(Math.max(0, c.response.delta), 3)}` : `menace +${fmtFr(-c.response.delta, 3)} mais suite moins prometteuse`;
+    lines.push(`RÉPONSE ADVERSE : ${kind} (${effect})`);
+  }
+  if (decision.game) {
+    const g = decision.game;
+    const row = (r: readonly number[]): string => r.map((x) => fmtFr(x, 3)).join(' ; ');
+    const outcome = g.pure ? `stratégie pure (${g.pi1 >= 0.5 ? g.actions[0] : g.actions[1]})` : 'stratégie mixte';
+    lines.push(`JEU 2×2 : matrice [[${row(g.matrix[0])}] ; [${row(g.matrix[1])}]], π₁ = ${fmtFr(g.pi1, 2)}, valeur ${fmtFr(g.value, 3)} → ${outcome}`);
   }
   const alternatives = decision.candidates.filter((k) => k !== c).slice(0, MAX_ALTERNATIVES);
   if (alternatives.length > 0) {

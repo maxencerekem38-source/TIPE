@@ -5,8 +5,11 @@
  *   V⁺(a) = Θ(q_a⁺) + w_prog · Δx/L + w_sup · sup(q_a⁺) + w_lb · n_lb(a)     (tir : V⁺ = 1, P = xG)
  *   C(a)  = w_time · T_a + w_off · 1[risque de hors-jeu] + w_len · P_a · max(0, d − d_sup)/L   (passes)
  *
- * Tir : EV₁ = xG · 1 − (1 − xG) · [λ · L(p_gk) + Θ(b)] − C, où Θ(b) = xT(b)·PC_att(b) est la possession abandonnée
+ * Tir : EV₁ = xG · 1 − (1 − xG) · [λ · L(p_gk) + w_poss·Θ(b)] − C, où Θ(b) = xT(b)·PC_att(b) est la possession abandonnée
  * par un tir manqué (coût d'opportunité : sans lui, un tir lointain à xG 0,02 bat toute passe).
+ * Autres actions : le même coût d'opportunité w_poss'·Θ(b) (w_poss' = wPossession·(1,6 − 1,2·riskTolerance)) est chargé
+ * avec le poids (1 − P) : une perte dans le camp adverse ne coûte pas seulement la (faible) menace adverse locale L(q⁻),
+ * elle abandonne la possession courante ; sans lui, une passe à 50 % bat systématiquement une passe sûre.
  *
  * Θ(q⁺) = xT(q⁺) · PC_att(q⁺) est lue sur l'état ANTICIPÉ (joueurs avancés de T_a à vitesse constante,
  * receveur au point d'arrivée) ; L(q⁻) = xT adverse au point de perte (point faible de la ligne pour une passe,
@@ -18,7 +21,7 @@
  *   progression P · w_prog · Δx / L
  *   support     P · w_sup · sup
  *   lines       P · w_lb · n_lb
- *   possession  −(1 − P) · Θ(b)              (tir : possession abandonnée)
+ *   possession  −(1 − P) · w_poss · Θ(b)     (possession abandonnée par un échec ; w_poss = wShotPossession pour un tir)
  *   risk        −(1 − P) · λ · L(q⁻)
  *   time        −w_time · T_a
  *   length      −w_len · P · max(0, d − d_sup) / L   (passes : au-delà de la distance de soutien tactique)
@@ -39,6 +42,7 @@ import type { Candidate, FieldSet, GamePhase, MatchState, Player, ScoreComponent
 import { attackDir, otherTeam } from '../core/types';
 import { pitchControlAt, pressureAt, threatAt } from '../models/fields';
 import { analyseInterception, lineBreaks, passingLaneQuality, type InterceptionAnalysis } from '../models/interception';
+import { dribbleTime } from '../models/motion';
 import { dribbleProbability, holdProbability, passProbability, shotProbability, throughBallProbability, type ProbabilityResult } from '../models/probability';
 import { OFFSIDE_TOLERANCE, offsideLine, smoothSuperiority } from '../models/structure';
 import { sigmoid } from '../core/vec2';
@@ -72,6 +76,7 @@ const OFFSIDE_RISK_MARGIN = 1.0;
 const DEFAULT_SHOT_MIN_XG = 0.04;
 const DEFAULT_W_LENGTH = 0.1;
 const DEFAULT_W_SHOT_POSSESSION = 1.0;
+const DEFAULT_W_POSSESSION = 0;
 /** Modulation du seuil de tir : xG_min ← shotMinXg · (SHOT_MIN_BASE − shotEagerness). */
 const SHOT_MIN_BASE = 1.5;
 /** Longueur maximale (caractères) d'une phrase d'explication. */
@@ -103,14 +108,18 @@ export interface OnBallWeights {
   shotMinXg: number;
   /** Part de Θ(b) comptée perdue par un tir manqué. */
   shotPossession: number;
+  /** w_poss modulé : part de Θ(b) comptée perdue par l'échec d'une passe, d'un dribble, d'une conservation ou d'un dégagement. */
+  wPossession: number;
 }
 
 /** Poids de l'évaluation après modulation tactique (§13.3). Tous les modulateurs à leur valeur neutre ⇒ défauts. */
 export function modulatedWeights(params: SimParams, tactic: TacticParams, phase: GamePhase): OnBallWeights {
   const d = params.decision;
   const counter = phase === 'transition_attack' ? 1 + COUNTER_GAIN * tactic.counterAttackBias : 1;
+  const riskFactor = Math.max(0, RISK_BASE - RISK_SLOPE * tactic.riskTolerance);
   return {
-    lambda: d.lambdaRisk * Math.max(0, RISK_BASE - RISK_SLOPE * tactic.riskTolerance),
+    lambda: d.lambdaRisk * riskFactor,
+    wPossession: (d.wPossession ?? DEFAULT_W_POSSESSION) * riskFactor,
     wProgress: d.wProgress * tactic.progressionBias * counter,
     wSupport: d.wSupport,
     wLineBreaks: d.wLineBreaks * tactic.progressionBias,
@@ -294,7 +303,9 @@ export function evaluateProposal(ctx: EvalContext, prop: Proposal): Evaluation |
     case 'dribble': {
       const pr = dribbleProbability(state, fields, me.id, prop.successPoint, params);
       P = pr.p;
-      duration = distance / Math.max(0.5, params.physics.dribbleSpeedFactor * me.maxSpeed);
+      // Durée = temps de conduite depuis la vitesse courante (même cinématique que la course de §5.3) : un dribble
+      // à contre-sens de la course en cours ou depuis l'arrêt dure plus longtemps qu'à d/v_drib.
+      duration = dribbleTime(origin, me.vel, prop.successPoint, me.maxSpeed, me.maxAccel, params.physics);
       failurePoint = origin;
       break;
     }
@@ -328,14 +339,14 @@ export function evaluateProposal(ctx: EvalContext, prop: Proposal): Evaluation |
   let valueIfSuccess: number;
   const successPoint = prop.successPoint;
 
-  let theta = 0;
+  // Coût d'opportunité de la possession : un échec rend le ballon, la possession courante vaut Θ(b) = xT(b)·PC_att(b)
+  // (part w_poss pour un tir manqué, w_poss' — modulé par la tolérance au risque — pour les autres actions).
+  const wPoss = prop.kind === 'shot' ? w.shotPossession : w.wPossession;
+  const theta = wPoss * ctx.thetaBall;
   if (prop.kind === 'shot') {
     // Un but vaut 1 : V⁺ = 1, P = xG (§6.2).
     valueIfSuccess = 1;
     components.push(comp('threat', 'Valeur d’un but', 1, P, P, 'but'));
-    // Coût d'opportunité : un tir manqué rend le ballon ; la possession courante vaut Θ(b) = xT(b)·PC_att(b).
-    theta = w.shotPossession * ctx.thetaBall;
-    if (theta > 0) components.push(comp('possession', 'Possession abandonnée', ctx.thetaBall, -(1 - P) * w.shotPossession, -(1 - P) * theta, 'but'));
   } else {
     const actorId = receiver ? receiver.id : me.id;
     advancePrediction(ctx, duration, actorId, successPoint);
@@ -352,9 +363,10 @@ export function evaluateProposal(ctx: EvalContext, prop: Proposal): Evaluation |
     if (prop.kind !== 'hold') components.push(comp('lines', 'Lignes défensives franchies', nlb, P * w.wLineBreaks, P * w.wLineBreaks * nlb));
   }
 
-  // Risque : perte au point q⁻, valorisée par la menace adverse.
+  // Risque : perte au point q⁻, valorisée par la menace adverse, plus la possession abandonnée.
   const loss = threatAt(failurePoint, otherTeam(team), params);
   components.push(comp('risk', 'Risque en cas de perte', loss, -(1 - P) * w.lambda, -(1 - P) * w.lambda * loss, 'but'));
+  if (theta > 0) components.push(comp('possession', 'Possession abandonnée', ctx.thetaBall, -(1 - P) * wPoss, -(1 - P) * theta, 'but'));
   // Coûts.
   components.push(comp('time', 'Durée de l’action', duration, -w.wTime, -w.wTime * duration, 's'));
   let offsideRisk = 0;
@@ -441,18 +453,23 @@ function positivePhrase(c: ScoreComponent, cand: Candidate): string | null {
 function negativePhrase(c: ScoreComponent, cand: Candidate, state: MatchState): string | null {
   const a = cand.action;
   switch (c.key) {
-    case 'risk': {
+    case 'risk':
+    case 'failure': {
+      // « failure » : famille risque + possession abandonnée (même cause : l'échec, de probabilité 1 − P).
       if ((a.type === 'pass' || a.type === 'clear') && cand.threats && cand.threats.length > 0) {
         return `risque d’interception élevé (${playerNumber(state, cand.weakOpponentId ?? cand.threats[0])})`;
       }
       return `risque de perte (${fmtPct(1 - cand.probability)})`;
     }
     case 'possession':
-      return `abandon d’une possession dangereuse (Θ ${fmtFr(c.value, 2)})`;
+      return a.type === 'shoot' ? `abandon d’une possession dangereuse (Θ ${fmtFr(c.value, 2)})` : `possession abandonnée en cas d’échec (Θ ${fmtFr(c.value, 2)})`;
     case 'length':
       return `passe longue (${fmtFr(c.value, 0)} m)`;
-    case 'response':
-      return `réponse adverse : press du receveur (−${fmtFr(-c.value, 3)})`;
+    case 'response': {
+      const kind = cand.response?.kind ?? 'press';
+      const label = kind === 'press' ? 'press du receveur' : kind === 'cover' ? 'couverture de la ligne' : kind === 'drop' ? 'recul de la ligne' : 'forme tenue';
+      return `réponse adverse : ${label} (−${fmtFr(-c.value, 3)})`;
+    }
     case 'control':
       return `zone contestée (${fmtPct(c.value + 0.5)})`;
     case 'progression':
@@ -489,7 +506,18 @@ function probabilityPhrase(cand: Candidate, pressureBall: number): string | null
  */
 export function buildReason(cand: Candidate, state: MatchState, pressureBall = 0): string {
   const pos = cand.components.filter((c) => c.contribution > 1e-4).sort((a, b) => b.contribution - a.contribution);
-  const neg = cand.components.filter((c) => c.contribution < -1e-4).sort((a, b) => a.contribution - b.contribution);
+  // Les termes d'échec (risque + possession abandonnée, tous deux pondérés par 1 − P) forment une seule famille pour
+  // le choix du terme négatif dominant ; un tir garde ses deux termes distincts (le coût d'opportunité y est nommé).
+  const negSrc: ScoreComponent[] = [];
+  let failure: ScoreComponent | null = null;
+  for (const c of cand.components) {
+    if (cand.action.type !== 'shoot' && (c.key === 'risk' || c.key === 'possession')) {
+      if (!failure) failure = { key: 'failure', label: 'Échec (risque + possession abandonnée)', value: c.value, weight: c.weight, contribution: 0 };
+      failure.contribution += c.contribution;
+    } else negSrc.push(c);
+  }
+  if (failure) negSrc.push(failure);
+  const neg = negSrc.filter((c) => c.contribution < -1e-4).sort((a, b) => a.contribution - b.contribution);
   const positives: string[] = [];
   const pp = probabilityPhrase(cand, pressureBall);
   if (pp) positives.push(pp);
@@ -500,9 +528,11 @@ export function buildReason(cand: Candidate, state: MatchState, pressureBall = 0
   }
   let negative: string | null = null;
   for (const c of neg) { negative = negativePhrase(c, cand, state); if (negative) break; }
-  let reason: string;
-  if (positives.length === 0) reason = negative ?? 'aucune option satisfaisante';
-  else reason = positives.join(' + ') + (negative ? `, mais ${negative}` : '');
+  // Au-delà de REASON_MAX caractères, on retire d'abord les phrases positives les moins contributives : le terme négatif
+  // dominant (qui nomme l'intercepteur) est conservé entier ; la troncature n'est qu'un dernier recours.
+  const assemble = (): string => (positives.length === 0 ? negative ?? 'aucune option satisfaisante' : positives.join(' + ') + (negative ? `, mais ${negative}` : ''));
+  let reason = assemble();
+  while (reason.length > REASON_MAX && positives.length > 1) { positives.pop(); reason = assemble(); }
   if (reason.length > REASON_MAX) reason = reason.slice(0, REASON_MAX - 1) + '…';
   return reason;
 }

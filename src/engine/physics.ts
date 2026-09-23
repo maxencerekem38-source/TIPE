@@ -88,15 +88,26 @@ export function stepPhysics(state: MatchState, params: SimParams, rng: Rng, dt: 
   if (ball.ownerId !== null) resolveDuels(state, params, rng);
 }
 
-/** Cinématique d'un joueur (§3.1) : vitesse désirée vers la cible, accélération bornée, vitesse plafonnée. */
+/** τ_steer par défaut (s) si le paramètre est absent. */
+const DEFAULT_STEERING_TAU = 0.3;
+
+/**
+ * Cinématique d'un joueur (§3.1) : vitesse désirée vers la cible, accélération bornée, vitesse plafonnée.
+ * Lissage de direction (§7.2) : la vitesse désirée brute v^des passe par un retard du premier ordre de constante
+ * τ_steer (`physics.steeringTau`), v̄ ← v̄ + (v^des − v̄)·min(1, dt/τ) ; un changement de cible tourne donc le joueur
+ * progressivement au lieu de le faire virer d'un cycle à l'autre. La norme de v̄ reste bornée par le profil de freinage
+ * et le ralentissement d'approche (le lissage ne fait jamais dépasser la cible).
+ */
 function movePlayer(p: Player, isOwner: boolean, pinned: boolean, ph: SimParams['physics'], dt: number, time: number): void {
   if (pinned || (p.beatenUntil !== undefined && time < p.beatenUntil)) {
     p.vel.x = 0;
     p.vel.y = 0;
+    if (p.steerVel) { p.steerVel.x = 0; p.steerVel.y = 0; }
     return;
   }
   const cap = p.maxSpeed * (isOwner ? ph.dribbleSpeedFactor : 1);
   let dx = 0, dy = 0;
+  let sMax = 0; // norme maximale de la vitesse désirée (freinage, approche)
   if (p.target) {
     const ox = p.target.x - p.pos.x, oy = p.target.y - p.pos.y;
     const d = Math.hypot(ox, oy);
@@ -106,7 +117,21 @@ function movePlayer(p: Player, isOwner: boolean, pinned: boolean, ph: SimParams[
       s = Math.min(s, cap * Math.min(1, d / ph.slowDownDistance)); // ralentissement à l'approche (§3.1)
       dx = (ox / d) * s;
       dy = (oy / d) * s;
+      sMax = s;
     }
+  }
+  // Retard du premier ordre sur la vitesse désirée (τ_steer), norme bornée par sMax.
+  const tau = ph.steeringTau ?? DEFAULT_STEERING_TAU;
+  if (tau > 0) {
+    let sv = p.steerVel;
+    if (!sv) sv = p.steerVel = { x: p.vel.x, y: p.vel.y };
+    const k = Math.min(1, dt / tau);
+    sv.x += (dx - sv.x) * k;
+    sv.y += (dy - sv.y) * k;
+    const sn = Math.hypot(sv.x, sv.y);
+    if (sn > sMax) { const r = sMax > 0 ? sMax / sn : 0; sv.x *= r; sv.y *= r; }
+    dx = sv.x;
+    dy = sv.y;
   }
   let ax = dx - p.vel.x, ay = dy - p.vel.y;
   const an = Math.hypot(ax, ay);

@@ -11,7 +11,8 @@
  */
 import type { Vec2 } from '../core/vec2';
 import { dist, normalize, add, sub } from '../core/vec2';
-import { PITCH, goalPosts, ownGoalCentre, isInPenaltyArea } from '../core/pitch';
+import { PITCH, goalPosts, ownGoalCentre, isInGoalArea, isInPenaltyArea } from '../core/pitch';
+import { rollsIntoOwnGoal } from './candidates';
 import type { Candidate, Decision, Player } from '../core/types';
 import { attackDir } from '../core/types';
 import { threatFor } from '../models/fields';
@@ -81,9 +82,14 @@ export function decideKeeper(input: DecisionInput, playerId: number, previous: D
       const t = timeToArrive(p.pos, p.vel, mine.point, p.maxSpeed, p.maxAccel, params.models);
       if (t < opp) opp = t;
     }
-    if (mine.time < opp) {
+    // Sortie si le gardien arrive le premier, ou si le point de rencontre est dans sa surface de but : un ballon qui
+    // traverse les six mètres est toujours attaqué (dernier rempart ; sinon un centre au sol roulait jusque dans le but).
+    const inGoalArea = isInGoalArea(mine.point, (-dir) as 1 | -1);
+    if (mine.time < opp || inGoalArea) {
       return simpleMoveDecision(input, keeper, mine.point, 'chase', keeper.maxSpeed,
-        `Ballon libre dans la surface : le gardien arrive en ${fmtFr(mine.time, 1)} s, l’adversaire le plus rapide en ${fmtFr(Math.min(opp, 99), 1)} s.`, t0);
+        inGoalArea && mine.time >= opp
+          ? `Ballon libre dans la surface de but : sortie systématique (gardien en ${fmtFr(mine.time, 1)} s, adversaire le plus rapide en ${fmtFr(Math.min(opp, 99), 1)} s).`
+          : `Ballon libre dans la surface : le gardien arrive en ${fmtFr(mine.time, 1)} s, l’adversaire le plus rapide en ${fmtFr(Math.min(opp, 99), 1)} s.`, t0);
     }
   }
 
@@ -114,7 +120,9 @@ function distribute(input: DecisionInput, keeper: Player, t0: number): Decision 
   // Passes courtes : défenseurs (à défaut, n'importe quel coéquipier de champ), meilleures probabilités.
   const defenders = state.players.filter((p) => p.team === team && p.role === 'DF');
   const pool = defenders.length ? defenders : state.players.filter((p) => p.team === team && p.id !== keeper.id && p.role !== 'GK');
-  const shorts = pool.map((p) => ({ p, prob: passProbability(state, fields, keeper.id, p.id, p.pos, params, SHORT_ARRIVAL) }))
+  // Une relance dont la course résiduelle franchirait la ligne de but (receveur collé au but) n'est pas une option.
+  const shorts = pool.filter((p) => !rollsIntoOwnGoal(keeper.pos, p.pos, SHORT_ARRIVAL, team, params))
+    .map((p) => ({ p, prob: passProbability(state, fields, keeper.id, p.id, p.pos, params, SHORT_ARRIVAL) }))
     .sort((a, b) => b.prob.p - a.prob.p)
     .slice(0, SHORT_OPTIONS);
   for (const s of shorts) {

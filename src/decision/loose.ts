@@ -3,7 +3,8 @@
  *
  *  - Ballon libre (§3.3, §13.2) : point d'arrêt prédit du ballon roulant, temps d'interception d'un joueur
  *    (le premier instant où il peut être sur la trajectoire avant ou en même temps que le ballon),
- *    classement des « chasseurs » d'une équipe, point de réception d'une passe en cours.
+ *    classement des « chasseurs » d'une équipe, point de réception d'une passe en cours, point de rencontre stable
+ *    (conservé tant qu'il reste physiquement atteignable avant le ballon).
  *  - Fabrique de candidats de déplacement, de contexte de décision et de décisions complètes, partagée par
  *    offball.ts, defence.ts, keeper.ts et coordinator.ts (aucune duplication des formats de sortie).
  *
@@ -15,7 +16,7 @@ import { clampToPitch } from '../core/pitch';
 import type {
   Action, Ball, Candidate, Decision, DecisionContext, MatchState, MoveIntent, PhysicsParams, Player, ScoreComponent, SimParams, TeamId,
 } from '../core/types';
-import { timeToArrive } from '../models/motion';
+import { runTimeFrom, timeToArrive } from '../models/motion';
 import { controlFor, pressureOn } from '../models/fields';
 import { localSuperiority } from '../models/structure';
 import { slotPosition } from '../engine/match';
@@ -38,9 +39,15 @@ const AVAILABLE_RADIUS = 30;
 /** Itérations de bissection pour affiner l'instant de rencontre avec le ballon (précision ≈ stop.time / (8·2⁶)). */
 const BISECTION_STEPS = 6;
 /** Vitesse par défaut (m/s) de la référence de ballon des postes (offBall.slotFollowRate absent). */
-const DEFAULT_SLOT_FOLLOW_RATE = 6;
+const DEFAULT_SLOT_FOLLOW_RATE = 5;
 /** Point de rencontre (course au ballon, réception) conservé d'un cycle à l'autre s'il bouge de moins de cette distance (m). */
 export const MEETING_KEEP_RADIUS = 3;
+/** Tolérance (m) d'écart à la trajectoire du ballon pour qu'un ancien point de rencontre soit encore « sur la trajectoire ». */
+const MEETING_LINE_TOLERANCE = 1;
+/** Retard (s) toléré du joueur sur le ballon à l'ancien point de rencontre (bruit du modèle de mouvement). */
+const MEETING_TIME_SLACK = 0.1;
+/** Défaut de offBall.meetingKeepGain (s). */
+const DEFAULT_MEETING_KEEP_GAIN = 0.5;
 
 // ---------------------------------------------------------------------------
 // Ballon libre
@@ -117,24 +124,82 @@ export function rankChasers(state: MatchState, params: SimParams, team: TeamId, 
   return out;
 }
 
-/** Point où le receveur désigné d'une passe en cours rejoint le ballon (point de rencontre, sinon point visé). */
-export function receiveTarget(state: MatchState, params: SimParams, receiver: Player): Vec2 {
+/** Point (et instant) où le receveur désigné d'une passe en cours rejoint le ballon : point de rencontre, sinon point visé (ballon aérien). */
+export function receiveMeeting(state: MatchState, params: SimParams, receiver: Player): { point: Vec2; time: number } {
   const flight = state.ball.flight;
-  const meet = timeToBall(receiver, state.ball, params);
-  if (!flight) return meet.point;
   // Ballon aérien : on attend le point visé (pas d'interception en vol).
-  if (flight.kind === 'lob' || flight.kind === 'clearance') return clampToPitch(flight.targetPoint, 0.5);
-  return meet.point;
+  if (flight && (flight.kind === 'lob' || flight.kind === 'clearance')) {
+    const point = clampToPitch(flight.targetPoint, 0.5);
+    return { point, time: timeToArrive(receiver.pos, receiver.vel, point, receiver.maxSpeed, receiver.maxAccel, params.models) };
+  }
+  return timeToBall(receiver, state.ball, params);
+}
+
+/** Point où le receveur désigné d'une passe en cours rejoint le ballon (point de rencontre, sinon point visé). */
+export const receiveTarget = (state: MatchState, params: SimParams, receiver: Player): Vec2 => receiveMeeting(state, params, receiver).point;
+
+/**
+ * Instant (s) auquel le ballon roulant passe au point `q` de sa trajectoire : ∞ si `q` n'est pas devant lui sur sa ligne
+ * (à MEETING_LINE_TOLERANCE près) ou au-delà de son point d'arrêt ; un ballon arrêté n'est « atteint » qu'à sa position.
+ * Solution de s·t − μt²/2 = d (§3.2).
+ */
+export function ballTimeAt(ball: Ball, q: Vec2, physics: PhysicsParams): number {
+  const s = Math.hypot(ball.vel.x, ball.vel.y);
+  if (s < BALL_STOP_SPEED) return dist(ball.pos, q) <= MEETING_LINE_TOLERANCE ? 0 : Infinity;
+  const ux = ball.vel.x / s, uy = ball.vel.y / s;
+  const dx = q.x - ball.pos.x, dy = q.y - ball.pos.y;
+  const along = dx * ux + dy * uy;
+  const across = Math.abs(dx * uy - dy * ux);
+  if (along < -MEETING_LINE_TOLERANCE || across > MEETING_LINE_TOLERANCE) return Infinity;
+  const mu = Math.max(1e-6, physics.ballFriction);
+  const range = (s * s) / (2 * mu);
+  if (along >= range) return along - range <= MEETING_LINE_TOLERANCE ? s / mu : Infinity;
+  if (along <= 0) return 0;
+  return (s - Math.sqrt(Math.max(0, s * s - 2 * mu * along))) / mu;
+}
+
+/** Contexte de conservation d'un point de rencontre : joueur, ballon, paramètres et instant de rencontre du nouveau point. */
+export interface MeetingContext { player: Player; ball: Ball; params: SimParams; time: number }
+
+/**
+ * Temps de course (s) d'un joueur déjà engagé vers `q` : cinématique exacte depuis sa vitesse courante projetée sur la
+ * direction de `q` (runTimeFrom), sans temps de réaction — contrairement à `timeToArrive` (planification : réaction τ
+ * puis départ arrêté), qui surestime d'environ 0,8 s l'arrivée d'un joueur lancé à pleine vitesse.
+ */
+export function engagedArrivalTime(p: Player, q: Vec2): number {
+  const dx = q.x - p.pos.x, dy = q.y - p.pos.y;
+  const d = Math.sqrt(dx * dx + dy * dy);
+  const vAlong = d > 1e-9 ? (dx * p.vel.x + dy * p.vel.y) / d : 0;
+  return runTimeFrom(d, Math.max(0, vAlong), p.maxSpeed, p.maxAccel);
 }
 
 /**
- * Point de rencontre stable : si la décision précédente avait la même intention (course au ballon, réception) et une
- * cible à moins de MEETING_KEEP_RADIUS m du nouveau point, l'ancienne cible est conservée (pas de cible qui « tremble »
- * d'un cycle à l'autre le long de la trajectoire).
+ * L'ancien point de rencontre `old` est-il encore physiquement valable : le ballon y passe encore (devant lui, sur sa
+ * trajectoire), le joueur — déjà engagé vers ce point, donc jugé sur sa cinématique réelle (`engagedArrivalTime`) — peut
+ * y être au plus tard quand le ballon y passe (T ≤ t_b(old) + tolérance), et attendre le ballon là ne coûte pas plus
+ * de `meetingKeepGain` s par rapport au nouveau point de rencontre ? Le point planifié (timeToBall) est choisi à la
+ * limite de faisabilité du modèle conservateur (T_j = t_b) ; le juger ensuite avec ce même modèle le rendait « en
+ * retard » de 0,1–0,3 s au cycle suivant et faisait glisser la cible le long de la trajectoire à chaque cycle.
  */
-export function stableMeetingPoint(previous: Decision | null | undefined, intent: MoveIntent, point: Vec2): Vec2 {
+export function meetingStillValid(old: Vec2, ctx: MeetingContext): boolean {
+  const tBall = ballTimeAt(ctx.ball, old, ctx.params.physics);
+  if (!Number.isFinite(tBall)) return false;
+  const T = engagedArrivalTime(ctx.player, old);
+  const gain = ctx.params.offBall.meetingKeepGain ?? DEFAULT_MEETING_KEEP_GAIN;
+  return T <= tBall + MEETING_TIME_SLACK && tBall <= ctx.time + gain;
+}
+
+/**
+ * Point de rencontre stable : si la décision précédente avait la même intention (course au ballon, réception), l'ancienne
+ * cible est conservée si elle est à moins de MEETING_KEEP_RADIUS m du nouveau point ou, avec `ctx`, si elle reste un point
+ * de rencontre physiquement valable (`meetingStillValid`) : pas de cible qui « tremble » ou recule le long de la trajectoire
+ * à mesure que le joueur s'approche du ballon.
+ */
+export function stableMeetingPoint(previous: Decision | null | undefined, intent: MoveIntent, point: Vec2, ctx?: MeetingContext): Vec2 {
   const a = previous?.chosen.action;
-  if (a && a.type === 'move' && a.intent === intent && dist(a.target, point) < MEETING_KEEP_RADIUS) return a.target;
+  if (!a || a.type !== 'move' || a.intent !== intent) return point;
+  if (dist(a.target, point) < MEETING_KEEP_RADIUS) return a.target;
+  if (ctx && meetingStillValid(a.target, ctx)) return a.target;
   return point;
 }
 

@@ -205,11 +205,12 @@ function whistleOffside(state: MatchState, receiver: Player, params: SimParams):
   const opp = otherTeam(receiver.team);
   changePossession(state, opp, true, pos, receiver.id);
   const taker = nearestOutfield(state, pos, opp) ?? nearestOutfield(state, pos, undefined, receiver.id);
-  restartWith(state, { kind: 'free_kick', team: opp, pos, resumeAt: 0 }, taker, params.physics.restartFreeze);
+  restartWith(state, { kind: 'free_kick', team: opp, pos, resumeAt: 0 }, taker, params);
 }
 
 /** Met en place une remise en jeu : ballon (et remetteur) au point, gel jusqu'à `time + freeze`. */
-function restartWith(state: MatchState, restart: Restart, taker: Player | undefined, freeze: number): void {
+function restartWith(state: MatchState, restart: Restart, taker: Player | undefined, params: SimParams): void {
+  const freeze = params.physics.restartFreeze;
   const pos: Vec2 = {
     x: clamp(restart.pos.x, -PITCH.halfLength + RESTART_MARGIN, PITCH.halfLength - RESTART_MARGIN),
     y: clamp(restart.pos.y, -PITCH.halfWidth + RESTART_MARGIN, PITCH.halfWidth - RESTART_MARGIN),
@@ -228,6 +229,26 @@ function restartWith(state: MatchState, restart: Restart, taker: Player | undefi
     ball.vz = 0;
     ball.ownerId = null;
     ball.flight = null;
+  }
+  // Adversaires repoussés (§3.4) : à ≥ `restartClearance` m du ballon ; sur une sortie de but, hors de la surface de
+  // réparation (loi 16 : sans ce replacement, une relance de 3 m était interceptée devant le but vide).
+  const clearance = params.physics.restartClearance ?? 0;
+  const opponents = otherTeam(restart.team);
+  const ownSide = (-attackDir(restart.team)) as AttackDir;
+  for (const p of state.players) {
+    if (p.team !== opponents) continue;
+    let moved = false;
+    if (restart.kind === 'goal_kick' && ownSide * p.pos.x >= PITCH.halfLength - PITCH.penaltyAreaLength - RESTART_MARGIN && Math.abs(p.pos.y) <= PITCH.penaltyAreaHalfWidth + RESTART_MARGIN) {
+      p.pos = { x: ownSide * (PITCH.halfLength - PITCH.penaltyAreaLength - clearance), y: p.pos.y };
+      moved = true;
+    }
+    const d = dist(p.pos, pos);
+    if (clearance > 0 && d < clearance) {
+      const ux = d > 1e-6 ? (p.pos.x - pos.x) / d : -ownSide, uy = d > 1e-6 ? (p.pos.y - pos.y) / d : 0;
+      p.pos = { x: clamp(pos.x + ux * clearance, -PITCH.halfLength, PITCH.halfLength), y: clamp(pos.y + uy * clearance, -PITCH.halfWidth, PITCH.halfWidth) };
+      moved = true;
+    }
+    if (moved) { p.vel = { x: 0, y: 0 }; p.target = null; p.targetSpeed = 0; p.steerVel = undefined; }
   }
   state.restart = { ...restart, pos, resumeAt: state.time + freeze };
   state.lastRestart = { ...state.restart, pos: { ...pos }, playerId: taker?.id };
@@ -349,12 +370,12 @@ function checkBallOut(state: MatchState, params: SimParams, rng: Rng): void {
       const spot: Vec2 = { x: side * GOAL_KICK_X, y: 0 };
       const taker = keeperOf(state, defending) ?? nearestPlayer(state, spot, defending) ?? nearestPlayer(state, spot);
       changePossession(state, defending, false, spot);
-      restartWith(state, { kind: 'goal_kick', team: defending, pos: spot, resumeAt: 0 }, taker, params.physics.restartFreeze);
+      restartWith(state, { kind: 'goal_kick', team: defending, pos: spot, resumeAt: 0 }, taker, params);
     } else {
       const spot: Vec2 = { x: side * H, y: (b.y >= 0 ? 1 : -1) * W };
       const taker = nearestOutfield(state, spot, attacking) ?? nearestOutfield(state, spot);
       changePossession(state, attacking, false, spot);
-      restartWith(state, { kind: 'corner', team: attacking, pos: spot, resumeAt: 0 }, taker, params.physics.restartFreeze);
+      restartWith(state, { kind: 'corner', team: attacking, pos: spot, resumeAt: 0 }, taker, params);
     }
     return;
   }
@@ -366,7 +387,7 @@ function checkBallOut(state: MatchState, params: SimParams, rng: Rng): void {
     endFlightOut(state, lastTouch);
     const taker = nearestOutfield(state, spot, team) ?? nearestOutfield(state, spot);
     changePossession(state, team, false, spot);
-    restartWith(state, { kind: 'throw_in', team, pos: spot, resumeAt: 0 }, taker, params.physics.restartFreeze);
+    restartWith(state, { kind: 'throw_in', team, pos: spot, resumeAt: 0 }, taker, params);
   }
   void rng;
 }

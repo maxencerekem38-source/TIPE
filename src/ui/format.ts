@@ -93,6 +93,31 @@ export const ROLE_LABELS: Record<Role, string> = { GK: 'GB', DF: 'DF', MF: 'MF',
 
 export const TEAM_LABELS: Record<TeamId, string> = { A: 'Équipe A', B: 'Équipe B' };
 
+/** Point du terrain « (12,3 ; −4,0) » (mètres, une décimale). */
+export function fmtPoint(p: { x: number; y: number }): string {
+  return `(${fmtNumber(p.x, 1)} ; ${fmtNumber(p.y, 1)})`;
+}
+
+/** Libellé d'une intention de déplacement avec majuscule initiale (« Appel », « Structure »…). */
+export function intentTitle(intent: MoveIntent): string {
+  const s = INTENT_LABELS[intent];
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+/**
+ * Cible d'un déplacement vue depuis la position `from` du joueur : « (23,5 ; −4,0) · 12 m · 6,4 m/s » (la vitesse de
+ * consigne est omise en forme compacte, pour les lignes étroites) ; une cible confondue avec la position (≤ 0,5 m) est
+ * « tenir sa place ».
+ */
+export function moveTargetLabel(a: Extract<Action, { type: 'move' }>, from?: { x: number; y: number }, compact = false): string {
+  const d = from ? Math.hypot(a.target.x - from.x, a.target.y - from.y) : NaN;
+  if (Number.isFinite(d) && d <= 0.5) return compact ? 'tenir sa place' : `tenir sa place ${fmtPoint(a.target)}`;
+  const parts = [fmtPoint(a.target)];
+  if (Number.isFinite(d)) parts.push(`${fmtNumber(d, 0)} m`);
+  if (!compact) parts.push(`${fmtNumber(a.speed, 1)} m/s`);
+  return parts.join(' · ');
+}
+
 /** Description courte de la cible d'une action : « Joueur 9 », « vers le but »… */
 export function actionTargetLabel(a: Action, numberOf: (id: number) => string): string {
   switch (a.type) {

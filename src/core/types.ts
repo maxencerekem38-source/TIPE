@@ -148,6 +148,8 @@ export interface Player {
   lastControlTime?: number;
   /** (moteur) Défenseur : instant d'entrée dans r_tackle du porteur (duel après `physics.duelContactTime` s de contact). */
   duelContactSince?: number;
+  /** (moteur) Vitesse désirée lissée (retard du premier ordre τ_steer = `physics.steeringTau`, §7.2). */
+  steerVel?: Vec2;
 }
 
 export type BallFlightKind = 'pass' | 'through' | 'lob' | 'shot' | 'clearance' | 'loose';
@@ -483,6 +485,11 @@ export interface PhysicsParams {
   takeOnRadius: number; // m, distance d'un adversaire en deçà de laquelle un dribble est un « dribble » (prise à défaut)
   lobLandingSpeed: number; // m/s, vitesse horizontale maximale conservée par un ballon aérien à son premier contact au sol
   lobBounce: number; // restitution verticale au premier contact au sol d'un ballon aérien (amortissement pelouse)
+  /** τ_steer (s) : retard du premier ordre sur la vitesse désirée de chaque joueur (§7.2, lissage de direction), défaut 0,3 ; ≤ 0 = désactivé. */
+  steeringTau?: number;
+  /** Remises en jeu (§3.4) : distance minimale (m) des adversaires au ballon à la reprise (touche, corner, coup franc) ;
+   * sur une sortie de but, les adversaires sont en outre replacés hors de la surface de réparation. Défaut 3. */
+  restartClearance?: number;
 }
 
 /** Coefficients d'un modèle logistique P = σ(base + Σ coef·feature). */
@@ -569,6 +576,29 @@ export interface DecisionWeights {
   wLength?: number;
   /** Part de la possession courante Θ(b) comptée perdue par un tir manqué (coût d'opportunité du tir), défaut 1. */
   wShotPossession?: number;
+  /**
+   * w_poss : part de la possession courante Θ(b) = xT(b)·PC_att(b) comptée perdue par l'échec d'une passe, d'un dribble,
+   * d'une conservation ou d'un dégagement (coût d'opportunité de la possession, modulé par la tolérance au risque comme
+   * λ_risk). Sans ce terme, une perte dans le camp adverse ne coûte que la (faible) menace adverse locale, et les passes
+   * à 50 % battent les passes sûres. Défaut 0 (formule §6.2 d'origine).
+   */
+  wPossession?: number;
+  /**
+   * Nombre de réponses défensives évaluées en profondeur 2 (§6.3), dans l'ordre hold, press, cover, drop :
+   * 4 = ensemble complet, minimum 2 = hold + press. Défaut 4 (mesure du coût : scripts/bench.ts, voir params.ts).
+   */
+  responseCount?: number;
+  /**
+   * Sous une réponse autre que hold, nombre des meilleures suites (trouvées sous hold) ré-évaluées sur l'état ajusté
+   * pour obtenir G(a, r) ; 0 = régénération complète du jeu réduit (≈ 20 évaluations). Défaut 4.
+   */
+  responseReevaluate?: number;
+  /** Engagement minimal (s) d'un dribble ou d'une conservation tirés au jeu 2×2 (§6.4 : « au moins 1 s »), défaut 1. */
+  gameCommitMin?: number;
+  /** Marge (m) de part et d'autre des poteaux : une passe au sol dont la course résiduelle (portée s₀²/2μ au-delà de la
+   * cible) franchirait sa propre ligne de but à moins de goalHalfWidth + marge n'est pas un candidat (but contre son camp
+   * si le receveur la manque). Défaut 1. */
+  ownGoalMargin?: number;
 }
 
 /** Poids de l'utilité de déplacement sans ballon (attaque). */
@@ -597,8 +627,22 @@ export interface OffBallWeights {
   intentSpeed?: { hold_shape: number; support: number; width: number; exploit_space: number; create_space: number };
   /** Distance (m) sous laquelle une cible « conservation de la structure » est remplacée par la position courante (le joueur tient sa place), défaut 1,5 (< 2 m : aucun saut de cible mesurable). */
   standDistance?: number;
-  /** Vitesse maximale (m/s) de la référence de ballon des postes instanciés (`MatchState.slotBallRef`) ; ≤ 0 = ballon instantané. Défaut 6. */
+  /** Vitesse maximale (m/s) de la référence de ballon des postes instanciés (`MatchState.slotBallRef`) ; ≤ 0 = ballon instantané. Défaut 5. */
   slotFollowRate?: number;
+  /** Coût de déplacement (utilité par mètre entre la position courante et la cible) : un déplacement n'est entrepris que
+   * s'il rapporte plus que ce coût (réalisme : distance parcourue, stabilité des cibles). Défaut 0,015. */
+  wMove?: number;
+  /** Fraction du bonus d'hystérésis accordée, à la récupération du ballon, à la cible de la tâche défensive précédente
+   * (repli, zone, marquage…) pendant `reexamineEvery` s : le joueur termine son mouvement au lieu de changer de cible à
+   * chaque bascule de possession. 0 = désactivé. Défaut 0,5. */
+  transitionHysteresis?: number;
+  /** Point de rencontre d'un ballon roulant (réception, course au ballon) : l'ancien point est conservé tant que le joueur
+   * peut encore y être avant le ballon et que le nouveau point de rencontre n'est pas plus tôt de plus de cette durée (s). Défaut 0,5. */
+  meetingKeepGain?: number;
+  /** Plancher (m, repère équipe) des postes de champ instanciés en phase de possession : le glissement des postes vers
+   * le ballon (followX) ne fait pas descendre les défenseurs sur leur ligne de but quand le gardien a le ballon (relance
+   * de sortie de but). ≤ −52,5 = désactivé. Défaut −38 (2 m à l'intérieur de la surface de réparation). */
+  slotFloorX?: number;
 }
 
 /** Coûts de l'affectation défensive. */
@@ -618,13 +662,18 @@ export interface DefenceWeights {
   containOffset: number; // m, distance côté but du porteur en mode « contain »
   tackleRadius: number; // m
   // --- Ajouts de la décision défensive (append-only, défauts dans params.ts) ---
-  /** Distance supplémentaire (m) de « contain » par unité de (1 − pressIntensity) : un bloc bas contient de plus loin, défaut 2. */
+  /** Distance supplémentaire (m) de « contain » par unité de (1 − pressIntensity) : un bloc bas contient de plus loin, défaut 6. */
   containSlack?: number;
-  /** Vitesses de consigne (fractions de v_max) des tâches non urgentes ; press / intercept / chase restent au sprint.
-   * Défauts : contain 0,8 ; zone 0,5 ; mark 0,6 + 0,4·priorité ; recover 0,35 + 0,35·recoverPriority. */
+  /** Vitesses de consigne (fractions de v_max) des tâches non urgentes ; press / intercept / chase restent au sprint ;
+   * zone et repli accélèrent linéairement vers le sprint entre 6 et 20 m de leur point (la ligne remonte vite).
+   * Défauts : contain 0,7 ; zone 0,3 ; mark 0,45 + 0,3·priorité ; recover 0,25 + 0,3·recoverPriority. */
   taskSpeed?: { contain: number; zone: number; markBase: number; markGain: number; recoverBase: number; recoverGain: number };
-  /** Distance (m) sous laquelle une tâche zone / repli est tenue sur place (cible = position courante), défaut 2. */
+  /** Distance (m) sous laquelle une tâche zone / repli est tenue sur place (cible = position courante), défaut 3. */
   standDistance?: number;
+  /** Tenue de la ligne (§8.4) : les points de marquage et de zone ne descendent pas à plus de cette distance (m) derrière
+   * la ligne du bloc (poste le plus bas des joueurs de champ) — un attaquant plus profond est laissé au hors-jeu.
+   * Une grande valeur (≥ 100) désactive la tenue de ligne. Défaut 1. */
+  lineHoldSlack?: number;
 }
 
 export interface SimParams {

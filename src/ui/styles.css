@@ -150,6 +150,7 @@ kbd {
 .tag-info { color: #bae6fd; border-color: rgba(56, 189, 248, 0.4); background: rgba(56, 189, 248, 0.1); }
 .tag-warn { color: #fde68a; border-color: rgba(251, 191, 36, 0.45); background: rgba(251, 191, 36, 0.12); }
 .tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.tags .tag { white-space: normal; line-height: 1.35; }
 
 /* ---------------------------------------------------------------- Décision */
 .decision-header { display: flex; align-items: center; gap: 10px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
@@ -162,13 +163,14 @@ kbd {
   border: 1px solid rgba(34, 197, 94, 0.35); box-shadow: var(--shadow);
   display: flex; flex-direction: column; gap: 6px;
 }
+.optimal .tag { white-space: normal; line-height: 1.35; align-self: flex-start; }
 .kv { display: flex; gap: 8px; align-items: baseline; }
-.kv-2 { justify-content: space-between; }
+.kv-2 { justify-content: space-between; flex-wrap: wrap; row-gap: 2px; }
 .kv .k { font-size: 11px; font-weight: 700; letter-spacing: 0.08em; color: var(--text-muted); flex: 0 0 auto; }
-.kv .v { font-weight: 700; font-size: 14px; }
+.kv .v { font-weight: 700; font-size: 14px; min-width: 0; overflow-wrap: anywhere; }
 .kv .v.accent { color: var(--accent); font-size: 18px; letter-spacing: 0.02em; }
 .kv .v.reason { font-weight: 500; font-size: 12.5px; color: var(--text); }
-.kv-inline { display: flex; gap: 16px; margin-top: 6px; font-size: 12px; }
+.kv-inline { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 6px; font-size: 12px; }
 
 .cand-list { display: flex; flex-direction: column; gap: 4px; }
 .cand { border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-elev); transition: border-color 0.12s, background 0.12s; }
@@ -199,7 +201,7 @@ kbd {
 .comp-value, .comp-weight, .comp-contrib { text-align: right; }
 .comp-contrib.pos { color: #86efac; }
 .comp-contrib.neg { color: #fca5a5; }
-.formula { margin-top: 10px; padding: 8px 10px; background: rgba(15, 23, 42, 0.6); border-radius: var(--radius-sm); font-size: 12px; border: 1px solid var(--border); }
+.formula { margin-top: 10px; padding: 8px 10px; background: rgba(15, 23, 42, 0.6); border-radius: var(--radius-sm); font-size: 12px; border: 1px solid var(--border); overflow-wrap: anywhere; }
 .reason-line { margin-top: 8px; color: var(--text-muted); font-style: italic; }
 .ctx-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; }
 .ctx-item { display: flex; justify-content: space-between; gap: 8px; padding: 4px 8px; background: var(--bg-elev); border-radius: var(--radius-sm); border: 1px solid var(--border); font-size: 12px; }
@@ -262,6 +264,9 @@ input[type="range"] { width: 100%; accent-color: var(--accent-2); height: 18px; 
 .log-item.kind-pass_intercepted .log-text, .log-item.kind-turnover .log-text, .log-item.kind-pass_failed .log-text { color: #fca5a5; }
 
 /* ---------------------------------------------------------------- Scénarios */
+.scenario-groups { display: flex; flex-direction: column; }
+.scenario-group { margin-top: 14px; }
+.scenario-group:first-child { margin-top: 4px; }
 .scenario-list { display: flex; flex-direction: column; gap: 6px; }
 .scenario {
   text-align: left; display: flex; flex-direction: column; gap: 2px; padding: 10px 12px;
@@ -270,6 +275,14 @@ input[type="range"] { width: 100%; accent-color: var(--accent-2); height: 18px; 
 .scenario:hover { border-color: var(--accent-2); background: rgba(56, 189, 248, 0.06); }
 .scenario-name { font-weight: 700; }
 .scenario-desc { color: var(--text-muted); font-size: 12px; }
+
+/* ---------------------------------------------------------------- Mode présentation */
+.present-btn.active { background: var(--accent-2); border-color: transparent; color: #04202c; }
+#app.presentation { --sidebar-w: 360px; }
+#app.presentation .hint-bar, #app.presentation .perf { display: none; }
+#app.presentation .panel { padding: 10px 12px 20px; }
+#app.presentation .tab { padding: 6px 7px; font-size: 12px; }
+#app.presentation .tabbar { padding: 6px 6px 0; }
 
 /* ---------------------------------------------------------------- Réactif */
 @media (max-width: 1750px) {

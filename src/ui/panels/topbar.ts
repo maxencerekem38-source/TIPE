@@ -25,6 +25,7 @@ export function createTopbar(app: AppState, onToggleSidebar: () => void): HTMLEl
   const perf = el('span', { class: 'perf', title: 'Images par seconde · latence moyenne de décision' }, '— fps');
   const demo = el('span', { class: 'demo-badge', title: 'Mode démo : le moteur de simulation n’est pas chargé, une simulation factice anime l’interface.', style: 'display:none' },
     'MODE DÉMO', el('span', { class: 'demo-long', text: ' (moteur non chargé)' }));
+  const presentBtn = el('button', { class: 'btn btn-small present-btn', title: 'Mode présentation (P) : aide clavier masquée, terrain agrandi', onClick: () => app.togglePresentation() }, 'Présentation');
   const toggleBtn = el('button', { class: 'btn btn-icon', title: 'Afficher / masquer le panneau latéral', onClick: onToggleSidebar }, '☰');
 
   const root = el('header', { class: 'topbar' },
@@ -42,7 +43,7 @@ export function createTopbar(app: AppState, onToggleSidebar: () => void): HTMLEl
       ),
       clock,
     ),
-    el('div', { class: 'topbar-right' }, perf, toggleBtn),
+    el('div', { class: 'topbar-right' }, perf, presentBtn, toggleBtn),
   );
 
   const refresh = (): void => {
@@ -59,6 +60,7 @@ export function createTopbar(app: AppState, onToggleSidebar: () => void): HTMLEl
     phaseB.dataset.phase = st.phase.B;
     perf.textContent = `${Math.round(app.fps)} fps · ${fmtMs(app.decisionLatencyMs)}`;
     demo.style.display = app.demoMode ? '' : 'none';
+    presentBtn.classList.toggle('active', app.presentation);
   };
   app.on('ui', refresh);
   app.on('sim', refresh);

@@ -52,6 +52,8 @@ export interface Scenario {
   id: string;
   name: string;
   description: string;
+  /** Catégorie d'affichage (regroupement du panneau « Scénarios ») ; absente = « Général ». */
+  category?: string;
   apply: (app: AppState) => void;
 }
 
@@ -71,6 +73,8 @@ export class AppState {
     control: true, threat: false, pressure: false, spaces: false, passLines: true, trajectories: true, moves: false, defence: false, labels: false,
   };
   manualTactics: Record<TeamId, Partial<TacticParams>> = { A: {}, B: {} };
+  /** Mode présentation : aide clavier masquée, panneau latéral resserré, terrain agrandi (touche P). */
+  presentation = false;
   ballTrail: TrailPoint[] = [];
   decisionHistory: Decision[] = [];
   /** Historique (temps, possession A, xG A, xG B) échantillonné toutes les secondes. */
@@ -150,6 +154,11 @@ export class AppState {
   }
   speedUp(): void { this.setSpeed(SPEEDS[Math.min(SPEEDS.length - 1, SPEEDS.indexOf(this.speed) + 1)]); }
   speedDown(): void { this.setSpeed(SPEEDS[Math.max(0, SPEEDS.indexOf(this.speed) - 1)]); }
+
+  togglePresentation(value?: boolean): void {
+    this.presentation = value ?? !this.presentation;
+    this.emit('ui');
+  }
 
   toggleOverlay(id: OverlayId, value?: boolean): void {
     const v = value ?? !this.overlays[id];
