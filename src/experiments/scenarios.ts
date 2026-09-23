@@ -383,7 +383,7 @@ export const SCENARIOS: Scenario[] = [
     protagonist: ST,
     acceptable: [{ cls: 'pass', target: LW }, { cls: 'through', target: LW }, { cls: 'dribble', direction: 'forward' }],
     att: [[-44, 0], [0, -26], [-10, -6], [-10, 6], [0, 26], [10, 0], [18, -12], [18, 12], [35, 8, 4, 0], [32, -4, 4, 0], [28, 22, 3, 0]],
-    def: [[48, 0], [24, 22, 5, 0], [36, 0], [26, -8, 6, 0], [22, -20, 5, 0], [10, 20], [12, 6], [12, -6], [10, -20], [-10, 6], [-10, -6]],
+    def: [[48, 0], [24, 22, 5, 0], [36, 0], [26, -8, 6, 0], [22, -20, 5, 0], [10, 20], [12, 6], [12, -6], [10, -20], [-14, 3], [-14, -9]],
   }),
   defineScenario({
     id: 'dribble_isolated_defender', name: 'Dribble face à un défenseur isolé', category: 'penetration', kpi: 'threat',

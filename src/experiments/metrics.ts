@@ -153,10 +153,11 @@ export interface WilcoxonResult {
 
 /** Fonction de répartition de la loi normale centrée réduite. */
 export function normalCdf(z: number): number {
-  // Abramowitz–Stegun 7.1.26 (erreur < 1,5e-7)
-  const t = 1 / (1 + 0.3275911 * Math.abs(z));
+  // Φ(z) = ½(1 + erf(z/√2)), erf par Abramowitz–Stegun 7.1.26 (erreur < 1,5e-7)
+  const x = Math.abs(z) / Math.SQRT2;
+  const t = 1 / (1 + 0.3275911 * x);
   const poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
-  const erf = 1 - poly * Math.exp(-z * z);
+  const erf = 1 - poly * Math.exp(-x * x);
   return 0.5 * (1 + (z >= 0 ? erf : -erf));
 }
 

@@ -226,8 +226,11 @@ export function createMatchCollector(options: RunMatchOptions = {}): MatchCollec
     let cycle = 0;
     const byId = new Map<number, Player>();
     for (const p of state.players) byId.set(p.id, p);
-    const carrierId = state.ball.ownerId;
+    // NB : le rappel a lieu après l'exécution des actions ; une passe ou un tir a déjà libéré le ballon.
+    // Toute décision « avec ballon » (type ≠ move) est donc attribuée à son auteur comme porteur.
     const possession = state.possession;
+    let carrierId: number | null = null;
+    for (const [id, d] of decisions) if (d.chosen.action.type !== 'move') { carrierId = id; break; }
     for (const [id, d] of decisions) {
       const ms = Number.isFinite(d.computeMs) ? d.computeMs : 0;
       decisionMs.push(ms);
@@ -236,13 +239,13 @@ export function createMatchCollector(options: RunMatchOptions = {}): MatchCollec
       if (!player) continue;
       const a = acc[player.team];
       const action = d.chosen.action;
-      if (id === carrierId && action.type !== 'move') {
+      if (action.type !== 'move') {
         const sig = actionSignature(action);
         if (lastCarrier && lastCarrier.id === id && lastCarrier.sig !== sig) a.intentionChanges++;
         a.carrierCycles++;
         lastCarrier = { id, sig };
         if (action.type === 'pass') { a.passLength += dist(player.pos, action.targetPoint); a.passCount++; }
-      } else if (action.type === 'move') {
+      } else {
         if (player.team === possession && id !== carrierId) {
           const prev = prevTargets.get(id);
           if (prev && dist(prev, action.target) > 2) a.targetChanges++;
@@ -254,7 +257,7 @@ export function createMatchCollector(options: RunMatchOptions = {}): MatchCollec
         prevIntent.set(id, action.intent);
       }
     }
-    if (carrierId === null || !decisions.has(carrierId)) lastCarrier = null;
+    if (carrierId === null) lastCarrier = null;
     cycleMs.push(cycle);
     scanEvents(state);
     scanFlight(state);
@@ -469,8 +472,9 @@ export function runScenario(scenario: Scenario, policy: PolicySet | undefined, s
     totalTicks++;
     if (s.possession === team) possessionTicks++;
     if (capture.decision) return;
+    // Le rappel suit l'exécution : après une passe ou un tir, le ballon est déjà libéré (lastTouchId = protagoniste).
     const d = decisions.get(scenario.protagonistId);
-    if (d && d.chosen.action.type !== 'move' && s.ball.ownerId === scenario.protagonistId) capture.decision = d;
+    if (d && d.chosen.action.type !== 'move' && (s.ball.ownerId === scenario.protagonistId || s.ball.lastTouchId === scenario.protagonistId)) capture.decision = d;
   };
   const t0 = performance.now();
   sim.advance(horizonSec, { policies, onDecisions, ...(options.decide ? { decide: options.decide } : {}) });
