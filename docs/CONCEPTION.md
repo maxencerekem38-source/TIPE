@@ -50,11 +50,13 @@ Convention de lecture : chaque formule est donnée avec ses paramètres et leurs
 | $\eta$ | efficacité de capture par échantillon | — | 0,35 (calibré §11.6) |
 | $\lambda_{risk}$ | aversion au risque (tactique) | — | 1,0 |
 | $w_{prog}, w_{sup}, w_{lb}$ | poids progression, soutien, lignes franchies | but | 0,15 ; 0,02 ; 0,02 |
-| $w_{time}, w_{off}$ | coût temporel, coût risque hors-jeu | but/s, but | 0,005 ; 0,05 |
+| $w_{time}, w_{off}$ | coût temporel, coût risque hors-jeu | but/s, but | 0,005 ; 0,02 |
+| $w_{len}, d_{sup}$ | pénalité de longueur de passe (× (1 − directness)), longueur libre = distance de soutien du style | but, m | 0,1 ; 11–18 |
+| $xG_{min}, w_{poss}$ | plancher de xG d'un tir candidat (× (1,5 − shotEagerness)), part de la possession Θ(b) perdue par un tir manqué | —, — | 0,04 ; 0,25 |
 | $\gamma$ | poids de la suite (profondeur 2) | — | 0,5 |
 | $K$ | nombre de candidats développés en profondeur 2 | — | 5 |
 | $\mathcal R$ | ensemble de réponses défensives | — | 4 réponses |
-| $h$ | hystérésis porteur | but | 0,02 |
+| $h$ | hystérésis porteur (30ᵉ percentile des écarts $Q(a_1) - Q(a_2)$ mesurés en match : 0,0018–0,0025) | but | 0,002 |
 | $\varepsilon$ | seuil d'égalité | but | 0,005 |
 | $\varepsilon_{game}$ | seuil de déclenchement du jeu 2×2 | but | 0,02 |
 | $w_1..w_6$ | poids de l'utilité hors-ballon | — | 1 ; 0,3 ; 0,3 ; 0,2 ; 0,4 ; 0,5 |
@@ -213,9 +215,9 @@ Une perte de balle en $q^-$ vaut $L(q^-) = xT^{def}(q^-)$ (menace adverse au poi
 | Type | Génération | Nombre |
 |---|---|---|
 | `pass` | un par coéquipier × 3 vitesses $s_{arr}$, cible anticipée $q_r$ ; élagage géométrique §4.6 | ≤ 30 → ~20 |
-| `through` | $q = p_k + \lambda \hat u_k$, $\lambda \in \{6, 12, 18\}$ m, $\hat u_k$ = direction de course de $k$ mélangée à $\hat x$ (50/50), + les 6 cellules de plus grand $D(q)$ à moins de 35 m devant le ballon ; élagage $W > 0{,}8$ ; garde les 8 meilleurs $W$ | ≤ 8 |
+| `through` | $q = p_k + \lambda \hat u_k$, $\lambda \in \{6, 12, 18\}$ m, $\hat u_k$ = direction de course de $k$ mélangée à $\hat x$ (50/50, rabattue sur $\hat x$ si le mélange ne pointe pas vers l'avant), + les 6 points de plus grand $D(q)$ d'un motif polaire centré sur le ballon (distances {8, 16, 24, 32} m × angles ±60°, servis au coéquipier en jeu qui y arrive le premier) ; cibles confondues (< 1 m) dédoublonnées ; élagage $W > 0{,}8$ ; garde les 8 meilleurs $EV_1$ (déviation : $EV_1$ contient déjà $1 - P_{int}$ et la valeur, ce que $W$ seul ignore) | ≤ 8 |
 | `dribble` | 8 directions × {4, 8} m | 16 |
-| `shot` | si $d_G < 35$ m, 3 points de visée | ≤ 3 |
+| `shot` | si $d_G < 35$ m et $xG \ge xG_{min}\,(1{,}5 - \text{shotEagerness})$ ($xG_{min} = 0{,}04$ : un tir désespéré n'est pas une option), 3 points de visée | ≤ 3 |
 | `hold` | 1 | 1 |
 | `clear` | dégagement long vers l'aile la plus libre, seulement si $x_b < -25$ et $\Pi(b) > 1{,}5$ | ≤ 1 |
 
@@ -224,8 +226,10 @@ Une perte de balle en $q^-$ vaut $L(q^-) = xT^{def}(q^-)$ (menace adverse au poi
 Pour un candidat $a$ de probabilité $P_a$, d'état de succès $q_a^+$ (ballon + porteur) et de point d'échec $q_a^-$, sur l'état **anticipé** (tous les joueurs avancés de $T_a$ à vitesse constante, $PC$ lu sur la grille du cycle) :
 $$EV_1(a) = P_a\, V^+(a) - (1 - P_a)\,\lambda_{risk}\, L(q_a^-) - C(a),$$
 $$V^+(a) = \Theta(q_a^+) + w_{prog}\frac{\Delta x_a}{L} + w_{sup}\,\text{sup}(q_a^+) + w_{lb}\, n_{lb}(a)\qquad(\text{tir} : V^+ = 1,\ P_a = xG),$$
-$$C(a) = w_{time}\, T_a + w_{off}\,\mathbb 1[\text{risque de hors-jeu}] ,$$
-avec $\lambda_{risk} = 1$, $w_{prog} = 0{,}15$, $w_{sup} = 0{,}02$, $w_{lb} = 0{,}02$, $w_{time} = 0{,}005$ but/s, $w_{off} = 0{,}05$. Le « risque de hors-jeu » est vrai si le receveur est à moins de 1 m de la ligne de hors-jeu. $T_a$ : durée de l'action ($T_b$ pour une passe, $d/v_{drib}$ pour un dribble, $T_{flight}$ pour un tir, $T_{hold}$).
+$$C(a) = w_{time}\, T_a + w_{off}\,\mathbb 1[\text{risque de hors-jeu}] + w_{len}\,(1 - \text{directness})\, P_a\, \frac{\max(0, d_a - d_{sup})}{L}\ (\text{passes}),$$
+avec $\lambda_{risk} = 1$, $w_{prog} = 0{,}15$, $w_{sup} = 0{,}02$, $w_{lb} = 0{,}02$, $w_{time} = 0{,}005$ but/s, $w_{off} = 0{,}02$, $w_{len} = 0{,}1$, $d_{sup}$ = distance de soutien du style (11 m possession, 16 m contre). Le « risque de hors-jeu » est vrai si le receveur est devant le ballon ET à moins de 1 m de la ligne des défenseurs (un receveur derrière le ballon ne peut jamais être hors-jeu, le porteur étant alors la ligne). $T_a$ : durée de l'action ($T_b$ pour une passe, $d/v_{drib}$ pour un dribble, $T_{flight}$ pour un tir, $T_{hold}$).
+
+**Tir** : $EV_1 = xG - (1 - xG)\,[\lambda_{risk}\, L(p_{gk}) + w_{poss}\,\Theta(b)] - C$, $w_{poss} = 0{,}25$ : un tir manqué rend le ballon (composante « possession », coût d'opportunité de la possession courante $\Theta(b) = xT(b)\,PC_{att}(b)$) ; sans ce terme, $L(p_{gk}) \approx 0{,}005$ rend un tir de 33 m à $xG = 0{,}02$ meilleur que toute passe. Calibré avec le plancher $xG_{min}$ sur 12 matchs : 4–7 tirs par équipe et 10 min, $xG$ moyen par tir 0,07–0,34.
 
 Décomposition stockée pour chaque candidat : `reward = P·V+`, `risk = (1−P)·λ·L`, `cost = C`, plus les contributions du logit de $P_a$. Elle est strictement additive.
 
@@ -241,7 +245,7 @@ $$\mathcal G(a, r) = \max_{a' \in \mathcal C'} \big[EV_1(a' \mid s^+_{a,r}) - \T
 
 **Score final** (retour à deux coups, minimax sur la réponse) :
 $$Q(a) = P_a \min_{r \in \mathcal R}\Big[\Theta_r(q_a^+) + w_{prog}\tfrac{\Delta x_a}{L} + w_{sup}\,\text{sup} + w_{lb}\, n_{lb} + \gamma\, \mathcal G(a, r)\Big] - (1 - P_a)\,\lambda_{risk}\, L(q_a^-) - C(a),\qquad \gamma = 0{,}5.$$
-Seuls les $K = 5$ meilleurs candidats selon $EV_1$ sont développés ; les autres gardent $Q = EV_1$. La réponse $r^\star(a) = \arg\min_r$ est mémorisée pour l'explication (« la meilleure réponse de la défense serait de couvrir la ligne vers le n° 9, ce qui dégrade cette passe de 0,012 »). Branchement : $5 \times 4 \times 13 = 260$ feuilles.
+Seuls les $K = 5$ meilleurs candidats selon $EV_1$ sont développés ; les autres gardent $Q = EV_1$. Implémentation (`onball.ts`, réponse `press` seule) : $Q(a) = EV_1(a) - P_a\,\delta_a + P_a\,\gamma\,\max(0, \mathcal G(a))$ avec $\delta_a = \Theta(q^+) - \Theta_{press}(q^+) \ge 0$ (composante « response », affichée telle quelle) et $\mathcal G(a) = \max_{a'} EV_1(a' \mid s^+) - \Theta_{press}(q^+)$ ; une suite « tir » est comparée en outre au tir immédiat (sinon « dribbler puis tirer » serait crédité de tout $xG'$). Le gain borné à 0 garantit qu'un candidat non développé ($Q = EV_1$) ne dépasse jamais un candidat développé par simple omission. La réponse $r^\star(a) = \arg\min_r$ est mémorisée pour l'explication (« la meilleure réponse de la défense serait de couvrir la ligne vers le n° 9, ce qui dégrade cette passe de 0,012 »). Branchement : $5 \times 4 \times 13 = 260$ feuilles.
 
 Justification : un critère glouton sur $xT$ ignore les combinaisons « passe au pied puis passe en profondeur » et la réaction adverse ; la profondeur 2 avec un petit ensemble de réponses capture les deux à coût borné ; la profondeur 3 est réservée à l'oracle hors-ligne (§11) qui sert à mesurer le regret de la profondeur 2.
 
@@ -256,7 +260,7 @@ Lorsque les deux meilleurs candidats $a_1, a_2$ sont de types différents parmi 
 
 ### 6.5 Pondération tactique, sélection, hystérésis
 
-Le profil tactique (§9) multiplie $\lambda_{risk}, w_{prog}, w_{lb}, \gamma, w_{time}$ avant évaluation. Sélection : $a^\star = \arg\max Q$ ; égalité à $\varepsilon = 0{,}005$ près ⇒ plus grand $P_a$, puis plus petit $T_a$, puis en phase `build` moins de lignes franchies (sécurité), en phase `attack` plus de lignes franchies. **Hystérésis** : l'intention courante $a_{cur}$ est conservée sauf si $Q(a_{new}) > Q(a_{cur}) + h$ ($h = 0{,}02$) ou si $a_{cur}$ est devenue infaisable. Procédure de calibration de $h$ : distribution des écarts $Q(a_1) - Q(a_2)$ sur la bibliothèque de scénarios, $h$ = 30ᵉ percentile (rapporté). Une passe ou un tir décidé est exécuté immédiatement (irrévocable) ; un dribble est engagé jusqu'à sa cible.
+Le profil tactique (§9) multiplie $\lambda_{risk}, w_{prog}, w_{lb}, \gamma, w_{time}$ avant évaluation. Sélection : $a^\star = \arg\max Q$ ; égalité à $\varepsilon = 0{,}005$ près ⇒ plus grand $P_a$, puis plus petit $T_a$ (température nulle), ou réponse quantale (softmax de température 0,01) sur la fenêtre $\varepsilon$ ; l'explication signale « départage quantal » lorsque l'action choisie n'est pas le premier candidat. **Hystérésis** : l'intention courante $a_{cur}$ est conservée sauf si $Q(a_{new}) > Q(a_{cur}) + h$ ou si $a_{cur}$ est devenue infaisable. Procédure de calibration de $h$ : distribution des écarts $Q(a_1) - Q(a_2)$ bruts (hors hystérésis) sur les décisions du porteur, $h$ = 30ᵉ percentile — mesuré en match (12 matchs, 3 paires tactiques) : 0,0018–0,0025 ⇒ $h = 0{,}002$ (sur les états construits de la bibliothèque, p30 ≈ 0,006 ; le test `calibration de h` rapporte les percentiles). L'ancienne valeur 0,02 était de l'ordre de la valeur entière d'une action au milieu du terrain et verrouillait le porteur dans son intention (54–65 % des décisions conservées par hystérésis, contre 5–6 % avec 0,002). Une passe ou un tir décidé est exécuté immédiatement (irrévocable) ; un dribble ou une conservation choisis portent `committedUntil` (durée de l'action) et le moteur (`loop.ts`) ne re-décide pas un dribble engagé tant que le porteur garde le ballon et n'a pas atteint sa cible.
 
 ### 6.6 Dérivation de l'explication
 
@@ -553,7 +557,7 @@ tests/                  vitest : core, models, engine, onball, offball, defence,
 Voir `src/core/types.ts`. Points saillants :
 
 - `Action` (union discriminée) : `pass {targetId, targetPoint, kind: ground|through|lob, speed}`, `dribble {direction, distance}`, `hold`, `shoot {targetPoint, power, xg?}`, `clear {targetPoint}`, `move {target, intent, speed, markId?}`. Les passes en profondeur sont des `pass` de `kind: 'through'`.
-- `Candidate` : `action, score, probability, valueIfSuccess, valueIfFailure, components: ScoreComponent[], reason, threats?, duration?, successPoint?, failurePoint?, response?, samples?`. **Invariant** : `score = Σ components[k].contribution` (décomposition additive exacte, base de l'explication).
+- `Candidate` : `action, score, probability, valueIfSuccess, valueIfFailure, components: ScoreComponent[], reason, threats?, weakOpponentId?, duration?, successPoint?, failurePoint?, response?, samples?`. **Invariant** : `score = Σ components[k].contribution` (décomposition additive exacte, base de l'explication) ; `threats[0]` est l'adversaire du point faible (`weakOpponentId`), nommé dans la raison du risque d'interception.
 - `Decision` : `playerId, time, chosen, candidates (triés par score décroissant), context, explanation, computeMs, keptByHysteresis?, committedUntil?, game?`.
 - `FieldSet` : champs `ScalarField` calculés une fois par cycle (`controlA`, `threatA`, `threatB`, `pressureByA`, `pressureByB`) ; des champs supplémentaires (temps d'arrivée, argmin) peuvent être ajoutés par le module `models`.
 - `TacticParams` : vecteur de 18 paramètres (attaque : `riskTolerance, progressionBias, tempo, directness, widthUsage, shotEagerness, supportDistance, runFrequency` ; défense : `pressIntensity, pressLine, defensiveLine, compactness, markingTightness, counterPressWindow, pressTriggerCount` ; transitions : `counterAttackBias, recoverPriority` ; `restDefenders`). Correspondance avec les modulateurs du §9.3 :
@@ -576,7 +580,8 @@ Voir `src/core/types.ts`. Points saillants :
 | marking, nMark | `markingTightness` | homme si $> 0{,}5$ ; $n_{mark} = 2 + \lfloor 4\,\text{markingTightness} \rfloor$ |
 | counterWindow, counterPress | `counterPressWindow` | contre-pressing pendant `counterPressWindow` s |
 | counterBoost | `counterAttackBias` | $w_{prog} \leftarrow w_{prog}(1 + 1{,}5\,\text{counterAttackBias})$ en transition offensive |
-| shotEagerness | `shotEagerness` | bonus additif $0{,}05\,(\text{shotEagerness} - 0{,}5)$ sur le tir |
+| shotEagerness | `shotEagerness` | bonus additif $0{,}05\,(\text{shotEagerness} - 0{,}5)$ sur le tir ; plancher $xG_{min} \leftarrow 0{,}04\,(1{,}5 - \text{shotEagerness})$ |
+| passes courtes | `directness`, `supportDistance` | pénalité $-(1 - \text{directness})\cdot 0{,}1\cdot P\cdot \max(0, d - d_{sup})/L$ sur `pass`/`lob`/`through` |
 
 ### 13.4 Signatures des fonctions clés (extraits des fichiers)
 
