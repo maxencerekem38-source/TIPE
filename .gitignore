@@ -9,3 +9,5 @@ results/*.csv
 results/analysis/
 results/screenshots/*.png
 !results/screenshots/.gitkeep
+results/*.md
+results/learning/
