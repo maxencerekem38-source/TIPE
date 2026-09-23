@@ -424,10 +424,9 @@ function classifyIntent(e: { c: Candidate; kind: CandidateKind; q: Vec2 }, stay:
 }
 
 function candidateReason(c: Candidate, intent: MoveIntent, q: Vec2, pos: Vec2, ball: Vec2, pPass: number): string {
-  const recv = c.components.find((x) => x.key === 'receivable');
-  const main = [...c.components].filter((x) => x.key !== 'hysteresis').sort((a, b) => Math.abs(b.contribution) - Math.abs(a.contribution))[0];
-  const d = dist(q, pos);
-  return `${INTENT_LABELS[intent]} à ${fmtFr(d, 0)} m (${fmtFr(dist(q, ball), 0)} m du ballon) : P_passe ${fmtFr(pPass)}, menace ${fmtFr(recv ? recv.value / Math.max(pPass, 1e-9) : 0)} ; ${main.label} ${fmtFr(main.contribution, 3, true)}`.slice(0, 140);
+  let main = c.components[0];
+  for (const x of c.components) if (x.key !== 'hysteresis' && Math.abs(x.contribution) > Math.abs(main.contribution)) main = x;
+  return `${INTENT_LABELS[intent]} à ${Math.round(dist(q, pos))} m (${Math.round(dist(q, ball))} m du ballon) : P_passe ${fmtFr(pPass)} ; ${main.label} ${fmtFr(main.contribution, 3, true)}`.slice(0, 140);
 }
 
 function explain(best: Candidate, second: Candidate | undefined, intent: MoveIntent, pos: Vec2, ball: Vec2, kept: boolean, ballDist: number): string {
