@@ -87,6 +87,10 @@ export interface TacticParams {
   counterAttackBias: number;
   /** 0..1 : priorité au repli après une perte. */
   recoverPriority: number;
+  /** Nombre de conditions de déclenchement du pressing requises (1 = pressing haut agressif, 3 = bloc bas). */
+  pressTriggerCount: number;
+  /** Nombre de « défenseurs de repos » qui restent sur leur poste pendant l'attaque. */
+  restDefenders: number;
 }
 
 export interface TacticConfig {
@@ -187,7 +191,7 @@ export type Action =
   | { type: 'pass'; targetId: number; targetPoint: Vec2; kind: 'ground' | 'through' | 'lob'; speed: number }
   | { type: 'dribble'; direction: Vec2; distance: number }
   | { type: 'hold' }
-  | { type: 'shoot'; targetPoint: Vec2; power: number }
+  | { type: 'shoot'; targetPoint: Vec2; power: number; xg?: number }
   | { type: 'clear'; targetPoint: Vec2 }
   | { type: 'move'; target: Vec2; intent: MoveIntent; speed: number; markId?: number };
 
@@ -222,6 +226,28 @@ export interface Candidate {
   reason: string;
   /** Adversaires susceptibles d'intercepter / contrer (pour la visualisation). */
   threats?: number[];
+  /** Durée estimée de l'action (s). */
+  duration?: number;
+  /** Point d'arrivée en cas de succès et point de perte en cas d'échec (visualisation). */
+  successPoint?: Vec2;
+  failurePoint?: Vec2;
+  /** Meilleure réponse défensive (minimax, profondeur 2) et dégradation de valeur associée. */
+  response?: { kind: DefensiveResponse; delta: number };
+  /** Points d'échantillonnage de l'interception (point, probabilité φ, adversaire) pour le rendu. */
+  samples?: { point: Vec2; phi: number; opponentId: number }[];
+}
+
+export type DefensiveResponse = 'hold' | 'press' | 'cover' | 'drop';
+
+/** Jeu 2×2 à somme nulle résolu lorsqu'un dilemme apparaît (§6.4 de la conception). */
+export interface Game2x2 {
+  actions: [string, string];
+  responses: [DefensiveResponse, DefensiveResponse];
+  matrix: [[number, number], [number, number]];
+  pure: boolean;
+  /** Probabilité de jouer la première action à l'équilibre. */
+  pi1: number;
+  value: number;
 }
 
 export interface DecisionContext {
@@ -247,6 +273,12 @@ export interface Decision {
   explanation: string;
   /** Temps de calcul (ms). */
   computeMs: number;
+  /** L'intention précédente a été conservée par hystérésis. */
+  keptByHysteresis?: boolean;
+  /** Instant jusqu'auquel l'action est engagée (pas de re-décision avant). */
+  committedUntil?: number;
+  /** Jeu 2×2 résolu le cas échéant (stratégie mixte). */
+  game?: Game2x2;
 }
 
 // ---------------------------------------------------------------------------
@@ -346,88 +378,131 @@ export interface MatchState {
 
 // ---------------------------------------------------------------------------
 // Paramètres globaux des modèles (physique, probabilités, poids de décision)
+// Toutes les valeurs par défaut sont dans src/core/params.ts (source de vérité).
 // ---------------------------------------------------------------------------
 export interface PhysicsParams {
   dt: number; // s, pas de simulation
-  playerMaxSpeed: number; // m/s (joueur moyen)
-  playerMaxAccel: number; // m/s²
-  playerReactionTime: number; // s
+  playerMaxSpeed: number; // m/s (joueur moyen, attribut pace = 0,5)
+  playerMaxAccel: number; // m/s² (joueur moyen)
+  playerReactionTime: number; // s, délai avant de réagir à une nouvelle cible
   controlRadius: number; // m, rayon de prise de balle
   ballFriction: number; // m/s², décélération du ballon au sol
-  passSpeedMin: number; // m/s
+  ballBounce: number; // coefficient de restitution vertical (lobs)
+  passArrivalSpeed: number; // m/s, vitesse voulue à l'arrivée d'une passe dans les pieds
+  throughArrivalSpeed: number; // m/s, vitesse voulue à l'arrivée d'une passe en profondeur
   passSpeedMax: number; // m/s
   shotSpeed: number; // m/s
   dribbleSpeedFactor: number; // fraction de la vitesse max avec le ballon
-  kickCooldown: number; // s, délai minimal entre deux touches
+  kickCooldown: number; // s, délai minimal entre deux touches de balle
+  executionNoiseDeg: number; // °, écart-type angulaire de l'erreur d'exécution (sans pression)
+  executionNoisePressure: number; // °, supplément par unité de pression
 }
+
+/** Coefficients d'un modèle logistique P = σ(base + Σ coef·feature). */
+export interface PassModel { base: number; distance: number; longDistance: number; passerPressure: number; receiverPressure: number }
+export interface ThroughModel { base: number; distance: number; passerPressure: number }
+export interface DribbleModel { base: number; pathPressure: number; distance: number; control: number }
+export interface ShotModel { base: number; angle: number; distance: number; keeperCoverage: number; blockers: number; pressure: number }
+export interface HoldModel { base: number; pressure: number; closeOpponents: number }
 
 export interface ModelParams {
-  // Contrôle du terrain
-  controlSigma: number; // s, pente de la sigmoïde temps d'arrivée
-  controlReaction: number; // s
+  // Temps d'arrivée et contrôle du terrain
+  reactionTime: number; // s
+  arrivalSigma: number; // s, incertitude de la sigmoïde d'arrivée
+  controlBeta: number; // s, température du softmin (β→0 ⇒ Voronoi)
+  controlBallSpeed: number; // m/s, vitesse nominale de passe utilisée pour le temps de trajet
   // Pression
   pressureRadius: number; // m
-  // Menace
-  threatDistanceScale: number; // m
-  threatAngleWeight: number;
-  // Passe
-  passInterceptMargin: number; // s, marge de temps donnant l'interception
-  passLogitBase: number;
-  passLogitDistance: number; // par mètre
-  passLogitIntercept: number; // par unité de risque
-  passLogitPressure: number;
-  passLogitReceiverPressure: number;
-  // Tir
-  xgLogitBase: number;
-  xgLogitDistance: number;
-  xgLogitAngle: number;
-  xgLogitKeeper: number;
-  xgLogitBlockers: number;
-  // Dribble
-  dribbleLogitBase: number;
-  dribbleLogitPressure: number;
-  dribbleLogitSpace: number;
-  // Conservation
-  holdLogitBase: number;
-  holdLogitPressure: number;
+  pressureDirectional: number; // pondération directionnelle (défenseur côté but compte plus)
+  // Menace (valeur d'une position)
+  threatKappa: number;
+  threatRhoX: number; // m
+  threatRhoY: number; // m
+  // Interception
+  interceptSamples: number;
+  interceptEfficiency: number; // η, efficacité de capture par échantillon
+  // Modèles de réussite
+  pass: PassModel;
+  through: ThroughModel;
+  dribble: DribbleModel;
+  shot: ShotModel;
+  hold: HoldModel;
+  /** Rayon de couverture du gardien (m) : base + gain·temps de vol. */
+  keeperReachBase: number;
+  keeperReachPerSecond: number;
 }
 
-/** Poids de la fonction d'évaluation (modulés ensuite par les paramètres tactiques). */
+/** Poids de la fonction d'évaluation du porteur (modulés ensuite par les paramètres tactiques). */
 export interface DecisionWeights {
-  wThreat: number; // valeur de la menace de la position résultante
-  wProgress: number; // progression vers le but
-  wRisk: number; // pénalité de perte de balle (valeur de l'état adverse)
-  wSpace: number; // espace/contrôle autour du receveur
-  wPressure: number; // pénalité de pression au point d'arrivée
-  wSupport: number; // qualité des options suivantes (lookahead 2e niveau)
-  wHold: number; // biais de conservation
-  wShot: number; // pondération du tir
-  wHysteresis: number; // bonus de continuité pour l'action courante
-  lookaheadDiscount: number; // gamma pour la valeur des options suivantes
-  candidateDribbleDirections: number;
-  dribbleDistance: number; // m
+  wProgress: number; // progression vers le but (par longueur de terrain)
+  wSupport: number; // options suivantes disponibles pour le receveur
+  lambdaRisk: number; // pondération de la valeur adverse en cas de perte
+  wTime: number; // coût par seconde d'exécution
+  wOffside: number; // pénalité de risque de hors-jeu
+  gamma: number; // poids du lookahead (profondeur 2)
+  topK: number; // nombre de candidats développés en profondeur 2
+  hysteresis: number; // bonus pour conserver l'intention courante
+  softmaxTemperature: number; // température de la réponse quantale (0 = déterministe)
+  dribbleDirections: number;
+  dribbleDistances: number[]; // m
+  throughDistances: number[]; // m
+  shotMaxDistance: number; // m
+  holdBias: number; // biais additif de conservation
+  wLineBreaks: number; // valeur d'une ligne défensive franchie
+  epsilonTie: number; // seuil d'égalité pour le départage
+  epsilonGame: number; // seuil de déclenchement du jeu 2×2
+  holdDuration: number; // s, durée d'une conservation
+  passArrivalSpeeds: number[]; // m/s, vitesses d'arrivée candidates
 }
 
+/** Poids de l'utilité de déplacement sans ballon (attaque). */
+export interface OffBallWeights {
+  wReceivable: number; // P_pass · xT
+  wSpace: number; // gain de contrôle
+  wTeamExposure: number; // gain d'exposition collective
+  wSlot: number; // rappel vers la position de structure
+  wSeparation: number; // répulsion entre coéquipiers
+  wOffside: number;
+  wRun: number; // bonus des appels en profondeur
+  slotRadius: number; // m
+  separationRadius: number; // m
+  candidateDistances: number[]; // m
+  candidateDirections: number;
+  hysteresis: number; // gain minimal pour changer de cible
+  runBandWidth: number; // m, largeur des bandes (un seul coureur par bande)
+  reexamineEvery: number; // s, ré-examen forcé de la cible
+}
+
+/** Coûts de l'affectation défensive. */
 export interface DefenceWeights {
-  wPressDistance: number;
-  wMarkDistance: number;
-  wMarkDanger: number;
-  wCoverDepth: number;
-  wZoneDistance: number;
-  wSlotDistance: number;
-  pressTriggerDistance: number; // m
-  maxPressers: number;
+  muPriority: number; // s par unité de priorité
+  nuShape: number; // s par longueur de terrain d'écart à la structure
+  xiHysteresis: number; // s, bonus pour conserver sa tâche
+  markGoalSideOffset: number; // m
+  maxMarkTasks: number;
+  maxZoneTasks: number;
+  pressTriggerTime: number; // s, temps d'arrivée max pour déclencher un pressing
+  keeperDepthFactor: number; // fraction de la distance au tireur
+  keeperMaxDepth: number; // m
+  muRole: number; // s, pénalité d'une tâche hors de la zone naturelle du rôle
+  maxTaskTime: number; // s, temps d'arrivée maximal pour une tâche non « recover »
+  minReassignGain: number; // s, gain minimal de coût total pour changer l'affectation
+  containOffset: number; // m, distance côté but du porteur en mode « contain »
+  tackleRadius: number; // m
 }
 
 export interface SimParams {
   physics: PhysicsParams;
   models: ModelParams;
   decision: DecisionWeights;
+  offBall: OffBallWeights;
   defence: DefenceWeights;
   /** Période de re-décision (s). */
   decisionPeriod: number;
   /** Résolution des champs (m). */
   fieldCellSize: number;
+  /** Durée de la fenêtre de transition après un changement de possession (s). */
+  transitionWindow: number;
 }
 
 export interface MatchConfig {
@@ -436,6 +511,5 @@ export interface MatchConfig {
   params: SimParams;
   /** Durée du match simulé (s) — les expériences utilisent typiquement 600 s. */
   durationSec: number;
-  /** Noms et attributs optionnels des joueurs (sinon générés). */
   teamNames?: Record<TeamId, string>;
 }
