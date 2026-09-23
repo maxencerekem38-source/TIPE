@@ -100,6 +100,7 @@ export function decideAll(state: MatchState, params: SimParams, policies: Record
     const ranked: Record<TeamId, ReturnType<typeof rankChasers>> = { A: rankChasers(state, params, 'A'), B: rankChasers(state, params, 'B') };
     const bestA = ranked.A[0]?.time ?? Infinity, bestB = ranked.B[0]?.time ?? Infinity;
     const contested = Math.abs(bestA - bestB) < CONTESTED_MARGIN;
+    const chasers = new Set<number>();
     for (const team of TEAMS) {
       const n = contested ? 2 : 1;
       const kickerTeam = flight ? state.players.find((p) => p.id === flight.kickerId)?.team ?? null : null;
@@ -111,7 +112,20 @@ export function decideAll(state: MatchState, params: SimParams, policies: Record
         const other = team === 'A' ? bestB : bestA;
         const reason = `${intent === 'intercept' ? 'Interception' : 'Course au ballon libre'} : ${p.name} rejoint le ballon en ${fmtFr(c.time, 1)} s (adversaire le plus rapide : ${Number.isFinite(other) ? fmtFr(other, 1) + ' s' : 'aucun'})${contested ? ', ballon disputé' : ''}.`;
         out.set(p.id, simpleMoveDecision(inputs[team], p, c.point, intent, p.maxSpeed, reason));
+        chasers.add(p.id);
       }
+    }
+    // Les tâches « chase / intercept » attribuées par la défense à d'autres joueurs sont rétrogradées vers leur meilleure
+    // autre tâche (un seul chasseur par équipe, deux si le ballon est disputé).
+    for (const p of state.players) {
+      if (chasers.has(p.id) || p.id === receiverId) continue;
+      const d = out.get(p.id)!;
+      const a = d.chosen.action;
+      if (a.type !== 'move' || (a.intent !== 'chase' && a.intent !== 'intercept')) continue;
+      const alt = d.candidates.find((c) => c.action.type === 'move' && c.action.intent !== 'chase' && c.action.intent !== 'intercept');
+      out.set(p.id, alt
+        ? { ...d, chosen: alt, explanation: `${d.explanation}\nTâche de course au ballon confiée à un coéquipier plus rapide : repli sur ${alt.reason}.` }
+        : freezeDecision(inputs[p.team], p));
     }
   }
 
