@@ -36,8 +36,8 @@
 import type { Vec2 } from '../core/vec2';
 import type { Action, Candidate, Decision, DecisionContext, DefensiveResponse, Game2x2, MatchState, Player, SimParams } from '../core/types';
 import type { DecisionInput } from './policy';
-import { actionOrigin, proposeClear, proposeDribbles, proposeHold, proposeLob, proposePass, proposeShot, proposeThroughBalls, rollsIntoOwnGoal, type Proposal } from './candidates';
-import { buildReason, createEvalContext, evaluateProposal, modulatedWeights, LANE_BLOCK_PHI, LOB_MIN_DISTANCE, type EvalContext, type Evaluation, type OnBallWeights } from './evaluate';
+import { actionOrigin, planPassVariants, proposeClear, proposeDribbles, proposeHold, proposeLob, proposePass, proposeShot, proposeThroughBalls, rollsIntoOwnGoal, type Proposal } from './candidates';
+import { buildReason, createEvalContext, evaluateProposal, modulatedWeights, LANE_BLOCK_PHI, type EvalContext, type Evaluation, type OnBallWeights } from './evaluate';
 import { explainDecision, shortLabel } from './explain';
 import { drawAction, gameClass, solve2x2, type GameMatrix } from './game2x2';
 import { applyResponse, bestOnwardLane, MIN_RESPONSES, nextOwnerId, predictHoldState, RESPONSES, RESPONSE_LABELS, responseThreat, type OnwardLane } from './responses';
@@ -87,9 +87,10 @@ export function compareCandidates(a: Candidate, b: Candidate): number {
 // ---------------------------------------------------------------------------
 /**
  * Génère et évalue tous les candidats du porteur `playerId` (triés par score décroissant), sans lookahead.
- * Passes : la vitesse d'arrivée par défaut est évaluée d'abord ; si la ligne est fermée (§4.6) les autres
- * vitesses sont élaguées et, au-delà de 25 m, la variante lobée est tentée ; sinon la meilleure des trois
- * vitesses est retenue (une passe par coéquipier dans la liste finale).
+ * Passes : la vitesse d'arrivée par défaut est évaluée d'abord ; les variantes (autres vitesses, passe appuyée, lob)
+ * suivent le plan `planPassVariants` (candidates.ts, §6.1) : ligne fermée ⇒ vitesses élaguées et lob au-delà de 25 m ;
+ * cible longue (> decision.longPassDistance) ⇒ passe appuyée ET lob toujours évalués. La liste finale garde la
+ * meilleure passe au sol par coéquipier, plus la meilleure variante lobée lorsqu'elle a été évaluée (candidat distinct).
  */
 export function evaluateCandidates(input: DecisionInput, playerId: number, options: EvaluateOptions = {}): Candidate[] {
   const { state, fields, params } = input;
@@ -115,19 +116,17 @@ export function evaluateCandidates(input: DecisionInput, playerId: number, optio
     const first = firstProp ? evaluateProposal(ctx, firstProp) : null;
     if (!first) continue;
     let best: Evaluation = first;
-    if (first.blocked) {
-      if (first.distance > LOB_MIN_DISTANCE) {
-        const lob = evaluateProposal(ctx, proposeLob(proposalOf(first, speeds[0]), first.logit));
-        if (lob && lob.candidate.score > best.candidate.score) best = lob;
-      }
-    } else {
-      for (let i = 1; i < speeds.length; i++) {
-        const prop = safePass(r, speeds[i]);
-        const e = prop ? evaluateProposal(ctx, prop) : null;
-        if (e && e.candidate.score > best.candidate.score) best = e;
-      }
+    const plan = planPassVariants(first.distance, first.blocked, speeds, params, reduced);
+    for (const speed of plan.speeds) {
+      const prop = safePass(r, speed);
+      const e = prop ? evaluateProposal(ctx, prop) : null;
+      if (e && e.candidate.score > best.candidate.score) best = e;
     }
     out.push(best.candidate);
+    if (plan.lob) {
+      const lob = evaluateProposal(ctx, proposeLob(proposalOf(first, speeds[0]), first.logit));
+      if (lob) out.push(lob.candidate);
+    }
   }
 
   if (!reduced) {

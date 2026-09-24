@@ -66,14 +66,24 @@ export function keeperOf(state: MatchState, team: TeamId): Player | null {
 }
 
 /**
- * Cible anticipée d'une passe au pied (§5.1) : q_r = p_r + v_r · T_b(‖p_r − b‖) (une itération de point fixe),
- * bornée au terrain.
+ * Cible anticipée d'une passe au pied (§5.1) : q_r = p_r + v_r · min(T_b(‖p_r − b‖), t_stop) (une itération de point fixe),
+ * bornée au terrain. t_stop = temps que met le receveur à atteindre sa cible de déplacement courante (`Player.target`,
+ * connue de la décision : le moteur l'y arrête) : sans cette borne, un receveur lancé à 6 m/s vers un poste à 4 m
+ * recevait le ballon 15 m plus loin (mesure : sur les passes « ouvertes » prises par l'adversaire, le receveur était à
+ * 15 m du point visé, contre 2,7 m sur les passes réussies).
  */
 export function anticipatedTarget(origin: Vec2, receiver: Player, arrivalSpeed: number, params: SimParams): Vec2 {
   const d0 = dist(origin, receiver.pos);
   const s0 = launchSpeed(d0, arrivalSpeed, params.physics);
   let t = ballTravelTime(d0, s0, params.physics);
   if (!Number.isFinite(t)) t = d0 / Math.max(1, arrivalSpeed);
+  const speed = Math.hypot(receiver.vel.x, receiver.vel.y);
+  if (receiver.target && speed > RUN_SPEED_MIN) {
+    // Le receveur s'arrête à sa cible : on ne l'extrapole pas au-delà (projection de la cible sur sa direction de course).
+    const along = ((receiver.target.x - receiver.pos.x) * receiver.vel.x + (receiver.target.y - receiver.pos.y) * receiver.vel.y) / speed;
+    const tStop = Math.max(0, along) / speed;
+    if (tStop < t) t = tStop;
+  }
   return clampToPitch({ x: receiver.pos.x + receiver.vel.x * t, y: receiver.pos.y + receiver.vel.y * t }, PITCH_MARGIN);
 }
 
@@ -89,7 +99,50 @@ export function proposePass(state: MatchState, passer: Player, receiver: Player,
   };
 }
 
-/** Variante lobée d'une passe (même cible) : utilisée quand la ligne au sol est fermée et la distance > 25 m. */
+/** Distance (m) au-delà de laquelle une cible est « longue » (repli si decision.longPassDistance est absent). */
+const DEFAULT_LONG_PASS_DISTANCE = 25;
+/** Distance (m) au-delà de laquelle une ligne fermée est jouée en lob (§6.1, cibles courtes). */
+export const LOB_MIN_DISTANCE = 25;
+
+export const longPassDistance = (params: SimParams): number => params.decision.longPassDistance ?? DEFAULT_LONG_PASS_DISTANCE;
+
+/** Vitesse d'arrivée « appuyée » : la plus grande de decision.passArrivalSpeeds (repli : physics.passArrivalSpeed). */
+export function drivenArrivalSpeed(params: SimParams): number {
+  let best = params.physics.passArrivalSpeed;
+  for (const s of params.decision.passArrivalSpeeds) if (s > best) best = s;
+  return best;
+}
+
+/** Variantes d'une passe au pied à évaluer après la vitesse par défaut (§6.1). */
+export interface PassVariantPlan {
+  /** Vitesses d'arrivée supplémentaires (m/s) à évaluer au sol. */
+  speeds: number[];
+  /** Évaluer la variante lobée (vol balistique, même cible). */
+  lob: boolean;
+}
+
+/**
+ * Plan des variantes d'une passe vers un coéquipier après l'évaluation à la vitesse par défaut `speeds[0]` (§6.1) :
+ *  - cible longue (d > decision.longPassDistance) : la passe appuyée (`drivenArrivalSpeed`) ET le lob sont toujours
+ *    évalués, ligne au sol fermée ou non (un renversement de 40 m se joue tendu ou par-dessus, pas en ballon roulant à
+ *    6 m/s qui met 4–5 s) ; ligne ouverte : toutes les vitesses candidates ;
+ *  - cible courte, ligne ouverte : les autres vitesses candidates ; ligne fermée : le lob seul au-delà de LOB_MIN_DISTANCE ;
+ *  - jeu réduit (profondeur 2) : aucune variante.
+ */
+export function planPassVariants(distance: number, blocked: boolean, speeds: readonly number[], params: SimParams, reduced = false): PassVariantPlan {
+  if (reduced) return { speeds: [], lob: false };
+  const long = distance > longPassDistance(params);
+  const others = speeds.slice(1);
+  if (long) {
+    const driven = drivenArrivalSpeed(params);
+    const list = blocked ? (driven !== speeds[0] ? [driven] : []) : others;
+    return { speeds: list, lob: true };
+  }
+  if (blocked) return { speeds: [], lob: distance > LOB_MIN_DISTANCE };
+  return { speeds: others, lob: false };
+}
+
+/** Variante lobée d'une passe (même cible) : ligne au sol fermée au-delà de 25 m, ou cible longue (§6.1). */
 export function proposeLob(pass: Proposal, logit?: number): Proposal {
   const a = pass.action as Extract<Action, { type: 'pass' }>;
   return {

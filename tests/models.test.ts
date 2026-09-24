@@ -14,8 +14,9 @@ import { executeAction } from '@/engine/actions';
 import { stepPhysics } from '@/engine/physics';
 import { Rng } from '@/core/rng';
 import { computeFields, pitchControlAt, pressureAt, threatAt, geometricXG, availableSpace } from '@/models/fields';
-import { analyseInterception, flightModel, passingLaneQuality, arrivalLogistic, lineBreaks, laneAngularMargin } from '@/models/interception';
-import { passProbability, throughBallProbability, dribbleProbability, shotProbability, holdProbability, keeperCoverage } from '@/models/probability';
+import { analyseInterception, flightModel, passingLaneQuality, arrivalLogistic, lineBreaks, laneAngularMargin, interceptionFeatures, rescoreInterception, interceptionModelOf } from '@/models/interception';
+import { passProbability, throughBallProbability, dribbleProbability, shotProbability, holdProbability, keeperCoverage, passLogit } from '@/models/probability';
+import { anticipatedTarget, drivenArrivalSpeed, planPassVariants, longPassDistance } from '@/decision/candidates';
 import { localSuperiority, compactness, offsideLine, isOffsidePosition, voronoiArea, convexHull, polygonArea } from '@/models/structure';
 
 const P: SimParams = DEFAULT_PARAMS;
@@ -376,13 +377,31 @@ describe('interception (§4.6)', () => {
 
     const guarded = simple([{ team: 'A', pos: from }, { team: 'A', pos: to }, { team: 'B', pos: v(10, 2) }, { team: 'B', pos: v(-40, 20) }]);
     const g = analyseInterception(guarded, from, to, 'pass', 'A', P);
-    expect(g.pIntercept).toBeGreaterThanOrEqual(0.3);
+    // Une chance par défenseur : P_int = η·Φ_j pour un seul défenseur menaçant (Φ_j = max_m φ_{j,m}), donc ≤ η.
+    expect(g.pIntercept).toBeGreaterThanOrEqual(0.7 * M.interceptEfficiency);
+    expect(g.pIntercept).toBeLessThanOrEqual(M.interceptEfficiency + 1e-9);
+    expect(g.pIntercept).toBeCloseTo(M.interceptEfficiency * g.defenderPhi[g.defenderIds.indexOf(2)], 9);
     expect(g.threats).toEqual([2]);
     expect(g.weakOpponentId).toBe(2);
     expect(g.weakPhi).toBeGreaterThan(0.4);
+    expect(g.defenderPhi[g.defenderIds.indexOf(2)]).toBeCloseTo(g.weakPhi, 12);
     // borne : P_int(η = 1) ≥ W
     const p1 = cloneParams(P); p1.models.interceptEfficiency = 1;
     expect(analyseInterception(guarded, from, to, 'pass', 'A', p1).pIntercept).toBeGreaterThanOrEqual(g.weakPhi - 1e-9);
+    // Un défenseur qui couvre toute la ligne (course parallèle à 1 m d'une passe lente) n'a qu'une tentative : P_int = η, pas 1 − (1 − η)¹².
+    const alongside = simple([{ team: 'A', pos: from }, { team: 'A', pos: to }, { team: 'B', pos: v(10, 1), vel: v(0, 0) }]);
+    const a = analyseInterception(alongside, from, to, 'pass', 'A', P, 4);
+    expect(a.weakPhi).toBeGreaterThan(0.98);
+    expect(a.pIntercept).toBeLessThanOrEqual(M.interceptEfficiency + 1e-9);
+    expect(a.pIntercept).toBeGreaterThan(0.95 * M.interceptEfficiency);
+    // Deux défenseurs indépendants se combinent : 1 − (1 − ηΦ₁)(1 − ηΦ₂).
+    const two = simple([{ team: 'A', pos: from }, { team: 'A', pos: to }, { team: 'B', pos: v(6, 1) }, { team: 'B', pos: v(14, -1) }]);
+    const t2 = analyseInterception(two, from, to, 'pass', 'A', P);
+    const eta = M.interceptEfficiency;
+    expect(t2.pIntercept).toBeCloseTo(1 - (1 - eta * t2.defenderPhi[0]) * (1 - eta * t2.defenderPhi[1]), 9);
+    // Fenêtre w = 1 : chance élargie aux échantillons voisins, jamais inférieure au meilleur point seul.
+    const pw = cloneParams(P); pw.models.interceptWindow = 1;
+    expect(analyseInterception(guarded, from, to, 'pass', 'A', pw).pIntercept).toBeGreaterThanOrEqual(g.pIntercept - 1e-12);
     // le dernier échantillon est la cible, les temps balle sont croissants
     expect(g.samples[g.samples.length - 1].point.x).toBeCloseTo(20, 9);
     for (let i = 1; i < g.samples.length; i++) expect(g.samples[i].ballTime).toBeGreaterThan(g.samples[i - 1].ballTime);
@@ -413,10 +432,11 @@ describe('interception (§4.6)', () => {
     const lobMid = analyseInterception(mid, from, target, 'lob', 'A', P);
     const passMid = analyseInterception(mid, from, target, 'pass', 'A', P);
     expect(lobMid.travelTime).toBeCloseTo(lf.travelTime, 12);
-    // le défenseur au milieu ne peut jouer que la zone de chute : P_int faible mais non nulle (course vers 40 m)
+    // le défenseur au milieu ne peut jouer que la zone de chute : P_int faible mais non nulle (course vers 40 m) ;
+    // au sol il est sur la ligne (φ ≈ 1) : P_int = η (une chance par défenseur)
     expect(lobMid.pIntercept).toBeLessThan(0.2);
-    expect(passMid.pIntercept).toBeGreaterThan(0.5);
-    expect(lobMid.pIntercept).toBeLessThan(0.3 * passMid.pIntercept);
+    expect(passMid.pIntercept).toBeGreaterThan(0.9 * M.interceptEfficiency);
+    expect(lobMid.pIntercept).toBeLessThan(0.5 * passMid.pIntercept); // (P_int au sol bornée par η : ratio 0,3 → 0,5)
     // en vol au-dessus de physics.controlMaxHeight : aucune chance (même condition que la prise de balle du moteur)
     for (let i = 0; i < lobMid.samples.length; i++) {
       const f = (i + 1) / lobMid.samples.length;
@@ -474,7 +494,7 @@ describe('interception (§4.6)', () => {
     const to = v(24, 0);
     const st = simple([{ team: 'A', pos: from }, { team: 'A', pos: to }, { team: 'B', pos: v(12, 1) }]);
     const fresh = analyseInterception(st, from, to, 'pass', 'A', P);
-    expect(fresh.pIntercept).toBeGreaterThan(0.3); // défenseur à 1 m de la ligne, à mi-course
+    expect(fresh.pIntercept).toBeGreaterThan(0.8 * M.interceptEfficiency); // défenseur à 1 m de la ligne, à mi-course : φ ≈ 1, P_int ≈ η
     // 1,6 s après la frappe le ballon a dépassé 12 m (T_b(12) ≈ 1,3 s) : le défenseur ne peut plus le couper
     const live = analyseInterception(st, from, to, 'pass', 'A', P, undefined, { elapsed: 1.6, initialSpeed: fresh.initialSpeed });
     expect(live.travelTime).toBeCloseTo(fresh.travelTime - 1.6, 9);
@@ -487,6 +507,30 @@ describe('interception (§4.6)', () => {
     // vitesse réellement imprimée (bruit) : une balle plus rapide arrive plus tôt
     const fast = analyseInterception(st, from, to, 'pass', 'A', P, undefined, { elapsed: 0, initialSpeed: fresh.initialSpeed * 1.2 });
     expect(fast.travelTime).toBeLessThan(fresh.travelTime);
+  });
+
+  it('calibration : le recalcul de P_int depuis les caractéristiques brutes reproduit analyseInterception (sol, profondeur, lob)', () => {
+    const st = simple([
+      { team: 'A', pos: from }, { team: 'A', pos: v(30, 4) },
+      { team: 'B', pos: v(12, 3), vel: v(2, -1) }, { team: 'B', pos: v(26, -2) }, { team: 'B', pos: v(-10, 10) }, { team: 'B', pos: v(50, 0), role: 'GK' },
+    ]);
+    const target = v(30, 4);
+    for (const kind of ['pass', 'through', 'lob'] as const) {
+      for (const model of [P, (() => { const q = cloneParams(P); q.models.interceptEfficiency = 0.7; q.models.arrivalSigma = 0.3; q.models.interceptWindow = 1; return q; })()]) {
+        const a = analyseInterception(st, from, target, kind, 'A', model, 9);
+        const f = interceptionFeatures(st, from, target, kind, 'A', model, 9);
+        expect(f.defenderIds).toEqual(a.defenderIds);
+        expect(f.deltas.length).toBe(f.defenderIds.length * f.samples);
+        expect(rescoreInterception(f, interceptionModelOf(model))).toBeCloseTo(a.pIntercept, 12);
+        expect(f.travelTime).toBeCloseTo(a.travelTime, 12);
+      }
+    }
+    // Les caractéristiques sont indépendantes de η et σ_T : re-tarifer avec η = 1 donne P_int ≥ W.
+    const a = analyseInterception(st, from, target, 'pass', 'A', P, 6);
+    const f = interceptionFeatures(st, from, target, 'pass', 'A', P, 6);
+    const m1 = { ...interceptionModelOf(P), eta: 1 };
+    expect(rescoreInterception(f, m1)).toBeGreaterThanOrEqual(a.weakPhi - 1e-9);
+    expect(rescoreInterception(f, { ...m1, eta: 0.2 })).toBeLessThan(rescoreInterception(f, m1));
   });
 
   it('passingLaneQuality : ≈ 0 pour un défenseur sur la ligne, croissante avec la distance, extrémités', () => {
@@ -520,6 +564,65 @@ describe('interception (§4.6)', () => {
 });
 
 // ---------------------------------------------------------------------------
+describe('candidats de passe (§6.1) : cibles longues, passe appuyée, lob, cible anticipée', () => {
+  const speeds = [P.physics.passArrivalSpeed, ...P.decision.passArrivalSpeeds.filter((s) => s !== P.physics.passArrivalSpeed)];
+
+  it('vitesse appuyée = plus grande des vitesses candidates, sous la porte de contrôle du moteur (12 m/s strict)', () => {
+    expect(drivenArrivalSpeed(P)).toBe(Math.max(...P.decision.passArrivalSpeeds));
+    expect(drivenArrivalSpeed(P)).toBeLessThan(P.physics.controlMaxRelSpeed);
+    expect(longPassDistance(P)).toBe(25);
+  });
+
+  it('plan des variantes : cible longue ⇒ passe appuyée ET lob quelle que soit la ligne ; cible courte ⇒ vitesses ou lob selon la ligne ; jeu réduit ⇒ rien', () => {
+    const long = longPassDistance(P) + 5;
+    const openLong = planPassVariants(long, false, speeds, P);
+    expect(openLong.lob).toBe(true);
+    expect(openLong.speeds).toEqual(speeds.slice(1));
+    expect(openLong.speeds).toContain(drivenArrivalSpeed(P));
+    const blockedLong = planPassVariants(long, true, speeds, P);
+    expect(blockedLong.lob).toBe(true);
+    expect(blockedLong.speeds).toEqual([drivenArrivalSpeed(P)]);
+    const openShort = planPassVariants(12, false, speeds, P);
+    expect(openShort).toEqual({ speeds: speeds.slice(1), lob: false });
+    const blockedShort = planPassVariants(12, true, speeds, P);
+    expect(blockedShort).toEqual({ speeds: [], lob: false });
+    expect(planPassVariants(long, false, speeds, P, true)).toEqual({ speeds: [], lob: false });
+    // Nombre de candidats borné : ≤ 1 passe + 1 lob par coéquipier (10), 8 profondeurs, 16 dribbles, tir, conservation, dégagement.
+    expect(10 * 2 + 8 + 16 + 3).toBeLessThanOrEqual(55);
+  });
+
+  it('cible anticipée : un receveur lancé n’est pas extrapolé au-delà de sa cible de déplacement', () => {
+    const st = simple([{ team: 'A', pos: v(0, 0) }, { team: 'A', pos: v(10, 0), vel: v(6, 0) }, { team: 'B', pos: v(45, 30) }]);
+    const runner = st.players[1];
+    const free = anticipatedTarget(v(0, 0), runner, 6, P);
+    expect(free.x).toBeGreaterThan(16); // T_b(10 m) ≈ 1,3 s à 6 m/s ⇒ ≈ +8 m
+    runner.target = v(12, 0); // il s'arrête 2 m plus loin
+    const capped = anticipatedTarget(v(0, 0), runner, 6, P);
+    expect(capped.x).toBeCloseTo(12, 6);
+    expect(capped.y).toBeCloseTo(0, 6);
+    runner.target = v(10, 8); // cible perpendiculaire à sa course : projection nulle ⇒ position courante
+    expect(anticipatedTarget(v(0, 0), runner, 6, P).x).toBeCloseTo(10, 6);
+    runner.target = v(40, 0); // cible plus loin que le ballon : extrapolation complète
+    expect(anticipatedTarget(v(0, 0), runner, 6, P).x).toBeCloseTo(free.x, 6);
+  });
+
+  it('logit de passe : pénalité de vitesse au-delà de 9 m/s et pénalité de réception aérienne (lob)', () => {
+    const st = simple([{ team: 'A', pos: v(0, 0) }, { team: 'A', pos: v(20, 0) }, { team: 'B', pos: v(45, 30) }]);
+    const fields = computeFields(st, P);
+    const at = (speed: number, aerial = false) => passLogit(st, fields, st.players[0], v(0, 0), v(20, 0), P, speed, aerial);
+    expect(at(9).logit).toBeCloseTo(at(6).logit, 12);
+    expect(at(10).logit).toBeCloseTo(at(9).logit + (P.models.pass.arrivalSpeed ?? -0.1), 12);
+    expect(at(10).features.find((f) => f.key === 'arrivalSpeed')!.value).toBeCloseTo(1, 12);
+    const lob = at(6, true);
+    expect(lob.logit).toBeCloseTo(at(6).logit + (P.models.pass.lobPenalty ?? -1.5), 12);
+    expect(lob.features.find((f) => f.key === 'lob')).toBeDefined();
+    // passProbability = (1 − P_int) · σ(passLogit) avec la vitesse demandée.
+    const pr = passProbability(st, fields, 0, 1, v(20, 0), P, 10);
+    expect(pr.p).toBeCloseTo((1 - pr.interception!.pIntercept) / (1 + Math.exp(-at(10).logit)), 12);
+  });
+});
+
+// ---------------------------------------------------------------------------
 describe('probability — passes (§5.1, §5.2)', () => {
   it('P_pass décroît avec la distance (couloir libre) ; ancrage 15 m libre ≈ 0,82–0,86', () => {
     let prev = 1;
@@ -539,7 +642,9 @@ describe('probability — passes (§5.1, §5.2)', () => {
     const pf = passProbability(free, computeFields(free, P), 0, 1, v(20, 0), P);
     const po = passProbability(onLine, computeFields(onLine, P), 0, 1, v(20, 0), P);
     const pp = passProbability(pressed, computeFields(pressed, P), 0, 1, v(20, 0), P);
-    expect(po.p).toBeLessThan(pf.p * 0.5);
+    // Un défenseur sur la ligne (φ ≈ 1) coûte le facteur (1 − η) : une chance par défenseur (§4.6).
+    expect(po.p).toBeLessThan(pf.p * (1 - 0.9 * M.interceptEfficiency));
+    expect(po.p).toBeGreaterThan(pf.p * (1 - M.interceptEfficiency) * 0.97); // (le défenseur pèse aussi un peu sur Π(q_r))
     expect(pp.p).toBeLessThan(pf.p);
     expect(po.interception?.threats).toEqual([2]);
     const comp = (r: typeof pf, k: string) => r.features.find((f) => f.key === k)!;

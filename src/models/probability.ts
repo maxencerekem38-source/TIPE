@@ -64,24 +64,28 @@ const attrInfluence = (params: SimParams): number => params.models.attributeInfl
 // ---------------------------------------------------------------------------
 // §5.1 Passe au pied
 // ---------------------------------------------------------------------------
+/** Vitesse d'arrivée (m/s) au-delà de laquelle une passe appuyée pénalise le contrôle du receveur (§5.1). */
+export const ARRIVAL_SPEED_FREE = 9;
+const DEFAULT_ARRIVAL_SPEED_COEF = -0.1;
+const DEFAULT_LOB_PENALTY = -1.5;
+
 /**
- * Passe dans les pieds de `receiverId` (ou vers `targetPoint` si fourni : passe « devant »).
- *   P_pass = (1 − P_int) · σ(2,4 − 0,04 d − 0,9 Π(b) − 0,6 Π(q_r) − 0,02 max(0, d − 30) + a·(passing − 0,5)).
- * Π(b) est exact (ponctuel), Π(q_r) est lu sur la grille du cycle. `arrivalSpeed` (m/s) permet de tester
- * les trois vitesses candidates {4, 6, 9} ; défaut physics.passArrivalSpeed.
- * Ancrages (sans interception) : 15 m libre ≈ 0,86 ; 35 m sous pression Π(b) = 1 ≈ 0,5.
+ * Partie logistique de P_pass (§5.1), hors interception — partagée avec la calibration (§11.6), qui la recalcule sur
+ * la passe réellement jouée : `from` est l'origine du ballon, `passer` fournit la pression Π(b) et l'attribut.
+ *   logit = 2,4 − 0,03 d − 0,9 Π(b) − 0,6 Π(q_r) − 0,01 max(0, d − 30) − 0,1 max(0, s_arr − 9) + a·(passing − 0,5) [+ β_lob]
+ * (coefficients de params.models.pass, termes de distance réajustés §11.6 / §15.2).
+ * `aerial` : passe lobée, terme additif pass.lobPenalty (réception d'un ballon retombé à côté du point visé).
+ * Retourne le logit et ses termes nommés (sans le log-facteur d'interception).
  */
-export function passProbability(state: MatchState, fields: FieldSet, passerId: number, receiverId: number, targetPoint: Vec2, params: SimParams, arrivalSpeed?: number): ProbabilityResult {
-  const passer = getPlayer(state, passerId);
+export function passLogit(state: MatchState, fields: FieldSet, passer: Player, from: Vec2, target: Vec2, params: SimParams, arrivalSpeed: number, aerial = false): { logit: number; features: ScoreComponent[] } {
   const team = passer.team;
-  const from = originOf(state, passer);
-  const target = targetPoint ?? getPlayer(state, receiverId).pos;
   const d = dist(from, target);
   const c = params.models.pass;
-  const interception = analyseInterception(state, from, target, 'pass', team, params, arrivalSpeed ?? params.physics.passArrivalSpeed);
   const piBall = pressureAt(state, from, team, params);
   const piTarget = pressureOn(fields, target, team);
   const longExcess = Math.max(0, d - 30);
+  const speedExcess = Math.max(0, arrivalSpeed - ARRIVAL_SPEED_FREE);
+  const speedCoef = c.arrivalSpeed ?? DEFAULT_ARRIVAL_SPEED_COEF;
   const skill = passer.attrs.passing - 0.5;
   const features: ScoreComponent[] = [
     feat('base', 'Base', 1, c.base),
@@ -89,10 +93,34 @@ export function passProbability(state: MatchState, fields: FieldSet, passerId: n
     feat('longDistance', 'Excédent au-delà de 30 m', longExcess, c.longDistance, 'm'),
     feat('passerPressure', 'Pression sur le passeur', piBall, c.passerPressure),
     feat('receiverPressure', 'Pression au point de réception', piTarget, c.receiverPressure),
+    feat('arrivalSpeed', 'Passe appuyée (excédent au-delà de 9 m/s)', speedExcess, speedCoef, 'm/s'),
     feat('skill', 'Qualité de passe du joueur', skill, attrInfluence(params)),
-    logFactor('interception', 'Risque d’interception', interception.pIntercept, 1 - interception.pIntercept),
   ];
-  const logit = c.base + c.distance * d + c.longDistance * longExcess + c.passerPressure * piBall + c.receiverPressure * piTarget + attrInfluence(params) * skill;
+  let logit = c.base + c.distance * d + c.longDistance * longExcess + c.passerPressure * piBall + c.receiverPressure * piTarget + speedCoef * speedExcess + attrInfluence(params) * skill;
+  if (aerial) {
+    const lob = c.lobPenalty ?? DEFAULT_LOB_PENALTY;
+    features.push(feat('lob', 'Réception d’un ballon lobé', 1, lob));
+    logit += lob;
+  }
+  return { logit, features };
+}
+
+/**
+ * Passe dans les pieds de `receiverId` (ou vers `targetPoint` si fourni : passe « devant »).
+ *   P_pass = (1 − P_int) · σ(2,4 − 0,03 d − 0,9 Π(b) − 0,6 Π(q_r) − 0,01 max(0, d − 30) − 0,1 max(0, s_arr − 9) + a·(passing − 0,5)).
+ * Π(b) est exact (ponctuel), Π(q_r) est lu sur la grille du cycle. `arrivalSpeed` (m/s) permet de tester
+ * les vitesses candidates {4, 6, 9, 10} ; défaut physics.passArrivalSpeed.
+ * Ancrages (sans interception) : 15 m libre ≈ 0,86 ; 35 m sous pression Π(b) = 1 ≈ 0,5.
+ */
+export function passProbability(state: MatchState, fields: FieldSet, passerId: number, receiverId: number, targetPoint: Vec2, params: SimParams, arrivalSpeed?: number): ProbabilityResult {
+  const passer = getPlayer(state, passerId);
+  const team = passer.team;
+  const from = originOf(state, passer);
+  const target = targetPoint ?? getPlayer(state, receiverId).pos;
+  const sArr = arrivalSpeed ?? params.physics.passArrivalSpeed;
+  const interception = analyseInterception(state, from, target, 'pass', team, params, sArr);
+  const { logit, features } = passLogit(state, fields, passer, from, target, params, sArr);
+  features.push(logFactor('interception', 'Risque d’interception', interception.pIntercept, 1 - interception.pIntercept));
   return { p: (1 - interception.pIntercept) * sigmoid(logit), features, interception };
 }
 

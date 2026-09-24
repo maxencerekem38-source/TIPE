@@ -72,8 +72,13 @@ export const DEFAULT_PARAMS: SimParams = {
     threatRhoX: 25,
     threatRhoY: 22,
     interceptSamples: 12,
+    // η : une chance par défenseur (§4.6) ; calibré sur l'auto-jeu (scripts/calibrate.ts, §11.6 et §15.2).
     interceptEfficiency: 0.35,
-    pass: { base: 2.4, distance: -0.04, longDistance: -0.02, passerPressure: -0.9, receiverPressure: -0.6 },
+    // Termes de distance réajustés sur les issues du moteur (§11.6, scripts/calibrate.ts ; §15.2) : la réussite observée
+    // dépend peu de la distance (les échecs sont surtout des réceptions manquées) ; le réajustement complet (distance −0,02,
+    // > 30 m 0) n'est pas un point fixe de l'auto-jeu (biais de sélection) et dégrade le banc de scénarios : demi-pas
+    // amorti distance −0,04 → −0,03, > 30 m −0,02 → −0,01. Base, pressions, vitesse, lob et modèle de profondeur inchangés.
+    pass: { base: 2.4, distance: -0.03, longDistance: -0.01, passerPressure: -0.9, receiverPressure: -0.6, arrivalSpeed: -0.1, lobPenalty: -1.5 },
     through: { base: 1.8, distance: -0.03, passerPressure: -0.8, reachSlack: 0.6 },
     dribble: { base: 1.5, pathPressure: -1.2, distance: -0.15, control: 0.8, race: 1.0 },
     shot: { base: -1.1, angle: 3.0, distance: -0.08, keeperCoverage: -1.5, blockers: -0.9, pressure: -0.5 },
@@ -89,6 +94,7 @@ export const DEFAULT_PARAMS: SimParams = {
     spaceRadius: 8,
     interceptLandingEfficiency: 0.6,
     interceptLandingWindow: 0.3,
+    interceptWindow: 0,
   },
   decision: {
     wProgress: 0.15,
@@ -109,7 +115,7 @@ export const DEFAULT_PARAMS: SimParams = {
     epsilonTie: 0.002,
     epsilonGame: 0.02,
     holdDuration: 0.4,
-    passArrivalSpeeds: [4, 6, 9],
+    passArrivalSpeeds: [4, 6, 9, 10],
     shotMinXg: 0.06,
     wLength: 0.1,
     wShotPossession: 0.4,
@@ -119,6 +125,9 @@ export const DEFAULT_PARAMS: SimParams = {
     responseReevaluate: 4,
     gameCommitMin: 1.0,
     ownGoalMargin: 1.0,
+    // Cibles longues (§6.1) : passe appuyée (10 m/s : 12 m/s serait refusée par la prise de balle du moteur,
+    // controlMaxRelSpeed = 12 strict, bruit de vitesse ±5 %) et lob toujours évalués au-delà de 25 m.
+    longPassDistance: 25,
   },
   offBall: {
     wReceivable: 1.0,

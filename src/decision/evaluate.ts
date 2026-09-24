@@ -43,7 +43,7 @@ import { attackDir, otherTeam } from '../core/types';
 import { pitchControlAt, pressureAt, threatAt } from '../models/fields';
 import { analyseInterception, lineBreaks, passingLaneQuality, type InterceptionAnalysis } from '../models/interception';
 import { dribbleTime } from '../models/motion';
-import { dribbleProbability, holdProbability, passProbability, shotProbability, throughBallProbability, type ProbabilityResult } from '../models/probability';
+import { dribbleProbability, holdProbability, passLogit, passProbability, shotProbability, throughBallProbability, type ProbabilityResult } from '../models/probability';
 import { OFFSIDE_TOLERANCE, offsideLine, smoothSuperiority } from '../models/structure';
 import { sigmoid } from '../core/vec2';
 import { keeperOf, type Proposal, type ProposalKind } from './candidates';
@@ -68,8 +68,8 @@ const COUNTER_GAIN = 1.5;
 /** Élagage géométrique (§4.6) : ligne « fermée » si un adversaire est à moins de LANE_BLOCK_DISTANCE m du segment et W > LANE_BLOCK_PHI. */
 export const LANE_BLOCK_DISTANCE = 1.0;
 export const LANE_BLOCK_PHI = 0.8;
-/** Distance (m) au-delà de laquelle une ligne fermée est jouée en lob. */
-export const LOB_MIN_DISTANCE = 25;
+/** Distance (m) au-delà de laquelle une ligne fermée est jouée en lob (définie avec le plan des variantes, candidates.ts). */
+export { LOB_MIN_DISTANCE } from './candidates';
 /** Marge (m) à la ligne des défenseurs en deçà de laquelle une passe porte un « risque de hors-jeu » (§6.2). */
 const OFFSIDE_RISK_MARGIN = 1.0;
 /** Replis des paramètres optionnels ajoutés (append-only dans SimParams). */
@@ -77,6 +77,8 @@ const DEFAULT_SHOT_MIN_XG = 0.04;
 const DEFAULT_W_LENGTH = 0.1;
 const DEFAULT_W_SHOT_POSSESSION = 1.0;
 const DEFAULT_W_POSSESSION = 0;
+/** Repli du terme additif du logit d'un lob (pass.lobPenalty, §5.1). */
+const DEFAULT_LOB_PENALTY = -1.5;
 /** Modulation du seuil de tir : xG_min ← shotMinXg · (SHOT_MIN_BASE − shotEagerness). */
 const SHOT_MIN_BASE = 1.5;
 /** Longueur maximale (caractères) d'une phrase d'explication. */
@@ -275,8 +277,9 @@ export function evaluateProposal(ctx: EvalContext, prop: Proposal): Evaluation |
     case 'pass':
     case 'lob': {
       if (prop.kind === 'lob') {
-        // Lob : partie logistique de la passe au sol (déjà connue si la proposition dérive d'une passe évaluée) × (1 − P_int aérien).
-        logit = prop.logit ?? logitOf(passProbability(state, fields, me.id, prop.receiverId, prop.successPoint, params, prop.arrivalSpeed));
+        // Lob : partie logistique de la passe au sol (déjà connue si la proposition dérive d'une passe évaluée, sinon
+        // `passLogit` sans nouvelle analyse d'interception au sol) + pénalité de réception aérienne, × (1 − P_int aérien).
+        logit = (prop.logit ?? passLogit(state, fields, me, origin, prop.successPoint, params, prop.arrivalSpeed ?? params.physics.passArrivalSpeed).logit) + (params.models.pass.lobPenalty ?? DEFAULT_LOB_PENALTY);
         inter = analyseInterception(state, origin, prop.successPoint, 'lob', team, params);
         P = (1 - inter.pIntercept) * sigmoid(logit);
       } else {

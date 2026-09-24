@@ -493,7 +493,16 @@ export interface PhysicsParams {
 }
 
 /** Coefficients d'un modèle logistique P = σ(base + Σ coef·feature). */
-export interface PassModel { base: number; distance: number; longDistance: number; passerPressure: number; receiverPressure: number }
+export interface PassModel {
+  base: number; distance: number; longDistance: number; passerPressure: number; receiverPressure: number;
+  /** (modèles, append-only) Coefficient de l'excédent de vitesse d'arrivée max(0, s_arr − 9) (m/s) : une passe appuyée
+   * (10 m/s) est plus difficile à contrôler pour le receveur (§5.1), défaut −0,1. */
+  arrivalSpeed?: number;
+  /** (modèles, append-only) Terme additif du logit d'une passe lobée (§5.1) : le ballon retombe à 2–3 m du point visé
+   * (bruit d'exécution) et le receveur attend au point visé ; calibré sur la réussite observée des lobs (§11.6, 16 %
+   * contre 42 % prédits sans ce terme), défaut −1,5. */
+  lobPenalty?: number;
+}
 export interface ThroughModel {
   base: number; distance: number; passerPressure: number;
   /** (modèles, append-only) Marge de temps (s) accordée au receveur pour rejoindre le ballon après son passage au point visé (§5.2), défaut 0,6. */
@@ -546,6 +555,9 @@ export interface ModelParams {
   interceptLandingEfficiency?: number;
   /** t_land : fenêtre (s) après l'atterrissage pendant laquelle le ballon retombé reste disputable près du point de chute, défaut 0,3. */
   interceptLandingWindow?: number;
+  /** w : demi-largeur (échantillons) de la fenêtre autour du meilleur point d'un défenseur dans l'agrégation « une chance par
+   * défenseur » (§4.6) : Φ_j = 1 − Π_{|m − m*| ≤ w}(1 − φ_{j,m}) ; 0 = son meilleur point seul (max_m φ_{j,m}). Défaut 0 (calibration §11.6). */
+  interceptWindow?: number;
 }
 
 /** Poids de la fonction d'évaluation du porteur (modulés ensuite par les paramètres tactiques). */
@@ -599,6 +611,9 @@ export interface DecisionWeights {
    * cible) franchirait sa propre ligne de but à moins de goalHalfWidth + marge n'est pas un candidat (but contre son camp
    * si le receveur la manque). Défaut 1. */
   ownGoalMargin?: number;
+  /** Distance (m) au-delà de laquelle un coéquipier est une cible « longue » (§6.1) : la passe appuyée (plus grande vitesse
+   * de `passArrivalSpeeds`) ET la variante lobée sont toujours évaluées, ligne au sol fermée ou non. Défaut 25. */
+  longPassDistance?: number;
 }
 
 /** Poids de l'utilité de déplacement sans ballon (attaque). */

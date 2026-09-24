@@ -145,7 +145,8 @@ describe('propriétés de classement (§6.2)', () => {
     const co = evaluateCandidates(mkInput(open), 0), cb = evaluateCandidates(mkInput(blocked), 0);
     const po = co.find((c) => isPass(c, 'ground', 1))!, pb = cb.find((c) => isPass(c, 'ground', 1))!;
     expect(po.probability).toBeGreaterThan(0.75);
-    expect(pb.probability).toBeLessThan(po.probability - 0.2);
+    // Une chance par défenseur (§4.6) : un défenseur à 0,8 m de la ligne (φ ≈ 1) coûte le facteur (1 − η) sur P.
+    expect(pb.probability).toBeLessThan(po.probability * (1 - 0.8 * P.models.interceptEfficiency));
     expect(pb.score).toBeLessThan(po.score);
     // Recul dans le classement (hors passes en profondeur, dont les cibles « espace » dépendent de la géométrie) :
     // le rang de la passe ne s'améliore pas et sa décomposition porte le risque d'interception.
@@ -346,8 +347,12 @@ describe('modulation tactique (§13.3)', () => {
     ], 0, style);
     const dp = decideOnBall(mkInput(mk('possession')), 0, null);
     const dc = decideOnBall(mkInput(mk('counter')), 0, null);
-    expect(isPass(dp.chosen, 'ground', 1)).toBe(true);
-    expect(isPass(dc.chosen, 'through', 2)).toBe(true);
+    // Possession : une passe au sol (vers le soutien 1, ou la passe appuyée vers le coureur 2 — tarifée 0,47 depuis
+    // l'interception « une chance par défenseur » §4.6 — dont l'EV dépasse celle de la passe en retrait, dont le point de
+    // perte est près du propre but) ; contre-attaque : le ballon vers l'avant pour le coureur 2, en profondeur ou par la
+    // passe appuyée (§6.1 : cible longue ⇒ variante appuyée toujours évaluée ; elle devance ici la profondeur de 0,004).
+    expect(isPass(dp.chosen, 'ground')).toBe(true);
+    expect(dc.chosen.action.type === 'pass' && dc.chosen.action.targetId === 2 && dc.chosen.action.kind !== 'lob').toBe(true);
     // Classement relatif des deux options inversé par le style.
     const best = (d: Decision, kind: 'ground' | 'through', id: number): Candidate => d.candidates.filter((c) => isPass(c, kind, id)).sort((a, b) => b.score - a.score)[0];
     expect(best(dp, 'ground', 1).score).toBeGreaterThan(best(dp, 'through', 2).score);
