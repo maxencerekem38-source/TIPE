@@ -18,7 +18,7 @@ import { computeFields } from '@/models/fields';
 import { passProbability } from '@/models/probability';
 import { offsideLine } from '@/models/structure';
 import { createMatch, giveBall, slotPosition } from '@/engine/match';
-import { decideOffBall, decideReceive, deepRunPoints, isRestDefender, offBallSpeed, quickPassProbability } from '@/decision/offball';
+import { carrierContext, decideOffBall, decideReceive, deepRunPoints, isRestDefender, offBallSpeed, quickPassProbability, supportUrgency } from '@/decision/offball';
 import { createSimulation } from '@/engine/loop';
 import { decideAll, FULL_POLICY } from '@/decision/coordinator';
 import { stepPhysics } from '@/engine/physics';
@@ -436,6 +436,96 @@ describe('offball — coût de déplacement, hystérésis de transition', () => 
     const stale = { ...previous, time: state.time - P.offBall.reexamineEvery - 0.1 };
     const f = decideOffBall(strong, player.id, stale);
     expect(f.chosen.components.some((c) => c.key === 'hysteresis')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe('offball — soutien urgent (§15.3 « jeu figé »)', () => {
+  it('supportUrgency : u = 1 + (u_max − 1)·max(f_t, f_P), neutre avec une passe sûre et un ballon frais, maximale sans solution', () => {
+    const w = P.offBall;
+    const uMax = w.supportUrgencyMax!;
+    expect(supportUrgency(0, 0.9, w)).toBeCloseTo(1, 12);
+    expect(supportUrgency(0, 0, w)).toBeCloseTo(uMax, 12);
+    expect(supportUrgency(w.supportUrgencyDelay! + w.supportUrgencyRamp! + 5, 0.9, w)).toBeCloseTo(uMax, 12);
+    expect(supportUrgency(w.supportUrgencyDelay! + 0.5 * w.supportUrgencyRamp!, 0.9, w)).toBeCloseTo(1 + 0.5 * (uMax - 1), 12);
+    expect(supportUrgency(0, 0.5 * w.supportUrgencyPass!, w)).toBeCloseTo(1 + 0.5 * (uMax - 1), 12);
+    expect(supportUrgency(99, 0, { ...w, supportUrgencyMax: 1 })).toBe(1);
+  });
+
+  it('carrierContext : porteur de champ (t_held, meilleure passe rapide, urgence) ; null pour un gardien porteur ou un ballon libre', () => {
+    const state = matchState(31, 6, v(0, 0));
+    const input = inputFor(state, 'A');
+    const ctx = carrierContext(state, input.fields, P)!;
+    expect(ctx).not.toBeNull();
+    expect(ctx.playerId).toBe(6);
+    expect(ctx.team).toBe('A');
+    expect(ctx.heldFor).toBeCloseTo(0, 9); // giveBall pose lastControlTime = maintenant
+    expect(ctx.bestPassP).toBeGreaterThan(0);
+    expect(ctx.bestPassP).toBeLessThanOrEqual(1);
+    expect(ctx.supportUrgency).toBeCloseTo(supportUrgency(0, ctx.bestPassP, P.offBall), 12);
+    state.players[6].lastControlTime = state.time - 10;
+    expect(carrierContext(state, input.fields, P)!.heldFor).toBeCloseTo(10, 9);
+    const gk = matchState(31, 0, v(-46, 0));
+    expect(carrierContext(gk, inputFor(gk, 'A').fields, P)).toBeNull();
+    const free = matchState(31, 6, v(0, 0));
+    free.ball.ownerId = null;
+    expect(carrierContext(free, inputFor(free, 'A').fields, P)).toBeNull();
+  });
+
+  it('composante « urgency » = w_urg·(u − 1)·G·P_passe pour les coéquipiers à portée, poste et séparation relâchés ; rien à u = 1 ; les cibles se rapprochent du ballon', () => {
+    const state = matchState(32, 6, v(-10, 0));
+    const base = inputFor(state, 'A');
+    const calm: DecisionInput = { ...base, carrier: { playerId: 6, team: 'A', heldFor: 0, bestPassP: 0.9, supportUrgency: 1 } };
+    const u = P.offBall.supportUrgencyMax!;
+    const urgent: DecisionInput = { ...base, carrier: { playerId: 6, team: 'A', heldFor: 6, bestPassP: 0.2, supportUrgency: u } };
+    const radius = P.offBall.supportUrgencyRadius!;
+    const relax = 1 / (1 + P.offBall.supportUrgencyRelax! * (u - 1));
+    let near = 0, closer = 0, sumCalm = 0, sumUrgent = 0;
+    for (const p of state.players.filter((q) => q.team === 'A' && q.role !== 'GK' && q.id !== 6)) {
+      const dc = decideOffBall(calm, p.id, null), du = decideOffBall(urgent, p.id, null);
+      for (const c of dc.candidates) expect(c.components.some((k) => k.key === 'urgency')).toBe(false);
+      const within = dist(p.pos, state.ball.pos) <= radius;
+      for (const c of du.candidates) {
+        const k = c.components.find((x) => x.key === 'urgency');
+        if (!within) { expect(k).toBeUndefined(); continue; }
+        expect(k).toBeDefined();
+        expect(k!.weight).toBeCloseTo(P.offBall.wSupportUrgency! * (u - 1), 12);
+        expect(k!.value).toBeGreaterThanOrEqual(0);
+        expect(k!.value).toBeLessThanOrEqual(1);
+        expect(k!.contribution).toBeCloseTo(k!.weight * k!.value, 12);
+        expect(c.components.find((x) => x.key === 'slot')!.weight).toBeCloseTo(-P.offBall.wSlot * relax, 12);
+        expect(c.components.find((x) => x.key === 'separation')!.weight).toBeCloseTo(-P.offBall.wSeparation * relax, 12);
+        expect(Math.abs(c.score - c.components.reduce((s, x) => s + x.contribution, 0))).toBeLessThan(1e-9);
+      }
+      if (!within) continue;
+      near++;
+      const tc = dist(target(dc), state.ball.pos), tu = dist(target(du), state.ball.pos);
+      sumCalm += tc; sumUrgent += tu;
+      if (tu < tc - 1e-9) closer++;
+    }
+    expect(near).toBeGreaterThanOrEqual(4);
+    expect(closer).toBeGreaterThanOrEqual(1);
+    expect(sumUrgent / near).toBeLessThan(sumCalm / near);
+    // Le porteur lui-même et un contexte absent (null) ne reçoivent pas la composante.
+    const none: DecisionInput = { ...base, carrier: null };
+    for (const p of state.players.filter((q) => q.team === 'A' && q.role !== 'GK' && q.id !== 6)) {
+      for (const c of decideOffBall(none, p.id, null).candidates) expect(c.components.some((k) => k.key === 'urgency')).toBe(false);
+    }
+  });
+
+  it('défenseur de repos sous urgence : la laisse de 5 m devient 5·u m (le latéral derrière le porteur bloqué devient une option)', () => {
+    const tactics = { A: makeTactic('4-3-3', 'balanced', { restDefenders: 3 }), B: makeTactic('4-4-2', 'balanced') };
+    const state = matchState(33, 6, v(-18, 0), tactics);
+    const base = inputFor(state, 'A');
+    const u = P.offBall.supportUrgencyMax!;
+    const rest = state.players.filter((p) => p.team === 'A' && p.role !== 'GK' && isRestDefender(state, p, 3) && dist(p.pos, state.ball.pos) <= P.offBall.supportUrgencyRadius!);
+    expect(rest.length).toBeGreaterThanOrEqual(1);
+    for (const p of rest) {
+      const calm = decideOffBall({ ...base, carrier: { playerId: 6, team: 'A', heldFor: 0, bestPassP: 0.9, supportUrgency: 1 } }, p.id, null);
+      for (const c of calm.candidates) expect(dist(c.successPoint!, p.pos)).toBeLessThanOrEqual(5 + 1e-6);
+      const urgent = decideOffBall({ ...base, carrier: { playerId: 6, team: 'A', heldFor: 6, bestPassP: 0.2, supportUrgency: u } }, p.id, null);
+      for (const c of urgent.candidates) expect(dist(c.successPoint!, p.pos)).toBeLessThanOrEqual(5 * u + 1e-6);
+    }
   });
 });
 

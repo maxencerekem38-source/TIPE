@@ -142,6 +142,9 @@ export function evaluateCandidates(input: DecisionInput, playerId: number, optio
     for (let i = 0; i < Math.min(MAX_THROUGH, through.length); i++) out.push(through[i]);
   }
 
+  // Meilleure passe disponible (toutes variantes) : porte de la pression du temps de possession sur dribble et conservation.
+  for (const c of out) if (c.probability > ctx.bestPassP) ctx.bestPassP = c.probability;
+
   // --- Dribbles ---
   const dribbleDistances = reduced ? params.decision.dribbleDistances.slice(0, 1) : params.decision.dribbleDistances;
   for (const prop of proposeDribbles(state, me, params, dribbleDistances)) {

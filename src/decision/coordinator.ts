@@ -12,6 +12,8 @@
  *     les autres gardent leur comportement de phase ; les points de rencontre sont stables (conservés à < 3 m ou tant
  *     qu'ils restent atteignables avant le ballon, loose.stableMeetingPoint) ;
  *  5. gel de remise en jeu : tous les joueurs rejoignent leur poste (« hold_shape »), le remetteur conserve le ballon.
+ * Contexte du porteur (§15.3 « jeu figé ») : calculé une fois par cycle (`carrierContext`) et passé aux décisions sans
+ * ballon de l'équipe attaquante via `DecisionInput.carrier` (temps de possession continue, meilleure passe, urgence du soutien).
  * Écritures dans l'état : `state.fields` (champs) et `state.slotBallRef` (référence de ballon lissée des postes, §7.2).
  * Retourne une décision pour CHAQUE joueur.
  */
@@ -24,7 +26,7 @@ import { fmtFr, fmtPoint } from './explain';
 import { decideDefence } from './defence';
 import { decideKeeper } from './keeper';
 import { rankChasers, receiveMeeting, simpleHoldDecision, simpleMoveDecision, stableMeetingPoint, teamSlot, updateSlotBallRef } from './loose';
-import { decideOffBall } from './offball';
+import { carrierContext, decideOffBall } from './offball';
 import { decideOnBall } from './onball';
 import type { DecisionInput, PolicySet } from './policy';
 
@@ -117,8 +119,9 @@ export function decideAll(state: MatchState, params: SimParams, policies: Record
   const attacking: TeamId = owner ? owner.team : state.possession ?? 'A';
   const defending = otherTeam(attacking);
 
-  // --- Équipe attaquante ---
-  const att = inputs[attacking];
+  // --- Équipe attaquante --- (contexte du porteur calculé une fois par cycle : temps de possession, meilleure passe,
+  // urgence du soutien, §15.3 ; null sans porteur de champ)
+  const att: DecisionInput = { ...inputs[attacking], carrier: owner && owner.role !== 'GK' ? carrierContext(state, state.fields, params) : null };
   for (const p of state.players) {
     if (p.team !== attacking) continue;
     const prev = previous.get(p.id) ?? null;

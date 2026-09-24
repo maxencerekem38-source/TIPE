@@ -390,6 +390,7 @@ function resolveDuels(state: MatchState, params: SimParams, rng: Rng): void {
         ball.vel.x = d.vel.x;
         ball.vel.y = d.vel.y;
         ball.flight = null;
+        d.lastControlTime = time; // prise de balle par le tacleur : délai de grâce et temps de possession repartent de zéro
       } else {
         const ux = dx / n, uy = dy / n;
         ball.ownerId = null;

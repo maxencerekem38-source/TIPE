@@ -20,6 +20,11 @@
  * Vitesse de consigne par intention (§7.2, réalisme) : appels au sprint, soutien / largeur / espace à une fraction de la
  * vitesse de tempo, conservation de la structure au trot (une cible lointaine accélère) ; une cible de conservation à
  * moins de `standDistance` m est remplacée par la position courante (le joueur tient sa place au lieu de ramper).
+ * Soutien urgent (§15.3 « jeu figé ») : le coordonnateur calcule une fois par cycle le contexte du porteur (`carrierContext` :
+ * temps de possession continue t_held, meilleure passe au sol P_max, urgence u = 1 + (u_max − 1)·max(f_t, f_P)) ; les
+ * coéquipiers à moins de `supportUrgencyRadius` reçoivent la composante additive w_urg·(u − 1)·G(‖q − b‖ ; d_support)·P_pass(b → q)
+ * (position de soutien à la bonne distance ET sur une ligne ouverte), nulle quand u = 1 ; la laisse des défenseurs de repos
+ * (5 m) est multipliée par u (le latéral derrière l'ailier bloqué devient une option).
  * Repère : coordonnées terrain, direction d'attaque `dir` explicite (symétrie miroir A/B).
  */
 import type { Vec2 } from '../core/vec2';
@@ -35,8 +40,8 @@ import { getPlayer } from '../models/probability';
 import { OFFSIDE_TOLERANCE, offsideLine } from '../models/structure';
 import { FORMATIONS } from '../tactics/formations';
 import { fmtFr, fmtPoint, INTENT_LABELS } from './explain';
-import { component, decisionContext, makeDecision, moveCandidate, receiveMeeting, simpleMoveDecision, stableMeetingPoint, TARGET_MARGIN, teamSlot } from './loose';
-import type { DecisionInput } from './policy';
+import { component, decisionContext, heldTime, makeDecision, moveCandidate, receiveMeeting, simpleMoveDecision, stableMeetingPoint, TARGET_MARGIN, teamSlot } from './loose';
+import type { CarrierContext, DecisionInput } from './policy';
 
 // ---------------------------------------------------------------------------
 // Constantes (§7)
@@ -95,6 +100,14 @@ const DOMINANCE_EPS = 1e-4;
 /** Défauts des paramètres optionnels : coût de déplacement (utilité/m), fraction d'hystérésis à la récupération du ballon. */
 const DEFAULT_W_MOVE = 0.015;
 const DEFAULT_TRANSITION_HYSTERESIS = 0.5;
+/** Défauts du soutien urgent (offBall.supportUrgency*, wSupportUrgency). */
+const DEFAULT_URGENCY_MAX = 3;
+const DEFAULT_URGENCY_DELAY = 2;
+const DEFAULT_URGENCY_RAMP = 3;
+const DEFAULT_URGENCY_PASS = 0.6;
+const DEFAULT_URGENCY_RADIUS = 30;
+const DEFAULT_W_URGENCY = 0.4;
+const DEFAULT_URGENCY_RELAX = 1;
 
 type CandidateKind = 'stay' | 'slot' | 'move' | 'run' | 'previous';
 
@@ -111,6 +124,7 @@ const LABELS: Record<string, string> = {
   run: 'Appel en profondeur',
   hysteresis: 'Hystérésis (cible engagée)',
   move: 'Coût de déplacement',
+  urgency: 'Soutien urgent (porteur bloqué)',
 };
 
 // ---------------------------------------------------------------------------
@@ -278,6 +292,44 @@ function passerOf(state: MatchState, player: Player): Player | null {
 const passOrigin = (state: MatchState, passer: Player): Vec2 => (state.ball.ownerId === passer.id ? state.ball.pos : passer.pos);
 
 // ---------------------------------------------------------------------------
+// Soutien urgent (§15.3) : contexte du porteur, calculé une fois par cycle
+// ---------------------------------------------------------------------------
+/**
+ * Multiplicateur d'urgence du soutien u ∈ [1, u_max] : u = 1 + (u_max − 1)·max(f_t, f_P) avec
+ * f_t = clamp((t_held − delay)/ramp, 0, 1) (le porteur garde le ballon) et f_P = clamp((P* − P_max)/P*, 0, 1)
+ * (il n'a pas de passe au sol à P ≥ P*). Le maximum des deux : l'absence de solution suffit, la durée aussi.
+ */
+export function supportUrgency(heldFor: number, bestPassP: number, w: SimParams['offBall']): number {
+  const uMax = w.supportUrgencyMax ?? DEFAULT_URGENCY_MAX;
+  if (!(uMax > 1)) return 1;
+  const delay = w.supportUrgencyDelay ?? DEFAULT_URGENCY_DELAY;
+  const ramp = Math.max(1e-6, w.supportUrgencyRamp ?? DEFAULT_URGENCY_RAMP);
+  const pStar = w.supportUrgencyPass ?? DEFAULT_URGENCY_PASS;
+  const ft = Math.max(0, Math.min(1, (heldFor - delay) / ramp));
+  const fp = pStar > 0 ? Math.max(0, Math.min(1, (pStar - bestPassP) / pStar)) : 0;
+  return 1 + (uMax - 1) * Math.max(ft, fp);
+}
+
+/**
+ * Contexte du porteur (joueur de champ possédant le ballon) : temps de possession continue, meilleure passe au sol vers
+ * un coéquipier de champ (modèle rapide) et urgence du soutien. null sans porteur de champ (ballon libre, gardien).
+ */
+export function carrierContext(state: MatchState, fields: FieldSet, params: SimParams): CarrierContext | null {
+  const ownerId = state.ball.ownerId;
+  if (ownerId === null) return null;
+  const owner = getPlayer(state, ownerId);
+  if (owner.role === 'GK') return null;
+  let bestPassP = 0;
+  for (const p of state.players) {
+    if (p.team !== owner.team || p.id === owner.id || p.role === 'GK') continue;
+    const q = quickPassProbability(state, fields, state.ball.pos, p.pos, owner.team, params).p;
+    if (q > bestPassP) bestPassP = q;
+  }
+  const heldFor = heldTime(state, owner);
+  return { playerId: owner.id, team: owner.team, heldFor, bestPassP, supportUrgency: supportUrgency(heldFor, bestPassP, params.offBall) };
+}
+
+// ---------------------------------------------------------------------------
 // Décision
 // ---------------------------------------------------------------------------
 /** Intentions produites par la décision hors-ballon (engagement porté par `committedUntil`). */
@@ -321,6 +373,17 @@ export function decideOffBall(input: DecisionInput, playerId: number, previous: 
   const invTwoSep2 = 1 / (2 * w.separationRadius * w.separationRadius);
   const wMove = w.wMove ?? DEFAULT_W_MOVE;
   const ballDistPos = dist(pos, ball);
+  // Soutien urgent (§15.3) : contexte du porteur fourni par le coordonnateur (une fois par cycle), sinon recalculé ;
+  // n'agit que sur les coéquipiers du porteur à moins de supportUrgencyRadius m.
+  const carrier = input.carrier !== undefined ? input.carrier : carrierContext(state, fields, params);
+  const urgency = carrier && carrier.team === team && carrier.playerId !== playerId && carrier.supportUrgency > 1
+    && ballDistPos <= (w.supportUrgencyRadius ?? DEFAULT_URGENCY_RADIUS) ? carrier.supportUrgency : 1;
+  const wUrgency = (w.wSupportUrgency ?? DEFAULT_W_URGENCY) * (urgency - 1);
+  // Relâchement de la structure sous urgence : poste et séparation pèsent 1/(1 + relax·(u − 1)) fois moins.
+  const relax = 1 / (1 + Math.max(0, w.supportUrgencyRelax ?? DEFAULT_URGENCY_RELAX) * (urgency - 1));
+  const wSlot = w.wSlot * relax, wSeparation = w.wSeparation * relax;
+  // Laisse des défenseurs de repos (§7.2), allongée par l'urgence : le latéral derrière l'ailier bloqué devient une option.
+  const restRadius = REST_RADIUS * urgency;
 
   // --- 1. Positions candidates ---
   const points: Point[] = [{ q: { x: pos.x, y: pos.y }, kind: 'stay' }];
@@ -329,11 +392,11 @@ export function decideOffBall(input: DecisionInput, playerId: number, previous: 
     for (const p of points) if (dist2(p.q, c) < 0.25) return;
     points.push({ q: c, kind });
   };
-  if (!rest || dist(slot, pos) <= REST_RADIUS) pushPoint(slot, 'slot');
-  else pushPoint({ x: pos.x + (slot.x - pos.x) * (REST_RADIUS / dist(slot, pos)), y: pos.y + (slot.y - pos.y) * (REST_RADIUS / dist(slot, pos)) }, 'slot');
+  if (!rest || dist(slot, pos) <= restRadius) pushPoint(slot, 'slot');
+  else pushPoint({ x: pos.x + (slot.x - pos.x) * (restRadius / dist(slot, pos)), y: pos.y + (slot.y - pos.y) * (restRadius / dist(slot, pos)) }, 'slot');
   const nDir = Math.max(1, Math.floor(w.candidateDirections));
   for (const d of w.candidateDistances) {
-    if (rest && d > REST_RADIUS) continue;
+    if (rest && d > restRadius) continue;
     for (let k = 0; k < nDir; k++) {
       const a = (2 * Math.PI * k) / nDir;
       pushPoint({ x: pos.x + d * Math.cos(a), y: pos.y + d * Math.sin(a) }, 'move');
@@ -401,12 +464,14 @@ export function decideOffBall(input: DecisionInput, playerId: number, previous: 
       component('support', LABELS.support, support, wSupport),
       component('space', LABELS.space, space, w.wSpace),
       component('exposure', LABELS.exposure, exposure, w.wTeamExposure),
-      component('slot', LABELS.slot, slotPen, -w.wSlot),
-      component('separation', LABELS.separation, sep, -w.wSeparation),
+      component('slot', LABELS.slot, slotPen, -wSlot),
+      component('separation', LABELS.separation, sep, -wSeparation),
       component('offside', LABELS.offside, off, -w.wOffside),
       component('run', LABELS.run, isRun ? 1 : 0, wRun),
       component('move', LABELS.move, dist(q, pos), -wMove, 'm'),
     ];
+    // Soutien urgent : à la distance de soutien ET sur une ligne ouverte (valeur G·P_pass, poids w_urg·(u − 1)).
+    if (wUrgency > 0) comps.push(component('urgency', LABELS.urgency, support * pass.p, wUrgency));
     if (prevTarget && dist2(q, prevTarget) < 0.25) comps.push(component('hysteresis', LABELS.hysteresis, 1, hysteresisBonus));
     const c = moveCandidate(q, 'hold_shape', 0, comps, '', {
       probability: pass.p,
@@ -482,6 +547,7 @@ function classifyIntent(e: { c: Candidate; kind: CandidateKind; q: Vec2 }, stay:
   switch (bestKey) {
     case 'receivable':
     case 'support':
+    case 'urgency':
       return dir * (e.q.x - ball.x) > AHEAD_FOR_RUN ? 'run' : 'support';
     case 'space':
       return 'exploit_space';

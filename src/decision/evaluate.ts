@@ -24,6 +24,11 @@
  *   possession  −(1 − P) · w_poss · Θ(b)     (possession abandonnée par un échec ; w_poss = wShotPossession pour un tir)
  *   risk        −(1 − P) · λ · L(q⁻)
  *   time        −w_time · T_a
+ *   holdTime    −w_time · κ · g · min(t_max, max(0, t_held − t₀))   (dribble, conservation : pression du temps de possession
+ *               continue t_held du porteur, §15.2 « jeu figé » — coût par DÉCISION de garder le ballon, indépendant de T_a :
+ *               une conservation de 0,4 s ne « coûte » pas trois fois moins qu'un dribble de 1,2 s, sinon attendre 0,4 s de
+ *               plus est toujours l'option la moins chère ; une passe libère le ballon et n'en porte pas ;
+ *               g = clamp((P_max − P_min)/(P_full − P_min)) porte la pression par la meilleure passe disponible)
  *   length      −w_len · P · max(0, d − d_sup) / L   (passes : au-delà de la distance de soutien tactique)
  *   offside     −w_off · 1[risque]           (receveur devant le ballon et à moins de 1 m de la ligne des défenseurs)
  *   tactic      bonus tactiques additifs (profondeur / lob : +0,5·directness·P·V⁺ ; tir : 0,05·(shotEagerness − 0,5) ;
@@ -48,6 +53,7 @@ import { OFFSIDE_TOLERANCE, offsideLine, smoothSuperiority } from '../models/str
 import { sigmoid } from '../core/vec2';
 import { keeperOf, type Proposal, type ProposalKind } from './candidates';
 import { fmtFr, fmtPct, playerNumber } from './explain';
+import { heldTime } from './loose';
 
 // ---------------------------------------------------------------------------
 // Constantes de modulation (§13.3) — formules de la spécification, non optimisables
@@ -81,6 +87,13 @@ const DEFAULT_W_POSSESSION = 0;
 const DEFAULT_LOB_PENALTY = -1.5;
 /** Modulation du seuil de tir : xG_min ← shotMinXg · (SHOT_MIN_BASE − shotEagerness). */
 const SHOT_MIN_BASE = 1.5;
+/** Replis de la pression du temps de possession (decision.holdTime*) et de la marge des lignes franchies (m). */
+const DEFAULT_HOLD_TIME_KAPPA = 4;
+const DEFAULT_HOLD_TIME_DELAY = 2;
+const DEFAULT_HOLD_TIME_MAX = 6;
+const DEFAULT_HOLD_TIME_PASS_MIN = 0.4;
+const DEFAULT_HOLD_TIME_PASS_FULL = 0.6;
+const DEFAULT_LINE_BREAK_MARGIN = 2;
 /** Longueur maximale (caractères) d'une phrase d'explication. */
 const REASON_MAX = 140;
 
@@ -112,6 +125,15 @@ export interface OnBallWeights {
   shotPossession: number;
   /** w_poss modulé : part de Θ(b) comptée perdue par l'échec d'une passe, d'un dribble, d'une conservation ou d'un dégagement. */
   wPossession: number;
+  /** Pression du temps de possession (§15.2) : κ (par s), retard t₀ (s) et plafond de l'excédent (s) — dribble et conservation. */
+  holdTimeKappa: number;
+  holdTimeDelay: number;
+  holdTimeMax: number;
+  /** Porte de la pression du temps par la meilleure passe disponible : nulle sous passMin, entière à partir de passFull. */
+  holdTimePassMin: number;
+  holdTimePassFull: number;
+  /** Marge (m) au-delà d'une ligne défensive pour la compter franchie (état anticipé). */
+  lineBreakMargin: number;
 }
 
 /** Poids de l'évaluation après modulation tactique (§13.3). Tous les modulateurs à leur valeur neutre ⇒ défauts. */
@@ -136,6 +158,12 @@ export function modulatedWeights(params: SimParams, tactic: TacticParams, phase:
     lengthFree: tactic.supportDistance,
     shotMinXg: (d.shotMinXg ?? DEFAULT_SHOT_MIN_XG) * Math.max(0, SHOT_MIN_BASE - tactic.shotEagerness),
     shotPossession: d.wShotPossession ?? DEFAULT_W_SHOT_POSSESSION,
+    holdTimeKappa: Math.max(0, d.holdTimeKappa ?? DEFAULT_HOLD_TIME_KAPPA),
+    holdTimeDelay: Math.max(0, d.holdTimeDelay ?? DEFAULT_HOLD_TIME_DELAY),
+    holdTimeMax: Math.max(0, d.holdTimeMax ?? DEFAULT_HOLD_TIME_MAX),
+    holdTimePassMin: d.holdTimePassMin ?? DEFAULT_HOLD_TIME_PASS_MIN,
+    holdTimePassFull: d.holdTimePassFull ?? DEFAULT_HOLD_TIME_PASS_FULL,
+    lineBreakMargin: Math.max(0, d.lineBreakMargin ?? DEFAULT_LINE_BREAK_MARGIN),
   };
 }
 
@@ -162,6 +190,11 @@ export interface EvalContext {
   ballX: number;
   /** Θ(b) = xT(b)·PC_att(b) : valeur de la possession courante (coût d'opportunité d'un tir manqué). */
   thetaBall: number;
+  /** t_held : temps de possession continue du porteur (s, `heldTime`) — pression du temps sur dribble et conservation. */
+  heldFor: number;
+  /** P_max : meilleure probabilité parmi les passes déjà évaluées de la décision (posée par evaluateCandidates avant les
+   * dribbles et la conservation) — porte de la pression du temps ; 0 tant qu'aucune passe n'est évaluée. */
+  bestPassP: number;
   /** État anticipé partagé : copies superficielles des joueurs, positions réécrites pour chaque candidat. */
   pred: MatchState;
   /** Détail complet (échantillons d'interception) — désactivé pour le jeu réduit de la profondeur 2. */
@@ -193,6 +226,8 @@ export function createEvalContext(state: MatchState, fields: FieldSet, params: S
     defLineX: defendersLineX(state, team),
     ballX,
     thetaBall: threatAt(origin, team, params) * pitchControlAt(state, origin, team, params),
+    heldFor: heldTime(state, me),
+    bestPassP: 0,
     pred, detailed, explain,
   };
 }
@@ -357,7 +392,9 @@ export function evaluateProposal(ctx: EvalContext, prop: Proposal): Evaluation |
     const control = pitchControlAt(ctx.pred, successPoint, team, params);
     const sup = smoothSuperiority(ctx.pred, successPoint, team, params);
     const dx = dir * (successPoint.x - origin.x);
-    const nlb = prop.kind === 'hold' ? 0 : lineBreaks(state, origin, successPoint, team);
+    // Lignes franchies sur l'état ANTICIPÉ (défenseurs avancés de T_a, comme Θ) et avec une marge : un défenseur qui
+    // contient en reculant devant un dribble de 4 m ne voit pas sa ligne « franchie » à chaque cycle (§15.2).
+    const nlb = prop.kind === 'hold' ? 0 : lineBreaks(ctx.pred, origin, { x: successPoint.x - dir * w.lineBreakMargin, y: successPoint.y }, team);
     valueIfSuccess = xT * control + w.wProgress * (dx / L) + w.wSupport * sup + w.wLineBreaks * nlb;
     components.push(comp('threat', 'Menace de la zone d’arrivée', xT, 0.5 * P, 0.5 * P * xT, 'but'));
     components.push(comp('control', 'Contrôle de la zone d’arrivée (− ½)', control - 0.5, P * xT, P * xT * (control - 0.5)));
@@ -372,6 +409,15 @@ export function evaluateProposal(ctx: EvalContext, prop: Proposal): Evaluation |
   if (theta > 0) components.push(comp('possession', 'Possession abandonnée', ctx.thetaBall, -(1 - P) * wPoss, -(1 - P) * theta, 'but'));
   // Coûts.
   components.push(comp('time', 'Durée de l’action', duration, -w.wTime, -w.wTime * duration, 's'));
+  // Pression du temps de possession (§15.2) : chaque décision de garder le ballon (dribble, conservation) au-delà de t₀ s
+  // de possession continue coûte w_time·κ·g·excès (indépendant de T_a) ; une passe, un tir ou un dégagement libèrent le ballon.
+  if ((prop.kind === 'dribble' || prop.kind === 'hold') && w.holdTimeKappa > 0) {
+    // Porte g ∈ [0, 1] : la pression n'existe que si une passe correcte est disponible (P_max au-dessus de passMin).
+    const span = w.holdTimePassFull - w.holdTimePassMin;
+    const gate = span > 1e-9 ? Math.max(0, Math.min(1, (ctx.bestPassP - w.holdTimePassMin) / span)) : ctx.bestPassP >= w.holdTimePassMin ? 1 : 0;
+    const excess = gate * Math.min(w.holdTimeMax, Math.max(0, ctx.heldFor - w.holdTimeDelay));
+    if (excess > 0) components.push(comp('holdTime', 'Temps de possession du porteur', excess, -w.wTime * w.holdTimeKappa, -w.wTime * w.holdTimeKappa * excess, 's'));
+  }
   let offsideRisk = 0;
   if (receiver && (prop.kind === 'pass' || prop.kind === 'lob' || prop.kind === 'through')) {
     const xr = dir * receiver.pos.x;
@@ -481,6 +527,8 @@ function negativePhrase(c: ScoreComponent, cand: Candidate, state: MatchState): 
       return 'infériorité numérique locale';
     case 'time':
       return `action lente (${fmtFr(c.value, 1)} s)`;
+    case 'holdTime':
+      return `ballon gardé trop longtemps (${fmtFr(c.value, 1)} s de trop)`;
     case 'offside':
       return 'receveur au bord du hors-jeu';
     case 'lookahead':

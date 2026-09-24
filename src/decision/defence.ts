@@ -18,6 +18,9 @@
  * plus profond que la ligne est laissé au hors-jeu, la hauteur du bloc suit ainsi la tactique.
  * Contre-pressing : en `transition_defence` pendant counterPressWindow s, les 3 défenseurs les plus proches du ballon
  * reçoivent des tâches press/cover à priorité renforcée (règle des 5 secondes).
+ * Porteur bloqué (§8.2, §15.3) : un porteur qui garde le ballon depuis plus de `defence.pressHoldTime` s sans solution de
+ * passe sûre (max P_pass < `pressHoldPass`) déclenche le pressing quel que soit n_trig — le défenseur qui le contenait s'engage et le duel
+ * du moteur tranche (sinon un ailier isolé conduisait le ballon en va-et-vient devant un défenseur qui contient à 5 m).
  * Repère : coordonnées terrain, direction d'attaque `dir` explicite (symétrie miroir A/B).
  */
 import type { Vec2 } from '../core/vec2';
@@ -35,7 +38,7 @@ import { localSuperiority } from '../models/structure';
 import { FORMATIONS } from '../tactics/formations';
 import { fmtFr, fmtPoint } from './explain';
 import { decideKeeper } from './keeper';
-import { ballStopPoint, component, decisionContext, makeDecision, moveCandidate, TARGET_MARGIN, teamSlot } from './loose';
+import { ballStopPoint, component, decisionContext, heldTime, makeDecision, moveCandidate, TARGET_MARGIN, teamSlot } from './loose';
 import type { DecisionInput } from './policy';
 
 // ---------------------------------------------------------------------------
@@ -97,6 +100,9 @@ const DEFAULT_STAND_DISTANCE = 3;
 const DEFAULT_CONTAIN_SLACK = 6;
 /** Tenue de la ligne : marge (m) derrière la ligne du bloc tolérée pour les points de marquage et de zone (défaut). */
 const DEFAULT_LINE_HOLD_SLACK = 1;
+/** Déclencheur « porteur bloqué » (s de possession continue sans solution de passe), défaut de `defence.pressHoldTime`. */
+const DEFAULT_PRESS_HOLD_TIME = 3;
+const DEFAULT_PRESS_HOLD_PASS = 0.75;
 /** Nombre de candidats (tâches) conservés par défenseur. */
 const KEPT_CANDIDATES = 3;
 /** Repli / zone : au-delà de RAMP_START m la vitesse croît linéairement jusqu'au sprint à RAMP_FULL m. */
@@ -133,6 +139,9 @@ export interface PressingInfo {
   tauP: number;
   tauTrig: number;
   carrierId: number | null;
+  /** Temps de possession continue du porteur (s) et déclencheur « porteur bloqué » actif (pressing forcé, §15.3). */
+  heldFor: number;
+  stuck: boolean;
 }
 
 export interface DefenceOptions {
@@ -200,12 +209,18 @@ export function pressingTrigger(input: DecisionInput, team: TeamId, defenders: r
   if (dir * ball.pos.x <= tp.pressLine) active.push('ballon dans la zone de pressing');
   if (localSuperiority(state, ball.pos, team, params) >= 0) active.push('supériorité locale');
   if (carrierId !== null && pressureAt(state, ball.pos, opp, params) >= CARRIER_PRESSURE) active.push('porteur sous pression');
+  // Porteur bloqué (§15.3) : possession continue > pressHoldTime s sans solution de passe ⇒ pressing forcé.
+  const heldFor = carrierId !== null ? heldTime(state, getPlayer(state, carrierId)) : 0;
+  const holdLimit = params.defence.pressHoldTime ?? DEFAULT_PRESS_HOLD_TIME;
+  const holdPass = params.defence.pressHoldPass ?? DEFAULT_PRESS_HOLD_PASS;
+  const stuck = carrierId !== null && holdLimit > 0 && heldFor > holdLimit && maxPass !== null && maxPass < holdPass;
+  if (stuck) active.push(`porteur bloqué depuis ${fmtFr(heldFor, 0)} s sans solution`);
   const counterPress = state.phase[team] === 'transition_defence' && state.time - state.phaseSince[team] < tp.counterPressWindow;
   const required = Math.max(1, Math.round(tp.pressTriggerCount));
-  const pressing = counterPress || active.length >= required;
+  const pressing = counterPress || stuck || active.length >= required;
   let nPress = pressing ? 1 + (tp.pressIntensity > TWO_PRESSERS_INTENSITY ? 1 : 0) : 0;
   if (counterPress) nPress = Math.max(nPress, 2);
-  return { pressing, counterPress, nPress, triggerCount: active.length, triggersActive: active, required, tauP, tauTrig, carrierId };
+  return { pressing, counterPress, nPress, triggerCount: active.length, triggersActive: active, required, tauP, tauTrig, carrierId, heldFor, stuck };
 }
 
 /**
@@ -573,7 +588,9 @@ function explainDefender(task: DefenceTask, b: CostBreakdown, dw: SimParams['def
     `Détail : ${parts.join(' ; ')}.`,
     info.counterPress
       ? `Contre-pressing : fenêtre de ${fmtFr(info.tauTrig, 1)} s après la perte, ${info.nPress} presseurs.`
-      : info.pressing
+      : info.stuck
+        ? `Pressing déclenché : porteur bloqué (${fmtFr(info.heldFor, 0)} s de possession sans solution de passe), ${info.nPress} presseur(s).`
+        : info.pressing
         ? `Pressing déclenché : ${info.triggerCount}/${info.required} condition(s) (${info.triggersActive.join(', ')}), ${info.nPress} presseur(s).`
         : `Bloc en place : ${info.triggerCount}/${info.required} condition(s) de pressing${info.triggersActive.length ? ` (${info.triggersActive.join(', ')})` : ''} → contenir le porteur.`,
   ];

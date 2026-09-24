@@ -230,6 +230,20 @@ export function updateSlotBallRef(state: MatchState, params: SimParams): void {
 /** Référence de ballon des postes instanciés : ballon filtré si le coordonnateur l'a posée, sinon ballon courant. */
 export const slotBallRef = (state: MatchState): Vec2 => state.slotBallRef?.pos ?? state.ball.pos;
 
+/**
+ * Temps de possession continue (s) du joueur s'il est porteur : depuis sa dernière prise de balle (`Player.lastControlTime`,
+ * posé par le moteur à toute prise de balle, tacle gagné ou remise en jeu), le gel d'une remise en jeu non compris
+ * (le remetteur « tient » le ballon pendant le gel sans jouer). 0 s'il n'est pas porteur ou si le moteur n'a rien posé
+ * (états construits à la main).
+ */
+export function heldTime(state: MatchState, player: Player): number {
+  if (state.ball.ownerId !== player.id || player.lastControlTime === undefined) return 0;
+  let since = player.lastControlTime;
+  const r = state.lastRestart;
+  if (r && r.playerId === player.id && r.resumeAt > since) since = r.resumeAt;
+  return Math.max(0, state.time - since);
+}
+
 /** Poste instancié d'un joueur calculé sur la référence de ballon lissée (offball, défense, coordonnateur). */
 export const teamSlot = (state: MatchState, player: Player): Vec2 => slotPosition(state, player, slotBallRef(state));
 

@@ -168,6 +168,7 @@ const WHY_NOT_LABELS: Record<string, string> = {
   risk: 'risque de perte plus élevé',
   possession: 'possession abandonnée plus précieuse',
   time: 'action plus lente',
+  holdTime: 'garde le ballon trop longtemps',
   length: 'passe plus longue',
   offside: 'risque de hors-jeu',
   response: 'réponse adverse plus pénalisante',
@@ -177,6 +178,7 @@ const WHY_NOT_LABELS: Record<string, string> = {
   probability: 'probabilité de réussite plus faible',
   // clés génériques d'autres politiques (hors-ballon, défense)
   receivable: 'moins recevable',
+  urgency: 'soutien moins utile au porteur bloqué',
   space: 'moins d’espace gagné',
   exposure: 'moins d’exposition créée',
   slot: 'trop loin du poste',

@@ -93,6 +93,10 @@ export function predictHoldState(state: MatchState, c: Candidate, playerId: numb
         const v = params.physics.dribbleSpeedFactor * p.maxSpeed;
         p.vel.x = c.action.direction.x * v; p.vel.y = c.action.direction.y * v;
       }
+      // Receveur d'une passe : sa possession continue repart de zéro dans la suite (sinon la date de sa dernière prise
+      // de balle, éventuellement ancienne, lui vaudrait la pression du temps de possession, §6.2) ; un dribble ou une
+      // conservation prolongent celle du porteur.
+      if (c.action.type === 'pass') p.lastControlTime = state.time;
     }
   }
   return {

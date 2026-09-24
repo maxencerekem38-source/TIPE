@@ -672,6 +672,41 @@ describe('régressions (réalisme du porteur) : coût de possession, hystérési
     if (shot) expect(shot.components.filter((k) => k.key === 'possession' || k.key === 'risk')).toHaveLength(2);
   });
 
+  it('pression du temps de possession (§15.2) : composante « holdTime » = −w_time·κ·g·min(t_max, t_held − t₀) sur dribble et conservation seulement, nulle sans passe correcte ou sous t₀', () => {
+    const mk = (): MatchState => simple([{ team: 'A', pos: v(0, 0) }, { team: 'A', pos: v(12, 0) }, { team: 'A', pos: v(-8, 10) }, ...B_LINE]);
+    const held = (state: MatchState, s: number): MatchState => { state.players[0].lastControlTime = state.time - s; return state; };
+    const w = modulatedWeights(P0, mk().tactics.A.params, 'attack');
+    const kappa = P0.decision.holdTimeKappa!, t0 = P0.decision.holdTimeDelay!, cap = P0.decision.holdTimeMax!;
+    // t_held = 5 s, passe libre à 12 m (P ≈ 0,88 ≥ passFull) : porte g = 1.
+    const cands = evaluateCandidates(mkInput(held(mk(), 5)), 0);
+    const bestPass = Math.max(...cands.filter((c) => c.action.type === 'pass').map((c) => c.probability));
+    expect(bestPass).toBeGreaterThanOrEqual(P0.decision.holdTimePassFull!);
+    for (const c of cands) {
+      const ht = c.components.find((k) => k.key === 'holdTime');
+      if (c.action.type === 'dribble' || c.action.type === 'hold') {
+        expect(ht, JSON.stringify(c.action)).toBeDefined();
+        expect(ht!.contribution).toBeCloseTo(-w.wTime * kappa * Math.min(cap, 5 - t0), 9);
+      } else expect(ht).toBeUndefined();
+      expect(Math.abs(sumContrib(c) - c.score)).toBeLessThan(1e-9);
+    }
+    // Plafond : t_held = 20 s ⇒ excédent borné à t_max.
+    const capped = evaluateCandidates(mkInput(held(mk(), 20)), 0).find((c) => c.action.type === 'hold')!;
+    expect(capped.components.find((k) => k.key === 'holdTime')!.contribution).toBeCloseTo(-w.wTime * kappa * cap, 9);
+    // Sous t₀ : aucune composante ; sans passe candidate (porteur seul) : porte nulle, aucune composante.
+    for (const c of evaluateCandidates(mkInput(held(mk(), t0 - 0.5)), 0)) expect(c.components.some((k) => k.key === 'holdTime')).toBe(false);
+    const alone = held(simple([{ team: 'A', pos: v(0, 0) }, ...B_LINE]), 8);
+    for (const c of evaluateCandidates(mkInput(alone), 0)) expect(c.components.some((k) => k.key === 'holdTime')).toBe(false);
+    // κ = 0 : désactivée.
+    const off = cloneParams(P0);
+    off.decision.holdTimeKappa = 0;
+    for (const c of evaluateCandidates(mkInput(held(mk(), 8), 1, off), 0)) expect(c.components.some((k) => k.key === 'holdTime')).toBe(false);
+    // Le porteur qui garde le ballon depuis 8 s avec une passe libre à 12 m la joue (la pression l'emporte sur le dribble).
+    const d = decideOnBall(mkInput(held(mk(), 8)), 0, null);
+    expect(d.chosen.action.type).toBe('pass');
+    // État construit sans `lastControlTime` : t_held = 0, aucune pression (comportement de référence conservé).
+    for (const c of evaluateCandidates(mkInput(mk()), 0)) expect(c.components.some((k) => k.key === 'holdTime')).toBe(false);
+  });
+
   it('phrase d’explication : le terme « réponse adverse » nomme la réponse argmin (§6.3 : press, cover, drop)', () => {
     const state = simple([{ team: 'A', pos: v(0, 0) }, { team: 'A', pos: v(15, 0) }, ...B_LINE]);
     const base: Candidate = {

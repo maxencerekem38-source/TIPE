@@ -128,6 +128,14 @@ export const DEFAULT_PARAMS: SimParams = {
     // Cibles longues (§6.1) : passe appuyée (10 m/s : 12 m/s serait refusée par la prise de balle du moteur,
     // controlMaxRelSpeed = 12 strict, bruit de vitesse ±5 %) et lob toujours évalués au-delà de 25 m.
     longPassDistance: 25,
+    // Pression du temps de possession (§15.2 « jeu figé ») : coût temporel des actions qui gardent le ballon multiplié
+    // par (1 + κ·min(6, max(0, t_held − 2))) ; lignes franchies comptées sur l'état anticipé avec 2 m de marge.
+    holdTimeKappa: 4,
+    holdTimeDelay: 2,
+    holdTimeMax: 6,
+    holdTimePassMin: 0.4,
+    holdTimePassFull: 0.6,
+    lineBreakMargin: 2,
   },
   offBall: {
     wReceivable: 1.0,
@@ -154,6 +162,14 @@ export const DEFAULT_PARAMS: SimParams = {
     transitionHysteresis: 0.5,
     meetingKeepGain: 0.5,
     slotFloorX: -38,
+    // Soutien urgent (§15.3 « jeu figé ») : u ∈ [1, 3] selon le temps de possession du porteur et l'absence de passe à P ≥ 0,6.
+    supportUrgencyMax: 3,
+    supportUrgencyDelay: 2,
+    supportUrgencyRamp: 3,
+    supportUrgencyPass: 0.6,
+    supportUrgencyRadius: 30,
+    wSupportUrgency: 0.4,
+    supportUrgencyRelax: 1,
   },
   defence: {
     muPriority: 6,
@@ -175,6 +191,9 @@ export const DEFAULT_PARAMS: SimParams = {
     taskSpeed: { contain: 0.7, zone: 0.3, markBase: 0.45, markGain: 0.3, recoverBase: 0.25, recoverGain: 0.3 },
     standDistance: 3,
     lineHoldSlack: 1,
+    // Déclencheur « porteur bloqué » (§15.3) : pressing forcé après 3 s de possession continue sans solution de passe.
+    pressHoldTime: 3,
+    pressHoldPass: 0.75,
   },
   decisionPeriod: 0.2,
   fieldCellSize: 2,

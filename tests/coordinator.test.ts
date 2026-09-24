@@ -15,7 +15,7 @@ import { createMatch, giveBall, slotPosition } from '@/engine/match';
 import { createSimulation } from '@/engine/loop';
 import { computeFields } from '@/models/fields';
 import { allocateRuns, decideAll, FULL_POLICY, attackingTeam, runBand } from '@/decision/coordinator';
-import { ballPositionAt, ballStopPoint, ballTimeAt, engagedArrivalTime, meetingStillValid, timeToBall, rankChasers, stableMeetingPoint, teamSlot, updateSlotBallRef } from '@/decision/loose';
+import { ballPositionAt, ballStopPoint, ballTimeAt, engagedArrivalTime, heldTime, meetingStillValid, timeToBall, rankChasers, stableMeetingPoint, teamSlot, updateSlotBallRef } from '@/decision/loose';
 import { runTime, timeToArrive } from '@/models/motion';
 import { decideKeeper } from '@/decision/keeper';
 import { BASELINES, pickGreedyProgress, pickGreedySafe, pickRandom, withChosen, candidateEndPoint } from '@/decision/baselines';
@@ -210,6 +210,33 @@ describe('coordinator — cycle complet', () => {
 });
 
 // ---------------------------------------------------------------------------
+describe('coordinator — temps de possession continue (loose.heldTime, §15.2)', () => {
+  it('heldTime : depuis la dernière prise de balle du porteur, gel de remise en jeu exclu ; 0 sans ballon ou sans date', () => {
+    const state = matchState(15, 6, v(0, 0));
+    state.time = 40;
+    const p = state.players[6];
+    p.lastControlTime = 37;
+    expect(heldTime(state, p)).toBeCloseTo(3, 9);
+    // Remise en jeu par ce joueur : le gel (jusqu'à resumeAt) ne compte pas.
+    state.lastRestart = { kind: 'throw_in', team: 'A', pos: { x: 0, y: 34 }, resumeAt: 39, playerId: 6 };
+    expect(heldTime(state, p)).toBeCloseTo(1, 9);
+    // Remise plus ancienne que la prise de balle : sans effet.
+    state.lastRestart = { kind: 'throw_in', team: 'A', pos: { x: 0, y: 34 }, resumeAt: 30, playerId: 6 };
+    expect(heldTime(state, p)).toBeCloseTo(3, 9);
+    // Pas porteur, ou état construit sans date de prise de balle : 0.
+    expect(heldTime(state, state.players[7])).toBe(0);
+    p.lastControlTime = undefined;
+    expect(heldTime(state, p)).toBe(0);
+    // Le contexte du porteur transmis par le coordonnateur reflète ce temps.
+    p.lastControlTime = 35;
+    state.lastRestart = undefined;
+    let seen: number | null = null;
+    const spy: PolicySet = { ...GUARDED, offBall: (input, id, prev) => { if (seen === null) seen = input.carrier?.heldFor ?? -1; return GUARDED.offBall(input, id, prev); } };
+    decideAll(state, P, { A: spy, B: spy }, new Map(), new Rng(1));
+    expect(seen).toBeCloseTo(5, 9);
+  });
+});
+
 describe('coordinator — ballon libre : faisabilité, passeur, gardien', () => {
   it('timeToBall : le point de rencontre est atteint avant ou quand le ballon y passe (jamais un point déjà dépassé) ; le passeur n’est pas premier', () => {
     const state = matchState(13, 6, v(0, 0));

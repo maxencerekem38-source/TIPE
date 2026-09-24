@@ -614,6 +614,28 @@ export interface DecisionWeights {
   /** Distance (m) au-delà de laquelle un coéquipier est une cible « longue » (§6.1) : la passe appuyée (plus grande vitesse
    * de `passArrivalSpeeds`) ET la variante lobée sont toujours évaluées, ligne au sol fermée ou non. Défaut 25. */
   longPassDistance?: number;
+  // --- Pression du temps de possession du porteur (§6.2, §15.2 « jeu figé ») ---
+  /** κ (sans dimension) : chaque décision qui GARDE le ballon (dribble, conservation) paie en plus de w_time·T_a le coût
+   * w_time·κ·g·min(holdTimeMax, max(0, t_held − holdTimeDelay)), t_held = possession continue du porteur (s), g = porte
+   * par la meilleure passe disponible (holdTimePass*) : un porteur qui conduit le ballon depuis plusieurs secondes alors
+   * qu'une passe correcte existe paie chaque seconde de plus en plus cher (la défense se réorganise, le presseur
+   * s'engage), jusqu'à préférer la passe. Coût par décision, indépendant de T_a (une conservation de 0,4 s ne coûte pas
+   * trois fois moins qu'un dribble de 1,2 s). 0 = désactivé. Défaut 4. */
+  holdTimeKappa?: number;
+  /** t₀ (s) : temps de possession continue à partir duquel la pression du temps s'applique, défaut 2. */
+  holdTimeDelay?: number;
+  /** Plafond (s) de l'excédent t_held − t₀ pris en compte (le coût ne diverge pas), défaut 6. */
+  holdTimeMax?: number;
+  /** Porte de la pression du temps par la meilleure passe disponible : facteur g = clamp((P_max − passMin)/(passFull − passMin), 0, 1)
+   * sur l'excédent, P_max = meilleure probabilité parmi les passes candidates (au sol, lobées, en profondeur). Un porteur
+   * qui garde le ballon alors qu'une passe sûre existe perd du temps ; sans option (P_max ≤ passMin) il attend le soutien
+   * et n'est pas poussé vers une passe perdue d'avance (c'est le soutien urgent et le pressing qui débloquent). Défauts 0,4 et 0,6. */
+  holdTimePassMin?: number;
+  holdTimePassFull?: number;
+  /** Marge (m) : une ligne défensive n'est comptée franchie (n_lb, §6.2) que si le point d'arrivée la dépasse d'au moins
+   * cette distance, sur l'état anticipé (défenseurs avancés de T_a) : un dribble de 4 m vers un défenseur qui contient
+   * en reculant ne « franchit » plus sa ligne à chaque cycle. Défaut 2. */
+  lineBreakMargin?: number;
 }
 
 /** Poids de l'utilité de déplacement sans ballon (attaque). */
@@ -658,6 +680,26 @@ export interface OffBallWeights {
    * le ballon (followX) ne fait pas descendre les défenseurs sur leur ligne de but quand le gardien a le ballon (relance
    * de sortie de but). ≤ −52,5 = désactivé. Défaut −38 (2 m à l'intérieur de la surface de réparation). */
   slotFloorX?: number;
+  // --- Soutien urgent (§7.1, §15.3 « jeu figé ») : le porteur n'a pas de passe ou garde le ballon depuis longtemps ---
+  /** u_max ≥ 1 : borne du multiplicateur d'urgence u = 1 + (u_max − 1)·max(f_t, f_P), f_t = clamp((t_held − delay)/ramp),
+   * f_P = clamp((P* − max P_pass)/P*) ; 1 = désactivé. Défaut 3. */
+  supportUrgencyMax?: number;
+  /** Temps de possession continue du porteur (s) à partir duquel l'urgence monte, défaut 2. */
+  supportUrgencyDelay?: number;
+  /** Durée (s) sur laquelle le facteur temporel de l'urgence passe de 0 à 1, défaut 3. */
+  supportUrgencyRamp?: number;
+  /** P* : probabilité de passe au sol (modèle rapide) en deçà de laquelle le porteur est « sans solution », défaut 0,6. */
+  supportUrgencyPass?: number;
+  /** Rayon (m) autour du porteur dans lequel les coéquipiers sont attirés vers une position de soutien, défaut 30. */
+  supportUrgencyRadius?: number;
+  /** Poids (par unité de u − 1) de la composante « soutien urgent » G(‖q − b‖ ; d_support)·P_pass(b → q) : une position
+   * de soutien à la bonne distance ET sur une ligne ouverte ; les rappels au poste et à la séparation restent, mais ne
+   * peuvent plus l'emporter seuls. Défaut 0,4. */
+  wSupportUrgency?: number;
+  /** Relâchement de la structure sous urgence ∈ [0, 1] : pour les coéquipiers attirés, les poids w₄ (poste) et w₅
+   * (séparation) sont divisés par 1 + relax·(u − 1) — à u = 3 et relax = 1, par 3 : venir soutenir un porteur bloqué
+   * prime sur la tenue du poste et la distance aux coéquipiers (le porteur compte dans la séparation). 0 = aucun. Défaut 1. */
+  supportUrgencyRelax?: number;
 }
 
 /** Coûts de l'affectation défensive. */
@@ -689,6 +731,14 @@ export interface DefenceWeights {
    * la ligne du bloc (poste le plus bas des joueurs de champ) — un attaquant plus profond est laissé au hors-jeu.
    * Une grande valeur (≥ 100) désactive la tenue de ligne. Défaut 1. */
   lineHoldSlack?: number;
+  /** Déclencheur « porteur bloqué » (§8.2, §15.3) : un porteur qui garde le ballon depuis plus de cette durée (s) sans
+   * solution de passe (max P_pass < 0,6) déclenche le pressing quel que soit n_trig — le défenseur qui le contenait
+   * s'engage, le duel du moteur tranche. ≤ 0 = désactivé. Défaut 3. */
+  pressHoldTime?: number;
+  /** Seuil de « solution de passe » du déclencheur « porteur bloqué » : max P_pass (modèle rapide) en deçà duquel un
+   * porteur qui hésite depuis pressHoldTime s est attaqué — plus exigeant que le seuil 0,6 du déclencheur §8.2 (un
+   * défenseur n'attend pas indéfiniment un porteur dont la meilleure passe est incertaine). Défaut 0,75. */
+  pressHoldPass?: number;
 }
 
 export interface SimParams {

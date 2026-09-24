@@ -265,6 +265,43 @@ describe('defence — pressing et marquage tactiques', () => {
     expect(later.pressing).toBe(false);
   });
 
+  it('porteur bloqué (§15.3) : possession continue > pressHoldTime sans solution de passe ⇒ pressing forcé, même en bloc bas (n_trig = 3) ; pas sous le délai, avec une passe sûre, ni si désactivé', () => {
+    const state = matchState(13, 6, v(-8, 6), { A: makeTactic('4-3-3', 'balanced'), B: makeTactic('4-4-2', 'low_block') });
+    const input = inputFor(state, 'B');
+    const defenders = outfieldDefenders(state, 'B');
+    const hold = P.defence.pressHoldTime!;
+    // Ballon frais (giveBall pose lastControlTime = maintenant) : le déclencheur ordinaire seul (bloc bas : pas de pressing).
+    const fresh = pressingTrigger(input, 'B', defenders, 0.5);
+    expect(fresh.stuck).toBe(false);
+    expect(fresh.heldFor).toBeCloseTo(0, 9);
+    expect(fresh.pressing).toBe(false);
+    // Le porteur garde le ballon depuis plus de pressHoldTime s sans passe à P ≥ pressHoldPass : pressing forcé.
+    state.players[6].lastControlTime = state.time - hold - 1;
+    const stuck = pressingTrigger(input, 'B', defenders, 0.5);
+    expect(stuck.stuck).toBe(true);
+    expect(stuck.heldFor).toBeCloseTo(hold + 1, 9);
+    expect(stuck.pressing).toBe(true);
+    expect(stuck.nPress).toBeGreaterThanOrEqual(1);
+    expect(stuck.triggersActive.some((t) => /porteur bloqué/.test(t))).toBe(true);
+    // Décision collective : `decideDefence` mesure lui-même la meilleure passe adverse ; avec pressHoldPass > 1 toute passe
+    // est « incertaine » et le pressing forcé se traduit par un presseur, expliqué comme tel.
+    const forced = { ...input, params: { ...P, defence: { ...P.defence, pressHoldPass: 1.01 } } };
+    const out = decideDefence(forced, 'B', new Map());
+    const pressers = state.players.filter((p) => p.team === 'B' && move(out.get(p.id)!)?.intent === 'press');
+    expect(pressers.length).toBe(stuck.nPress);
+    expect(out.get(pressers[0].id)!.explanation).toMatch(/porteur bloqué/);
+    expect(intents(decideDefence(input, 'B', new Map()), state, 'B').filter((i) => i === 'press').length).toBeLessThanOrEqual(stuck.nPress);
+    // Passe sûre disponible (max P ≥ pressHoldPass) : le porteur n'est pas « bloqué ».
+    expect(pressingTrigger(input, 'B', defenders, P.defence.pressHoldPass!).stuck).toBe(false);
+    // Juste sous le délai : rien.
+    state.players[6].lastControlTime = state.time - hold + 0.1;
+    expect(pressingTrigger(input, 'B', defenders, 0.5).stuck).toBe(false);
+    // Désactivé (pressHoldTime ≤ 0).
+    state.players[6].lastControlTime = state.time - 30;
+    const off = { ...input, params: { ...P, defence: { ...P.defence, pressHoldTime: 0 } } };
+    expect(pressingTrigger(off, 'B', defenders, 0.5).stuck).toBe(false);
+  });
+
   it('passe adverse en cours : un défenseur qui arrive avant le ballon reçoit une tâche d’interception', () => {
     const state = matchState(8, 6, v(0, 0), { A: makeTactic('4-3-3', 'balanced'), B: makeTactic('4-4-2', 'balanced') });
     const ball = state.ball;
