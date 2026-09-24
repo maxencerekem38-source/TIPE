@@ -67,4 +67,13 @@ docs             CONCEPTION.md (spécification scientifique + écarts d'impléme
 5. **Tactiques** : formation + style ⇒ vecteur de 18 paramètres qui module poids, seuils et lignes ; les tactiques changent réellement les décisions (mesuré dans le tournoi).
 6. **Expériences** : baselines (aléatoire, glouton, sans anticipation, sans risque, sans tactique, affectation gloutonne), tournoi 7 styles, ablations, CEM, calibration ; intervalles de confiance bootstrap, Wilcoxon, delta de Cliff, Elo.
 
-La spécification complète (notations, formules, paramètres, justifications, références) est dans `docs/CONCEPTION.md`.
+## Résultats principaux (16 graines appariées, matchs de 10 min — détails dans `docs/EXPERIENCES.md`)
+
+- Algorithme complet contre baseline aléatoire : +9,6 xG par match (100 % de victoires) ; contre le glouton « passe la plus sûre » : +7,3 xG ; contre une défense sans affectation hongroise : +0,7 xG et +1,4 but (p = 0,03).
+- Tournoi de 7 profils tactiques (672 matchs) : les tactiques changent mesurablement la structure du jeu (ligne défensive de −19 à −26 m, appels en profondeur de 25 à 100 par match, réussite des passes de 61 à 74 %) et le résultat (Elo de 1364 à 1584), avec un cycle non transitif largeur > direct > contre-attaque > largeur.
+- Bibliothèque de 26 scénarios : accord avec l'action « de manuel » 70 % (84 % sur les scénarios réservés).
+- Calibration des probabilités de passe contre les issues du simulateur : score de Brier 0,209, bien calibré au-dessus de 0,6.
+- Optimisation des poids par entropie croisée : convergence en 12 générations, poids appris plus directs — cohérent avec les baselines.
+- Latence : 2,5 ms par cycle de décision pour 22 joueurs (p95 5,5 ms), 274 tests automatisés.
+
+La spécification complète (notations, formules, paramètres, justifications, références, écarts d'implémentation) est dans `docs/CONCEPTION.md`.

@@ -42,14 +42,15 @@ Puis la **probabilité d'une passe** : `(1 − P_int) · σ(β₀ + β·caracté
 
 ## 6. Les expériences (2 min)
 
-Ouvrir `docs/EXPERIENCES.md` (généré par `npm run experiments`) :
+Ouvrir `docs/EXPERIENCES.md` (analyse) et `docs/resultats/` (rapports bruts générés par `npm run experiments`, `scenarios`, `calibrate`, `optimize`, `bench`) :
 
-- **Baselines** : l'algorithme complet contre aléatoire, glouton, sans anticipation, sans risque, sans tactique, affectation gloutonne ; différences appariées par graine, intervalles de confiance bootstrap, test de Wilcoxon, delta de Cliff.
-- **Tournoi tactique** : 7 styles, classement Elo, indicateurs structurels (hauteur de ligne, longueur de passe, part de passes en profondeur) qui prouvent que la tactique change les décisions.
-- **Ablations** : sensibilité à l'anticipation (γ), au risque (λ), à la température du contrôle (β), à l'efficacité d'interception (η).
-- **Apprentissage** : optimisation des poids par méthode d'entropie croisée (`npm run optimize`), courbe d'apprentissage.
-- **Calibration** : score de Brier et diagramme de fiabilité des probabilités prédites contre les issues simulées (`npm run calibrate`).
-- **Regret et accord expert** sur la bibliothèque de scénarios (`npm run scenarios`).
+- **Baselines** (16 graines appariées × 2 orientations) : complet contre aléatoire +9,6 xG (100 % de victoires), contre glouton « sécurité » +7,3 xG, contre défense sans hongrois +0,7 xG (+1,4 but, p = 0,03) ; anticipation et terme de risque non mesurables sur un match ; le glouton « progression » bat le complet (−3,1 xG) — à expliquer : poids par défaut prudents, défense simulée vulnérable au jeu direct, et l'apprentissage le confirme.
+- **Tournoi tactique** : 7 styles, 672 matchs, Elo ; le jeu en largeur, la contre-attaque et le jeu direct dominent, la possession est dernière ; cycle non transitif (largeur > direct > contre > largeur) ; indicateurs structurels (ligne défensive −19 à −26 m, appels 25 à 100, réussite des passes 61 à 74 %) qui prouvent que la tactique change les décisions.
+- **Ablations** : seul le temps de réaction du modèle est significatif ; robustesse à β et η.
+- **Scénarios** : accord expert 70 % (84 % sur les scénarios réservés), regret moyen 0,0001.
+- **Calibration** : Brier 0,209, bien calibré au-dessus de 0,6, pessimiste en dessous (diagramme de fiabilité).
+- **Apprentissage** : CEM 12 générations, fitness moyenne −2,7 → −0,2, poids appris plus directs (`wProgress` × 2,6) — cohérent avec les baselines.
+- **Latence** : 2,5 ms par cycle en match (p95 5,5 ms), 5,7 ms sur des états générés denses (p95 8,5 ms).
 
 ## 7. Limites et perspectives (30 s)
 
