@@ -25,7 +25,7 @@ npm run scenarios -- --seeds 8            # bibliothèque de scénarios : accord
 npm run experiments -- --quick            # baselines, tournoi tactique, ablations → results/EXPERIENCES.md
 npm run optimize -- --generations 10      # optimisation des poids (CEM) → results/learning/
 npm run bench                             # latence de décision (p50/p95/p99) et facteur temps réel
-npm run calibrate                         # calibration des modèles probabilistes (Brier, fiabilité)
+npm run calibrate                         # calibration des modèles probabilistes (Brier, fiabilité par distance, réajustement de Platt)
 npm run screenshot                        # captures d'écran de l'interface (Playwright)
 ```
 
@@ -35,12 +35,13 @@ Toutes les expériences sont **déterministes à graine fixée** : même graine 
 
 - **Terrain** : joueurs (A en bleu, attaque vers la droite ; B en rouge), ballon, trajectoires, cible de déplacement de chaque joueur avec son intention (soutien, appel, largeur, pressing, marquage, couverture, repli…).
 - **Calques** (touches 1 à 9) : contrôle du terrain, zones dangereuses (menace), pression, espaces disponibles, lignes de passe colorées par score avec probabilité de réussite, trajectoires, déplacements, affectations défensives, étiquettes.
-- **Panneau Décision** : pour le porteur (ou le joueur sélectionné d'un clic) — action optimale, cible, score, probabilité, raison ; classement de tous les candidats ; décomposition additive du score (menace, contrôle, progression, soutien, lignes franchies, risque, durée, hystérésis, anticipation, modulation tactique) ; formule `Score = P·V⁺ − (1−P)·V⁻ − C` avec les valeurs ; menaces d'interception.
+- **Panneau Décision** : pour le porteur (ou le joueur sélectionné d'un clic) — action optimale, cible, score, probabilité, raison ; classement de tous les candidats ; décomposition additive du score (menace, contrôle, progression, soutien, lignes franchies, risque, possession abandonnée, durée, hystérésis, anticipation, réponse adverse, modulation tactique) ; formule `Score = P·V⁺ − (1−P)·V⁻ − C` avec les valeurs ; menaces d'interception ; meilleure réponse défensive (hold / press / cover / drop) et, en cas de dilemme, la matrice du jeu 2×2 avec la stratégie mixte. Pour un joueur sans ballon : intention (soutien, appel, largeur, créer / exploiter un espace, structure, pressing, marquage, couverture, repli…) et décomposition de l'utilité des positions candidates.
 - **Tactiques** : formation (4-3-3, 4-4-2, 3-5-2, 4-2-3-1, 3-4-3) et style (équilibré, possession, contre-attaque, pressing haut, bloc bas, jeu en largeur, jeu direct) par équipe, plus les curseurs des 18 paramètres tactiques ; l'effet est immédiat sur les décisions.
 - **Paramètres** : poids de la fonction d'évaluation et paramètres des modèles, modifiables en direct.
 - **Statistiques** : buts, tirs, xG, passes, dribbles, tacles, interceptions, pertes, possession, menace créée, latence des décisions, regret.
 - **Scénarios** : 26 situations prédéfinies (contre 3 contre 2, construction sous pressing, bloc bas, 1 contre 1 gardien, piège du hors-jeu, renversement, impasse…).
-- Raccourcis : `Espace` lecture/pause, `N` pas à pas, `R` réinitialiser, `+`/`−` vitesse (×0,25 à ×8).
+- **Mode présentation** (`P`) : masque l'aide, agrandit le terrain — prévu pour la projection.
+- Raccourcis : `Espace` lecture/pause, `N` pas à pas, `R` réinitialiser, `1`–`9` calques, `+`/`−` vitesse (×0,25 à ×8), `P` présentation, clic sur un joueur pour voir sa décision (porteur ou non).
 
 ## Organisation du code
 
@@ -54,13 +55,13 @@ src/experiments  banc d'expériences : scénarios, métriques, tournoi, ablation
 src/ui           interface Canvas 2D (rendu, calques, panneaux)
 scripts          lignes de commande (sim, scenarios, experiments, optimize, bench, calibrate, screenshot)
 tests            tests unitaires et d'intégration (vitest)
-docs             CONCEPTION.md (spécification scientifique), EXPERIENCES.md (résultats), GUIDE_PRESENTATION.md
+docs             CONCEPTION.md (spécification scientifique + écarts d'implémentation §15), EXPERIENCES.md (résultats), GUIDE_PRESENTATION.md
 ```
 
 ## Principe de l'algorithme (résumé)
 
 1. **Champs spatiaux** (une fois par cycle de 0,2 s) : temps d'arrivée de chaque joueur en chaque point (accélération bornée, temps de réaction), contrôle du terrain par softmin des temps d'arrivée, menace analytique `xT(q)` (angle et distance au but), pression directionnelle.
-2. **Porteur** : ≤ 50 candidats (passes vers chaque coéquipier à plusieurs vitesses, passes en profondeur, 16 dribbles, tir, conservation, dégagement). Pour chaque candidat : probabilité de réussite `P` (modèle logistique + interception échantillonnée), valeur en cas de succès `V⁺` (menace × contrôle, progression, soutien, lignes franchies), coût en cas d'échec `V⁻` (menace adverse au point de perte), coût `C` (temps, hors-jeu). Les 5 meilleurs sont développés à profondeur 2 avec une réponse adverse pessimiste. Sélection avec hystérésis et réponse quantale (température réglable). Le score est une somme de contributions nommées : l'explication est la décomposition exacte, pas un texte reconstruit.
+2. **Porteur** : ≤ 50 candidats (passes vers chaque coéquipier à plusieurs vitesses d'arrivée, passes appuyées et lobées pour les longues distances, passes en profondeur, 16 dribbles, tir, conservation, dégagement). Pour chaque candidat : probabilité de réussite `P` (modèle logistique + interception à une chance par défenseur, calibrée contre les issues du moteur), valeur en cas de succès `V⁺` (menace × contrôle, progression, soutien, lignes franchies), coût en cas d'échec `V⁻` (menace adverse au point de perte + possession abandonnée), coût `C` (temps, hors-jeu). Les 5 meilleurs sont développés à profondeur 2 : pour chaque réponse défensive de l'ensemble {tenir, presser, couvrir, reculer} on recalcule la menace du point d'arrivée et la meilleure suite du receveur, et on retient le minimum (minimax). Quand deux actions de types différents sont à égalité, un jeu 2×2 à somme nulle est résolu (point-selle ou stratégie mixte de Nash) et l'action est tirée au sort selon l'équilibre. Sélection avec hystérésis déterministe et réponse quantale (température réglable). Le score est une somme de contributions nommées : l'explication est la décomposition exacte, pas un texte reconstruit.
 3. **Sans ballon** : chaque attaquant maximise une utilité sur 29 positions candidates (valeur recevable, gain d'espace, exposition adverse, rappel au poste, séparation, hors-jeu, appels).
 4. **Défense** : tâches (presser, contenir, marquer, couvrir, intercepter, se replier) affectées aux 10 joueurs de champ par l'algorithme hongrois sur une matrice de coûts en secondes, avec déclencheurs de pressing tactiques et hystérésis.
 5. **Tactiques** : formation + style ⇒ vecteur de 18 paramètres qui module poids, seuils et lignes ; les tactiques changent réellement les décisions (mesuré dans le tournoi).
